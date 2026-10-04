@@ -615,16 +615,20 @@ static int interrupts_enabled(void);
  * scheduler event, on the interrupt stack -- as the firmware's own library
  * threads deliver them, outside the caller's HLE call. Up to five arguments. */
 #define MAX_POSTED 32
-static struct { uint32_t func, a[6]; } g_posted[MAX_POSTED];
+static struct { uint32_t func, a[8]; } g_posted[MAX_POSTED];
 static int g_nposted;
 
-int psp_sched_post_call6(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5) {
+int psp_sched_post_call8(uint32_t func, const uint32_t a[8]) {
     if (!func || g_nposted >= MAX_POSTED) return -1;
     g_posted[g_nposted].func = func;
-    g_posted[g_nposted].a[0] = a0; g_posted[g_nposted].a[1] = a1; g_posted[g_nposted].a[2] = a2;
-    g_posted[g_nposted].a[3] = a3; g_posted[g_nposted].a[4] = a4; g_posted[g_nposted].a[5] = a5;
+    memcpy(g_posted[g_nposted].a, a, sizeof g_posted[g_nposted].a);
     g_nposted++;
     return 0;
+}
+
+int psp_sched_post_call6(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5) {
+    const uint32_t a[8] = { a0, a1, a2, a3, a4, a5, 0, 0 };
+    return psp_sched_post_call8(func, a);
 }
 
 int psp_sched_post_call(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4) {
@@ -641,6 +645,8 @@ static void run_posted(void) {
         psp_cpu.r[PSP_REG_A3] = g_posted[i].a[3];
         psp_cpu.r[8] = g_posted[i].a[4];                  /* $t0: fifth argument */
         psp_cpu.r[9] = g_posted[i].a[5];                  /* $t1: sixth */
+        psp_cpu.r[10] = g_posted[i].a[6];                 /* $t2, $t3 */
+        psp_cpu.r[11] = g_posted[i].a[7];
         g_in_interrupt++;
         /* call_guest preserves and restores the register file around the call */
         call_guest(g_posted[i].func, g_posted[i].a[0], g_posted[i].a[1], g_posted[i].a[2],
