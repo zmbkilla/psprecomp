@@ -112,6 +112,9 @@ typedef struct {
     void (*sync_vram)(uint32_t addr, uint32_t bytes);
     /* Emulated VRAM in [addr, addr+bytes) was written outside the backend. */
     void (*vram_written)(uint32_t addr, uint32_t bytes);
+    /* Nonzero: the backend keeps VRAM coherent on every CPU access itself
+     * (psp_mem_set_vram_hook), so a GE sync needs no flush. */
+    int  coherent_on_access;
 } psp_gpu_backend;
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */

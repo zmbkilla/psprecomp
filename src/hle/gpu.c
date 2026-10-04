@@ -1712,7 +1712,10 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
  * menu highlights vanished (and dialogue text went black) until restart.
  * The software rasterizer draws into VRAM directly, so there it is a no-op. */
 void psp_gpu_cpu_sync(void) {
-    if (!g_hw) return;
+    /* A backend that is coherent on access (psp_mem_set_vram_hook) syncs the
+     * bytes the CPU actually touches, when it touches them; flushing every
+     * target here cost a pipeline stall per sync, every frame. */
+    if (!g_hw || g_hw->coherent_on_access) return;
     g_hw->sync_vram(PSP_VRAM_BASE, 0x200000u);
     g_hw->vram_written(PSP_VRAM_BASE, 0x200000u);
 }

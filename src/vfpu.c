@@ -34,7 +34,12 @@ static uint32_t g_prefix[3];      /* vpfxs, vpfxt, vpfxd */
 static int      g_prefix_set[3];
 static uint64_t g_traps;
 
+static void build_tabs(void);
+static int  g_tabs_ready;
+static int8_t g_regs_tab[4][128][4], g_quad_tab[4][128][4], g_regs_len[4][128];
+
 void psp_vfpu_reset(void) {
+    if (!g_tabs_ready) build_tabs();
     memset(g_prefix, 0, sizeof g_prefix);
     memset(g_prefix_set, 0, sizeof g_prefix_set);
     g_traps = 0;
@@ -72,8 +77,6 @@ static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
  * for all 128 registers and the four sizes, so the results are identical. */
 static int  regs_compute(uint32_t vreg, int size, int out[4]);
 static void quad_compute(uint32_t vreg, int size, int out[4]);
-static int8_t g_regs_tab[4][128][4], g_quad_tab[4][128][4], g_regs_len[4][128];
-static int    g_tabs_ready;
 
 static void build_tabs(void) {
     for (int sz = 1; sz <= 4; sz++)
@@ -149,6 +152,13 @@ static const float PFX_CONST[8] = {
 
 /* Read `size` lanes of a source operand through prefix `which` (0 = s, 1 = t). */
 static int read_src(uint32_t vreg, int size, float out[4], int which) {
+    if (!g_prefix_set[which] && g_tabs_ready && size >= 1 && size <= 4) {
+        /* No prefix: the lanes are the operand's own registers (the same as
+         * the quad's first `size` entries). */
+        const int8_t *r = g_regs_tab[size - 1][vreg & 127];
+        for (int i = 0; i < size; i++) out[i] = psp_cpu.v[r[i]];
+        return size;
+    }
     int q[4];
     quad_regs(vreg, size, q);
     float raw[4];
@@ -185,6 +195,11 @@ static void read_src_bits(uint32_t vreg, int size, uint32_t out[4], int which) {
 
 /* Write `size` lanes through the destination prefix. */
 static void write_dst(uint32_t vreg, int size, const float in[4]) {
+    if (!g_prefix_set[2] && g_tabs_ready && size >= 1 && size <= 4) {
+        const int8_t *r = g_regs_tab[size - 1][vreg & 127];
+        for (int i = 0; i < size; i++) psp_cpu.v[r[i]] = in[i];
+        return;
+    }
     int d[4];
     psp_vfpu_regs(vreg, size, d);
     const uint32_t p = g_prefix_set[2] ? g_prefix[2] : 0;
@@ -277,8 +292,24 @@ uint32_t psp_mfv(uint32_t reg) {
 
 /* ---- arithmetic ---------------------------------------------------------- */
 
+/* No prefix pending (the usual case): operate on the registers directly. */
+#define NO_PREFIX(size) (!(g_prefix_set[0] | g_prefix_set[1] | g_prefix_set[2]) && g_tabs_ready && \
+                         (size) >= 1 && (size) <= 4)
+
 #define BINOP(name, expr)                                                    \
     void psp_##name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {       \
+        if (NO_PREFIX(size)) {                                               \
+            const int8_t *S = g_regs_tab[size - 1][vs & 127];                \
+            const int8_t *T = g_regs_tab[size - 1][vt & 127];                \
+            const int8_t *D = g_regs_tab[size - 1][vd & 127];                \
+            float o_[4];                                                     \
+            for (int i = 0; i < size; i++) {                                 \
+                const float a = psp_cpu.v[S[i]], b = psp_cpu.v[T[i]];        \
+                o_[i] = (expr);                                              \
+            }                                                                \
+            for (int i = 0; i < size; i++) psp_cpu.v[D[i]] = o_[i];          \
+            return;                                                          \
+        }                                                                    \
         float s[4], t[4], out[4];                                            \
         read_src(vs, size, s, 0);                                            \
         read_src(vt, size, t, 1);                                            \
@@ -304,6 +335,13 @@ BINOP(vslt, a <  b ? 1.0f : 0.0f)
 
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    if (NO_PREFIX(size)) {
+        const int8_t *S = g_regs_tab[size - 1][vs & 127], *T = g_regs_tab[size - 1][vt & 127];
+        float sum = 0.0f;
+        for (int i = 0; i < size; i++) sum += psp_cpu.v[S[i]] * psp_cpu.v[T[i]];
+        psp_cpu.v[g_regs_tab[0][vd & 127][0]] = sum;
+        return;
+    }
     float s[4], t[4], out[4];
     read_src(vs, size, s, 0);
     read_src(vt, size, t, 1);
@@ -316,6 +354,14 @@ void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 /* Scale: every lane of vs multiplied by the scalar in vt. */
 void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    if (NO_PREFIX(size)) {
+        const int8_t *S = g_regs_tab[size - 1][vs & 127], *D = g_regs_tab[size - 1][vd & 127];
+        const float k = psp_cpu.v[g_regs_tab[0][vt & 127][0]];
+        float o[4];
+        for (int i = 0; i < size; i++) o[i] = psp_cpu.v[S[i]] * k;
+        for (int i = 0; i < size; i++) psp_cpu.v[D[i]] = o[i];
+        return;
+    }
     float s[4], t[4], out[4];
     read_src(vs, size, s, 0);
     read_src(vt, 1, t, 1);

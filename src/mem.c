@@ -87,6 +87,9 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
     return 0;
 }
 
+static void (*g_vram_hook)(uint32_t off, uint32_t size);
+void psp_mem_set_vram_hook(void (*fn)(uint32_t off, uint32_t size)) { g_vram_hook = fn; }
+
 void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     /* Collapse the three cache-behaviour mirrors onto one backing store. */
     const uint32_t a = addr & PSP_ADDR_MASK;
@@ -107,6 +110,7 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     if (a >= PSP_VRAM_BASE && a < PSP_VRAM_BASE + PSP_VRAM_SIZE) {
         uint32_t off = a - PSP_VRAM_BASE;
         if (off + size > PSP_VRAM_SIZE) return NULL;
+        if (g_vram_hook) g_vram_hook(off, size ? size : 1);
         return psp_mem.vram + off;
     }
     if (a >= PSP_SCRATCH_BASE && a < PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {
@@ -120,7 +124,21 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
 /* Reads of unmapped memory return 0 and are counted. Silently returning 0 is
  * what hardware roughly does, but a recompiled game should never be doing it
  * in a steady state — the counter is how you notice. */
+/* Main RAM is where nearly every load and store of the recompiled code goes:
+ * answer it before the general region walk (same mirror mask, same bounds;
+ * a module mapped separately is checked first there, so only when none is). */
+#define RAM_FAST_READ(TYPE)                                                     \
+    {                                                                           \
+        const uint32_t off_ = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;            \
+        if (!g_module_size && off_ <= PSP_RAM_SIZE - (uint32_t)sizeof(TYPE)) {  \
+            TYPE v_;                                                            \
+            memcpy(&v_, psp_mem.ram + off_, sizeof v_);                         \
+            return v_;                                                          \
+        }                                                                       \
+    }
+
 #define READ_BODY(TYPE)                              \
+    RAM_FAST_READ(TYPE)                              \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
     if (!p) { bad_access(addr, 0, (int)sizeof(TYPE)); return 0; }      \
     TYPE v;                                          \
@@ -133,9 +151,15 @@ uint32_t psp_read32(uint32_t addr) { READ_BODY(uint32_t) }
 float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
 
 #define WRITE_BODY(TYPE)                             \
-    void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
+    void *p;                                         \
+    {                                                \
+        const uint32_t off_ = (addr & PSP_ADDR_MASK) - PSP_RAM_BASE;           \
+        if (!g_module_size && off_ <= PSP_RAM_SIZE - (uint32_t)sizeof(TYPE))   \
+            p = psp_mem.ram + off_;                                            \
+        else p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE));                    \
+    }                                                \
     if (!p) { bad_access(addr, 1, (int)sizeof(TYPE)); return; }         \
-    { uint32_t v_ = 0; memcpy(&v_, &val, sizeof(TYPE) < 4 ? sizeof(TYPE) : 4); \
+    if (g_wwatch) { uint32_t v_ = 0; memcpy(&v_, &val, sizeof(TYPE) < 4 ? sizeof(TYPE) : 4); \
       note_write(addr, (uint32_t)sizeof(TYPE), v_); }            \
     memcpy(p, &val, sizeof(TYPE));
 

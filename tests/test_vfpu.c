@@ -432,6 +432,53 @@ static void test_vidt(void) {
     CHECK_F(psp_cpu.v[d[1]], 1.0f, "vidt.p on an odd column: lane 1 is 1");
 }
 
+/* The no-prefix fast paths (direct register access) must give bit-identical
+ * results to the general prefix-aware path. Identity prefixes (swizzle
+ * x,y,z,w; no abs/neg/constant; no saturation or masking) force the general
+ * path without changing the result. Covers every op with a fast path, every
+ * size, and destinations that alias a source. */
+typedef void (*binop_fn)(uint32_t, uint32_t, uint32_t, int);
+
+static void fill_regs(unsigned seed) {
+    for (int i = 0; i < 128; i++) {
+        seed = seed * 1103515245u + 12345u;
+        psp_cpu.v[i] = (float)((int)(seed >> 8) % 20001 - 10000) / 997.0f;
+    }
+}
+
+static void test_fast_paths(void) {
+    static const struct { const char *name; binop_fn fn; } OPS[] = {
+        { "vadd", psp_vadd }, { "vsub", psp_vsub }, { "vmul", psp_vmul }, { "vdiv", psp_vdiv },
+        { "vmin", psp_vmin }, { "vmax", psp_vmax }, { "vsge", psp_vsge }, { "vslt", psp_vslt },
+        { "vscl", psp_vscl }, { "vdot", psp_vdot },
+    };
+    static const uint32_t REGS[] = { 0x00, 0x05, 0x13, 0x20, 0x27, 0x41, 0x62, 0x7F, 0x1A, 0x55 };
+    float fast[128], slow[128];
+    int bad = 0, runs = 0;
+    for (size_t o = 0; o < sizeof OPS / sizeof OPS[0]; o++)
+        for (int size = 1; size <= 4; size++)
+            for (size_t a = 0; a < 10; a++)
+                for (size_t b = 0; b < 10; b++) {
+                    const uint32_t vs = REGS[a], vt = REGS[b];
+                    const uint32_t vd = (a + b) % 3 == 0 ? vs : (a + b) % 3 == 1 ? vt : REGS[(a * 3 + b) % 10];
+                    fill_regs((unsigned)(o * 7919 + size * 104729 + a * 31 + b));
+                    OPS[o].fn(vd, vs, vt, size);
+                    memcpy(fast, psp_cpu.v, sizeof fast);
+                    fill_regs((unsigned)(o * 7919 + size * 104729 + a * 31 + b));
+                    psp_vfpu_set_prefix(0, 0xE4);
+                    psp_vfpu_set_prefix(1, 0xE4);
+                    psp_vfpu_set_prefix(2, 0);
+                    OPS[o].fn(vd, vs, vt, size);
+                    memcpy(slow, psp_cpu.v, sizeof slow);
+                    runs++;
+                    if (memcmp(fast, slow, sizeof fast) != 0 && bad++ < 5)
+                        printf("FAIL fast path %s size %d vd %02X vs %02X vt %02X differs\n",
+                               OPS[o].name, size, vd, vs, vt);
+                }
+    CHECK(bad == 0, "%d of %d fast-path runs differ from the prefix path", bad, runs);
+    CHECK(!psp_vfpu_prefix_pending(), "prefixes consumed");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -445,6 +492,7 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vidt();
+    test_fast_paths();
 
     psp_mem_free();
 

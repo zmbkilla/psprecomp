@@ -63,6 +63,14 @@ int psp_mem_map_module(uint32_t base, uint32_t size);
  * rejected rather than silently truncated. */
 void *psp_mem_ptr(uint32_t addr, uint32_t size);
 
+/* Called by psp_mem_ptr for every VRAM access, before the pointer is handed
+ * out, with the VRAM offset and size. Every CPU load and store of the
+ * recompiled code and every HLE copy goes through psp_mem_ptr, so a GPU
+ * backend whose render targets run ahead of emulated VRAM can make exactly
+ * the bytes being touched current here -- lazily, instead of flushing all of
+ * VRAM at every GE sync. NULL (the default) = no hook. */
+void psp_mem_set_vram_hook(void (*fn)(uint32_t off, uint32_t size));
+
 /* The PSP is little-endian and so is every host we target, so these are plain
  * loads once the address is resolved. Unmapped accesses return 0 / are dropped
  * and bump psp_mem_bad_access — a recompiled game that starts faulting here is
