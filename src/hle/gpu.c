@@ -57,6 +57,7 @@ static float    g_world[12], g_view[12], g_proj[16], g_tgen[12];
 static float    g_bone[8 * 12];
 static uint32_t g_world_i, g_view_i, g_proj_i, g_tgen_i, g_bone_i;
 static uint8_t  g_clut[1024];            /* the CLUT cache, filled by CLOAD */
+static uint64_t g_clut_hash;             /* FNV-1a of g_clut, updated by CLOAD */
 static uint64_t g_pixels;
 /* Profiling counters (rasterizer workload). */
 static uint64_t c_tested, c_shaded, c_textured, c_linear, c_sprite_px, c_tri_px, c_blend, c_clear;
@@ -81,6 +82,7 @@ void psp_gpu_reset(void) {
     memset(g_bone, 0, sizeof g_bone);
     g_world_i = g_view_i = g_proj_i = g_tgen_i = g_bone_i = 0;
     memset(g_clut, 0, sizeof g_clut);
+    g_clut_hash = 0;
     /* Defaults where a zero register would be unusable rather than merely
      * unset: 8888 framebuffer, identity matrices, a full-screen scissor and
      * always-passing tests. Every game sets these explicitly. */
@@ -1243,25 +1245,65 @@ static int g_null_backend(void) { return psp_render_current() == &psp_render_nul
 
 /* Draw `count` vertices of primitive `type` from the current vertex (and
  * index) buffers. */
+static int   g_dump_req;
+static long  g_dump_flip = -1;
+static FILE *g_dump_file;
+
+/* Describe every draw of the next whole frame into `path` (F12 in the host
+ * window). Same format as PSP2I_GE_DUMP_FLIP, which goes to stderr. */
+void psp_gpu_dump_next_frame(const char *path) {
+    if (g_dump_req) return;                      /* one at a time */
+    g_dump_file = fopen(path, "w");
+    if (!g_dump_file) { fprintf(stderr, "ge-dump: cannot write %s\n", path); return; }
+    g_dump_req = 1;
+    g_dump_flip = -1;
+    fprintf(stderr, "ge-dump: next frame -> %s\n", path);
+}
+
 /* PSP2I_GE_DUMP_FLIP=N: describe every draw of frame N (counted in display
  * flips) -- target, vertex format, primitive, texture, state, and for
  * transformed geometry the first vertices in clip space. */
 static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
-    static long want = -2;
+    static long want = -2, want_vb = -2;
     if (want == -2) { const char *e = getenv("PSP2I_GE_DUMP_FLIP"); want = e ? atol(e) : -1; }
-    if (want < 0 || psp_display_flips() != (uint64_t)want) return;
+    /* PSP2I_GE_DUMP_VBLANK=N: the first whole frame after vblank N (flip
+     * numbers drift with loading times; vblanks line up with --press). */
+    if (want_vb == -2) { const char *e = getenv("PSP2I_GE_DUMP_VBLANK"); want_vb = e ? atol(e) : -1; }
+    if (want_vb >= 0 && want < 0 && psp_sched_vblank_count() >= (uint64_t)want_vb)
+        want = (long)psp_display_flips() + 1;
+    /* psp_gpu_dump_next_frame(): one frame on request, into a file. */
+    if (g_dump_req) {
+        if (g_dump_flip < 0) g_dump_flip = (long)psp_display_flips() + 1;
+        if (psp_display_flips() > (uint64_t)g_dump_flip) {
+            if (g_dump_file) { fclose(g_dump_file); g_dump_file = NULL; }
+            fprintf(stderr, "ge-dump: frame %ld written\n", g_dump_flip);
+            g_dump_req = 0; g_dump_flip = -1;
+        }
+    }
+    FILE *out = stderr;
+    if (g_dump_req && g_dump_file && psp_display_flips() == (uint64_t)g_dump_flip) out = g_dump_file;
+    else if (want < 0 || psp_display_flips() != (uint64_t)want) return;
     const uint32_t vt = R[0x12];
-    fprintf(stderr, "ge-dump: prim %u x%u fb 0x%06X/%u fmt %d z 0x%06X/%u vt 0x%06X%s%s%s%s%s%s%s",
+    fprintf(out, "ge-dump: prim %u x%u fb 0x%06X/%u fmt %d z 0x%06X/%u vt 0x%06X%s%s%s%s%s%s%s",
             type, n, R[0x9C] & 0x1FFFF0u, R[0x9D] & 0x7FC, g_psm, R[0x9E] & 0x1FFFF0u, g_zbw, vt,
             VT_THROUGH(vt) ? " through" : "", g_clear ? " CLEAR" : "", (R[0x21] & 1) ? " blend" : "",
             (R[0x23] & 1) ? " ztest" : "", (R[0x22] & 1) ? " atest" : "", (R[0x17] & 1) ? " light" : "",
             (R[0x1D] & 1) ? " cull" : "");
     if (g_tex)
-        fprintf(stderr, " tex 0x%08X psm %u %ux%u bufw %u", tex_addr(0), R[0xC3] & 0xF, tex_w(0), tex_h(0), tex_bufw(0));
-    fprintf(stderr, " scissor %d,%d-%d,%d\n", g_sx0, g_sy0, g_sx1, g_sy1);
+        fprintf(out, " tex 0x%08X psm %u %ux%u bufw %u", tex_addr(0), R[0xC3] & 0xF, tex_w(0), tex_h(0), tex_bufw(0));
+    fprintf(out, " scissor %d,%d-%d,%d\n", g_sx0, g_sy0, g_sx1, g_sy1);
+    /* The state that decides how a UI quad looks: texture function and env
+     * colour, blending and fixed colours, alpha test, colour test, write
+     * masks, material colour for colourless vertices, shading, CLUT mode,
+     * texture filter and wrap. */
+    fprintf(out, "    state tfunc 0x%06X env 0x%06X blend 0x%06X fix %06X/%06X atest 0x%06X ctest %u "
+                 "mask rgb %06X a %02X zmask %u mat 0x%06X/%02X shade %u clut 0x%06X tflt 0x%06X twrap 0x%06X\n",
+            R[0xC9], R[0xCA] & 0xFFFFFF, R[0xDF], R[0xE0] & 0xFFFFFF, R[0xE1] & 0xFFFFFF, R[0xDB],
+            R[0x27] & 1, R[0xE8] & 0xFFFFFF, R[0xE9] & 0xFF, R[0xE7] & 1, R[0x55] & 0xFFFFFF, R[0x58] & 0xFF,
+            R[0x50] & 1, R[0xC5], R[0xC6], R[0xC7]);
     for (uint32_t i = 0; i < n && i < 3; i++) {
         const pvtx *p = &buf[i];
-        fprintf(stderr, "    v%u screen (%.1f, %.1f, z %.0f) uv (%.2f, %.2f) rgba (%.0f %.0f %.0f %.0f) clip (%.2f %.2f %.2f w %.3f)\n",
+        fprintf(out, "    v%u screen (%.1f, %.1f, z %.0f) uv (%.2f, %.2f) rgba (%.0f %.0f %.0f %.0f) clip (%.2f %.2f %.2f w %.3f)\n",
                 i, p->s.x, p->s.y, p->s.z, p->s.u, p->s.v, p->s.r, p->s.g, p->s.b, p->s.a,
                 p->clip[0], p->clip[1], p->clip[2], p->clip[3]);
     }
@@ -1269,16 +1311,16 @@ static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
         static uint64_t last;
         if (last != psp_display_flips()) {
             last = psp_display_flips();
-            fprintf(stderr, "    world  %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f | t %.3f %.3f %.3f\n",
+            fprintf(out, "    world  %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f | t %.3f %.3f %.3f\n",
                     g_world[0], g_world[1], g_world[2], g_world[3], g_world[4], g_world[5],
                     g_world[6], g_world[7], g_world[8], g_world[9], g_world[10], g_world[11]);
-            fprintf(stderr, "    view   %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f | t %.3f %.3f %.3f\n",
+            fprintf(out, "    view   %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f | t %.3f %.3f %.3f\n",
                     g_view[0], g_view[1], g_view[2], g_view[3], g_view[4], g_view[5],
                     g_view[6], g_view[7], g_view[8], g_view[9], g_view[10], g_view[11]);
-            fprintf(stderr, "    proj   %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
+            fprintf(out, "    proj   %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
                     g_proj[0], g_proj[1], g_proj[2], g_proj[3], g_proj[4], g_proj[5], g_proj[6], g_proj[7],
                     g_proj[8], g_proj[9], g_proj[10], g_proj[11], g_proj[12], g_proj[13], g_proj[14], g_proj[15]);
-            fprintf(stderr, "    viewport scale %.1f %.1f %.1f centre %.1f %.1f %.1f offset %.1f %.1f\n",
+            fprintf(out, "    viewport scale %.1f %.1f %.1f centre %.1f %.1f %.1f offset %.1f %.1f\n",
                     ge_float(R[0x42]), ge_float(R[0x43]), ge_float(R[0x44]),
                     ge_float(R[0x45]), ge_float(R[0x46]), ge_float(R[0x47]),
                     (R[0x4C] & 0xFFFF) / 16.0, (R[0x4D] & 0xFFFF) / 16.0);
@@ -1568,7 +1610,16 @@ static void fill_hw_state(psp_gpu_state *st) {
         k = k * 1099511628211ull ^ ((uint64_t)st->tex_psm << 1 | (uint64_t)st->tex_swz);
         k = k * 1099511628211ull ^ ((uint64_t)st->tex_w << 16 | st->tex_h);
         k = k * 1099511628211ull ^ st->tex_bufw;
-        if (st->tex_psm >= 4 && st->tex_psm <= 7) k = k * 1099511628211ull ^ (R[0xC5] | 0x100000000ull);
+        /* CLUT formats: the CLUT mode AND the palette's contents. Without the
+         * contents a backend that validates a texture once per frame reused
+         * the first palette for every later draw of the same image that
+         * frame -- PSP2i recolours its CLUT4 UI atlas per element, so after
+         * its save flow changed the palette order, dialogue text came out
+         * black and the HUD frame, prompt boxes and highlights vanished. */
+        if (st->tex_psm >= 4 && st->tex_psm <= 7) {
+            k = k * 1099511628211ull ^ (R[0xC5] | 0x100000000ull);
+            k = k * 1099511628211ull ^ g_clut_hash;
+        }
         st->tex_key = k;
         st->tex_linear = (int)((R[0xC6] >> 8) & 1);
         st->tex_clamp_u = (int)(R[0xC7] & 1); st->tex_clamp_v = (int)((R[0xC7] >> 8) & 1);
@@ -1648,6 +1699,24 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
 
 /* ---- block transfer ------------------------------------------------------------- */
 
+/* A GE sync (sceGeDrawSync / sceGeListSync) is where a game may start
+ * touching what the GE drew with the CPU -- the GE runs asynchronously on
+ * the hardware, so no correct game reads or writes rendered VRAM before one.
+ * With a hardware backend the newest pixels live in its render targets, not
+ * in emulated VRAM, so make VRAM current now and have every target re-check
+ * VRAM before its next draw (picking up whatever the CPU writes meanwhile).
+ *
+ * PSP2i copies 0xDC000 bytes of upper VRAM to RAM and back with plain loads
+ * and stores around each save. Without this, D3D11 handed it stale VRAM: the
+ * copy that comes back clobbered its UI atlas, and the HUD, prompt boxes and
+ * menu highlights vanished (and dialogue text went black) until restart.
+ * The software rasterizer draws into VRAM directly, so there it is a no-op. */
+void psp_gpu_cpu_sync(void) {
+    if (!g_hw) return;
+    g_hw->sync_vram(PSP_VRAM_BASE, 0x200000u);
+    g_hw->vram_written(PSP_VRAM_BASE, 0x200000u);
+}
+
 static void block_transfer(uint32_t arg) {
     const int bpp = (arg & 1) ? 4 : 2;
     uint32_t src = (R[0xB2] & 0xFFFFF0u) | ((R[0xB3] & 0x0F0000u) << 8);
@@ -1657,6 +1726,15 @@ static void block_transfer(uint32_t arg) {
     uint32_t dx = R[0xEC] & 0x3FF, dy = (R[0xEC] >> 10) & 0x3FF;
     uint32_t w = (R[0xEE] & 0x3FF) + 1, h = ((R[0xEE] >> 10) & 0x3FF) + 1;
     if (g_hw) g_hw->sync_vram(src, ((sy + h) * sw) * (uint32_t)bpp);
+    /* The destination too: a backend render target over these bytes may be
+     * ahead of VRAM, and its next readback writes whole rows -- it would
+     * overwrite what this transfer stores. Flushing first makes VRAM hold
+     * both, and vram_written below has the target pick the result up.
+     * Without it PSP2i's save flow, which parks its UI atlas in VRAM inside
+     * the scene target's rows and copies it back afterwards, got stale
+     * pixels back on D3D11: HUD, prompt boxes and highlights vanished and
+     * dialogue text turned black for the rest of the session. */
+    if (g_hw) g_hw->sync_vram(dst, ((dy + h) * dw) * (uint32_t)bpp);
     for (uint32_t y = 0; y < h; y++) {
         uint8_t *s = mem(src + ((sy + y) * sw + sx) * (uint32_t)bpp, w * (uint32_t)bpp);
         uint8_t *d = mem(dst + ((dy + y) * dw + dx) * (uint32_t)bpp, w * (uint32_t)bpp);
@@ -1687,6 +1765,12 @@ void psp_gpu_cmd(uint32_t cmd, uint32_t arg) {
         uint32_t src = (R[0xB0] & 0xFFFFF0u) | ((R[0xB1] & 0x0F0000u) << 8);
         uint8_t *p = mem(src, n);
         if (p && n <= sizeof g_clut) memcpy(g_clut, p, n);
+        /* Hash the palette now, so the texture key can carry it (see
+         * fill_hw_state): one CLUT4/8 image drawn with different palettes is
+         * a different texture to a backend's cache. */
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (size_t i = 0; i < sizeof g_clut; i++) h = (h ^ g_clut[i]) * 1099511628211ull;
+        g_clut_hash = h;
         break;
     }
     case 0xEA: block_transfer(arg); break;

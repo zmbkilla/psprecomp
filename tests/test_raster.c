@@ -246,6 +246,78 @@ static void test_triangle_strip(void) {
     CHECK(pixel(100, 100) == 0xFFFFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
 }
 
+/* A backend's texture cache identifies textures by tex_key. For CLUT formats
+ * the key must change with the palette's CONTENTS, not just the CLUT mode:
+ * PSP2i draws one CLUT4 UI atlas with several palettes per frame, and the
+ * D3D11 cache (which re-validates a key once per frame) reused the first
+ * palette for every later draw -- black dialogue text, missing HUD frame,
+ * prompt boxes and selection highlights after the game's save flow. */
+#define TEXDATA 0x08820000u
+#define CLUTA   0x08830000u
+#define CLUTB   0x08830040u
+static uint64_t g_keys[8];
+static int g_nkeys;
+static int key_draw(const psp_gpu_state *st, const psp_gpu_vertex *v, int n) {
+    (void)v; (void)n;
+    if (st->tex && g_nkeys < 8) g_keys[g_nkeys++] = st->tex_key;
+    return 0;
+}
+static void key_sync(uint32_t a, uint32_t b) { (void)a; (void)b; }
+static const psp_gpu_backend KEY_BACKEND = { "key-probe", key_draw, key_sync, key_sync };
+
+static void clut_sprite(uint32_t clut_addr) {
+    cmd(0xB0, clut_addr & 0xFFFFF0u);              /* CBP */
+    cmd(0xB1, (clut_addr >> 8) & 0x0F0000u);       /* CBW: address bits 24-27 */
+    cmd(0xC5, 3);                                  /* CMODE: 8888 */
+    cmd(0xC4, 2);                                  /* CLOAD: 2 x 32 bytes = 16 entries */
+    cmd(0x04, (6u << 16) | 2);                     /* sprite */
+}
+
+static void test_clut_in_texture_key(void) {
+    psp_render_select("software");
+    psp_ge_reset();
+    clear_fb();
+    for (uint32_t i = 0; i < 16; i++) {
+        psp_write32(CLUTA + i * 4, 0xFF000000u | i);              /* two different palettes */
+        psp_write32(CLUTB + i * 4, 0xFFFFFFFFu - i);
+    }
+    for (uint32_t i = 0; i < 32; i++) psp_write8(TEXDATA + i, 0x11);  /* 8x8 CLUT4 */
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0xD4, 0);
+    cmd(0xD5, (271u << 10) | 479u);
+    cmd(0x12, 2u | (7u << 2) | (2u << 7) | (1u << 23));   /* 16-bit uv, 8888, 16-bit pos, through */
+    cmd(0x01, VERTS & 0xFFFFFF);
+    cmd(0x1E, 1);                                  /* texturing on */
+    cmd(0xA0, TEXDATA & 0xFFFFF0u);                /* TBP0 */
+    cmd(0xA8, ((TEXDATA >> 8) & 0x0F0000u) | 8);   /* TBW0 */
+    cmd(0xB8, 3u | (3u << 8));                     /* TSIZE0 8x8 */
+    cmd(0xC3, 4);                                  /* TPSM CLUT4 */
+    /* uv(u16 x2), colour, pos(s16 x3) -> 16-byte vertices */
+    static const int16_t XY[2][2] = { { 10, 10 }, { 18, 18 } };
+    for (int i = 0; i < 2; i++) {
+        uint32_t a = VERTS + (uint32_t)i * 16;
+        psp_write16(a, (uint16_t)(i * 8)); psp_write16(a + 2, (uint16_t)(i * 8));
+        psp_write32(a + 4, 0xFFFFFFFFu);
+        psp_write16(a + 8, (uint16_t)XY[i][0]); psp_write16(a + 10, (uint16_t)XY[i][1]);
+        psp_write16(a + 12, 0);
+    }
+    clut_sprite(CLUTA);
+    clut_sprite(CLUTB);
+    clut_sprite(CLUTA);
+    g_nkeys = 0;
+    psp_gpu_set_backend(&KEY_BACKEND);
+    end_list();
+    psp_gpu_set_backend(NULL);
+    CHECK(g_nkeys == 3, "three textured draws reached the backend, got %d", g_nkeys);
+    if (g_nkeys == 3) {
+        CHECK(g_keys[0] != g_keys[1], "a different palette gives a different texture key");
+        CHECK(g_keys[0] == g_keys[2], "the same palette gives the same texture key");
+    }
+}
+
 /* The backend interface itself. The software path is the reference every other
  * backend is diffed against, so selection has to be predictable: an unknown
  * name must not silently leave you rendering into nothing. */
@@ -294,6 +366,7 @@ int main(void) {
     test_transformed_is_skipped();
     test_triangle_strip();
     test_cull_front_face();
+    test_clut_in_texture_key();
     test_backend_selection();
 
     psp_mem_free();

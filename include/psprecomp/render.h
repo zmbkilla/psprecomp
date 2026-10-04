@@ -117,6 +117,15 @@ typedef struct {
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);
 
+/* GE sync point (sceGeDrawSync/ListSync): bring emulated VRAM up to date with
+ * the hardware backend's render targets, and have the targets re-check VRAM
+ * for CPU writes before their next draw. No-op for the software rasterizer. */
+void psp_gpu_cpu_sync(void);
+
+/* Diagnostics: describe every draw of the next whole frame (target, vertex
+ * format, state, first vertices) into the text file `path`. */
+void psp_gpu_dump_next_frame(const char *path);
+
 /* For backends: decode the current texture (level 0, as the draw state
  * describes it) into tex_w*tex_h RGBA8 pixels, 0xAABBGGRR. */
 void psp_gpu_decode_texture(uint32_t *out);

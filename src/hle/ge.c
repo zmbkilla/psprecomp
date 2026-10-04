@@ -341,6 +341,7 @@ static void hle_ListUpdateStallAddr(void) {
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (psp_arg(1) == 1) { psp_ret(q && !q->done ? 3 : 0); return; }   /* 3: stall reached */
+    psp_gpu_cpu_sync();                  /* the CPU may now touch what the GE drew */
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 static void hle_DrawSync(void) {
@@ -350,6 +351,7 @@ static void hle_DrawSync(void) {
         psp_ret(0);
         return;
     }
+    psp_gpu_cpu_sync();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
