@@ -211,7 +211,10 @@ static void hle_NpAuthCreateStartRequest(void) {
     psp_ret((uint32_t)(id + 1));                 /* request IDs start at 1 */
 }
 
+void psp_np2_poll(void);                         /* np2.c */
+
 void psp_np_poll(void) {
+    psp_np2_poll();
     for (int i = 0; i < MAX_AUTH; i++) {
         if (!g_req[i].used || g_req[i].delivered) continue;
         if (!g_req[i].failed && g_be && g_be->ticket_state) {

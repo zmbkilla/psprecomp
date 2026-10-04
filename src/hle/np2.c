@@ -142,11 +142,42 @@ static uint32_t new_request(uint32_t ctx, uint32_t opt, uint32_t assigned_ptr, u
     return id;
 }
 
-/* The request callback: cb(ctxId, reqId, event, errorCode, data, cbArg). */
+/* The request callback: cb(ctxId, reqId, event, errorCode, data, cbArg).
+ * Never during the request: the game records "query sent" after the call
+ * returns, and a callback run before that (a blocking server request leaves
+ * a vblank overdue, so a posted call would run at once) is overwritten by
+ * it -- PSP2i then waits forever ("connecting to world"). Callbacks are
+ * queued and posted from psp_np2_poll a few vblanks later, as the
+ * firmware's matching thread answers some time after the request. */
+#define CB_DELAY_POLLS 3
+#define MAX_PENDING 16
+static struct { uint32_t cb, a[6]; unsigned due; } g_pending[MAX_PENDING];
+static int g_npending;
+static unsigned g_polls;
+
 static void deliver(uint32_t ctx, uint32_t req, uint32_t ev, uint32_t err, uint32_t data, uint32_t cb, uint32_t cb_arg) {
     m2_log("-> %s callback 0x%08X(ctx %u, req %u, event 0x%04X, error 0x%08X, data 0x%08X, arg 0x%08X)%s",
            event_name(ev), cb, ctx, req, ev, err, data, cb_arg, cb ? "" : " -- no callback, dropped");
-    if (cb) psp_sched_post_call6(cb, ctx, req, ev, err, data, cb_arg);
+    if (!cb) return;
+    if (g_npending >= MAX_PENDING) { m2_log("callback queue full: dropped"); return; }
+    g_pending[g_npending].cb = cb;
+    const uint32_t a[6] = { ctx, req, ev, err, data, cb_arg };
+    memcpy(g_pending[g_npending].a, a, sizeof a);
+    g_pending[g_npending].due = g_polls + CB_DELAY_POLLS;
+    g_npending++;
+}
+
+/* Once per vblank (from psp_np_poll). */
+void psp_np2_poll(void) {
+    g_polls++;
+    int k = 0;
+    for (int i = 0; i < g_npending; i++) {
+        if ((int)(g_polls - g_pending[i].due) >= 0) {
+            const uint32_t *a = g_pending[i].a;
+            psp_sched_post_call6(g_pending[i].cb, a[0], a[1], a[2], a[3], a[4], a[5]);
+        } else g_pending[k++] = g_pending[i];
+    }
+    g_npending = k;
 }
 
 /* ---- init / contexts ----------------------------------------------------------------- */
@@ -163,6 +194,7 @@ static void hle_Init(void) {
 static void hle_Term(void) {
     m2_log("Term()");
     memset(g_ctx, 0, sizeof g_ctx);
+    g_npending = 0;
     g_inited = 0;
     psp_ret(M2_OK);
 }
