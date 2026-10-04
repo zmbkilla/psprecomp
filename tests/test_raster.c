@@ -353,6 +353,89 @@ static void test_backend_selection(void) {
     CHECK(psp_render_select("software") == 0, "software reselectable");
 }
 
+/* Points and lines on a hardware backend: every pixel the software
+ * rasterizer writes arrives as a 1x1 quad on exactly that pixel, with that
+ * pixel's colour, and the backend is never asked to sync VRAM (which, on
+ * D3D11, was a pipeline stall per draw). */
+static psp_gpu_vertex g_rec[8192];
+static int g_nrec, g_nsync;
+static int rec_draw(const psp_gpu_state *st, const psp_gpu_vertex *v, int n) {
+    (void)st;
+    for (int i = 0; i < n && g_nrec < 8192; i++) g_rec[g_nrec++] = v[i];
+    return 0;
+}
+static void rec_sync(uint32_t a, uint32_t b) { (void)a; (void)b; g_nsync++; }
+static const psp_gpu_backend REC_BACKEND = { "record", rec_draw, rec_sync, rec_sync };
+
+static void lines_and_points_list(void) {
+    begin_list();
+    cmd(0xD4, 0);
+    cmd(0xD5, (271u << 10) | 479u);
+    /* lines: shallow, steep, diagonal, reversed, with a colour ramp */
+    vertex(0, 10, 10, 0xFF0000FFu);  vertex(1, 90, 30, 0xFFFF0000u);
+    vertex(2, 20, 40, 0xFF00FF00u);  vertex(3, 30, 120, 0xFF00FF00u);
+    vertex(4, 100, 100, 0xFFFFFFFFu); vertex(5, 60, 60, 0xFF808080u);
+    cmd(0x04, (1u << 16) | 6);                     /* PRIM lines, 6 vertices */
+    cmd(0x01, (VERTS + 6 * 12) & 0xFFFFFF);
+    vertex(6, 200, 10, 0xFF112233u); vertex(7, 260, 50, 0xFF445566u); vertex(8, 210, 90, 0xFF778899u);
+    cmd(0x04, (2u << 16) | 3);                     /* PRIM line strip */
+    cmd(0x01, (VERTS + 9 * 12) & 0xFFFFFF);
+    vertex(9, 300, 200, 0xFFABCDEFu); vertex(10, 301, 200, 0xFF00FFFFu); vertex(11, 450, 5, 0xFFFF00FFu);
+    cmd(0x04, (0u << 16) | 3);                     /* PRIM points */
+    end_list();
+}
+
+static void test_points_lines_on_backend(void) {
+    psp_render_select("software");
+    psp_gpu_set_backend(NULL);
+    psp_ge_reset();
+    clear_fb();
+    lines_and_points_list();
+    static uint32_t ref[272][480];
+    int nref = 0;
+    for (int y = 0; y < 272; y++)
+        for (int x = 0; x < 480; x++) { ref[y][x] = pixel(x, y); if (ref[y][x]) nref++; }
+    CHECK(nref > 200, "the software reference drew the lines and points (%d pixels)", nref);
+
+    psp_ge_reset();
+    clear_fb();
+    g_nrec = g_nsync = 0;
+    psp_gpu_set_backend(&REC_BACKEND);
+    lines_and_points_list();
+    psp_gpu_set_backend(NULL);
+    CHECK(g_nsync == 0, "points and lines never sync VRAM on a backend (%d syncs)", g_nsync);
+    CHECK(g_nrec % 6 == 0, "pixels arrive as 6-vertex quads (%d vertices)", g_nrec);
+
+    static uint8_t hit[272][480];
+    memset(hit, 0, sizeof hit);
+    int bad_shape = 0, bad_px = 0, bad_col = 0, quads = 0;
+    for (int q = 0; q + 6 <= g_nrec; q += 6) {
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for (int k = 0; k < 6; k++) {
+            const psp_gpu_vertex *v = &g_rec[q + k];
+            if (v->x < x0) x0 = v->x; if (v->x > x1) x1 = v->x;
+            if (v->y < y0) y0 = v->y; if (v->y > y1) y1 = v->y;
+        }
+        quads++;
+        if (x1 - x0 != 1.0f || y1 - y0 != 1.0f) { bad_shape++; continue; }
+        const int x = (int)x0, y = (int)y0;
+        if (x < 0 || y < 0 || x >= 480 || y >= 272 || !ref[y][x]) { bad_px++; continue; }
+        hit[y][x] = 1;
+        const psp_gpu_vertex *v = &g_rec[q];
+        const uint32_t want = ref[y][x];
+        const int dr = (int)(v->r + 0.5f) - (int)(want & 0xFF), dg = (int)(v->g + 0.5f) - (int)((want >> 8) & 0xFF);
+        const int db = (int)(v->b + 0.5f) - (int)((want >> 16) & 0xFF);
+        if (dr < -1 || dr > 1 || dg < -1 || dg > 1 || db < -1 || db > 1) bad_col++;
+    }
+    int missing = 0;
+    for (int y = 0; y < 272; y++) for (int x = 0; x < 480; x++) if (ref[y][x] && !hit[y][x]) missing++;
+    CHECK(bad_shape == 0, "every quad is one pixel (%d are not)", bad_shape);
+    CHECK(bad_px == 0, "no quad lands where the reference drew nothing (%d do)", bad_px);
+    CHECK(missing == 0, "every reference pixel is covered (%d missing of %d)", missing, nref);
+    CHECK(bad_col == 0, "quad colours match the reference to one step (%d differ)", bad_col);
+    CHECK(quads >= nref, "one quad per reference pixel at least (%d quads, %d pixels)", quads, nref);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -367,6 +450,7 @@ int main(void) {
     test_triangle_strip();
     test_cull_front_face();
     test_clut_in_texture_key();
+    test_points_lines_on_backend();
     test_backend_selection();
 
     psp_mem_free();

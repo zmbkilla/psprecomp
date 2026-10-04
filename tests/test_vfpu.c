@@ -10,6 +10,7 @@
 
 #include "psprecomp/vfpu.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -479,6 +480,94 @@ static void test_fast_paths(void) {
     CHECK(!psp_vfpu_prefix_pending(), "prefixes consumed");
 }
 
+/* vf2i / vi2f scale by 2^scale with an exact multiply instead of ldexp:
+ * every rounding mode and scale must match an ldexp reference, including
+ * NaN, infinities, denormals and out-of-range values. */
+static int32_t ref_f2i(int mode, float s, int scale) {
+    double x = ldexp((double)s, scale);
+    if (x != x) return 0x7FFFFFFF;
+    if (x >= 2147483647.0) return 0x7FFFFFFF;
+    if (x <= -2147483648.0) return (int32_t)0x80000000u;
+    switch (mode) {
+    case PSP_VF2I_NEAREST: return (int32_t)nearbyint(x);
+    case PSP_VF2I_ZERO:    return (int32_t)x;
+    case PSP_VF2I_UP:      return (int32_t)ceil(x);
+    default:               return (int32_t)floor(x);
+    }
+}
+
+static void test_scaled_conversions(void) {
+    static const float F[] = { 0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 1.5f, 2.5f, -2.5f, 3.75f, 1e-30f, -1e-30f,
+                               1.17549435e-38f, 1e-45f, 65535.9f, -65536.1f, 1e9f, -3e9f, 3.4e38f, -3.4e38f };
+    int bad = 0;
+    int r[4];
+    psp_vfpu_regs(0x00, 1, r);
+    for (int mode = 0; mode < 4; mode++)
+        for (int sc = 0; sc < 32; sc++)
+            for (size_t i = 0; i < sizeof F / sizeof F[0] + 3; i++) {
+                float f = i < sizeof F / sizeof F[0] ? F[i] : i == sizeof F / sizeof F[0] ? INFINITY
+                        : i == sizeof F / sizeof F[0] + 1 ? -INFINITY : NAN;
+                psp_cpu.v[r[0]] = f;
+                psp_vf2i(mode, 0x01, 0x00, (uint32_t)sc, 1);
+                int r1[4];
+                psp_vfpu_regs(0x01, 1, r1);
+                uint32_t got;
+                memcpy(&got, &psp_cpu.v[r1[0]], 4);
+                if ((int32_t)got != ref_f2i(mode, f, sc) && bad++ < 5)
+                    printf("FAIL vf2i mode %d scale %d of %g: got %d want %d\n", mode, sc, (double)f, (int32_t)got, ref_f2i(mode, f, sc));
+            }
+    static const int32_t I[] = { 0, 1, -1, 2, 3, 12345, -12345, 0x7FFFFFFF, (int32_t)0x80000000u, 0x00FFFFFF, 0x01000001, -0x01000001 };
+    for (int sc = 0; sc < 32; sc++)
+        for (size_t i = 0; i < sizeof I / sizeof I[0]; i++) {
+            uint32_t bits = (uint32_t)I[i];
+            memcpy(&psp_cpu.v[r[0]], &bits, 4);
+            psp_vi2f(0x01, 0x00, (uint32_t)sc, 1);
+            int r1[4];
+            psp_vfpu_regs(0x01, 1, r1);
+            const float want = (float)ldexp((double)I[i], -sc);
+            if (memcmp(&psp_cpu.v[r1[0]], &want, 4) != 0 && bad++ < 5)
+                printf("FAIL vi2f scale %d of %d: got %g want %g\n", sc, I[i], (double)psp_cpu.v[r1[0]], (double)want);
+        }
+    CHECK(bad == 0, "%d scaled conversions differ from the ldexp reference", bad);
+}
+
+/* Source prefixes are decoded once when set: random prefixes on vadd must
+ * match a reference that decodes the prefix bits itself. */
+static float ref_src(uint32_t p, const float quad[4], int i) {
+    static const float K[8] = { 0.0f, 1.0f, 2.0f, 0.5f, 3.0f, 1.0f / 3.0f, 0.25f, 1.0f / 6.0f };
+    const int swz = (int)(p >> (2 * i)) & 3, ab = (int)(p >> (8 + i)) & 1;
+    const int cst = (int)(p >> (12 + i)) & 1, neg = (int)(p >> (16 + i)) & 1;
+    float x = cst ? K[swz + 4 * ab] : (ab ? fabsf(quad[swz]) : quad[swz]);
+    return neg ? -x : x;
+}
+
+static void test_prefix_decode(void) {
+    unsigned seed = 12345;
+    int bad = 0;
+    for (int n = 0; n < 2000; n++) {
+        seed = seed * 1103515245u + 12345u; const uint32_t ps = (seed >> 4) & 0xFFFFFu;
+        seed = seed * 1103515245u + 12345u; const uint32_t pt = (seed >> 4) & 0xFFFFFu;
+        const int size = 1 + n % 4;
+        fill_regs((unsigned)n);
+        float qs[4], qt[4];
+        int r[4];
+        psp_vfpu_regs(0x00, 4, r); for (int i = 0; i < 4; i++) qs[i] = psp_cpu.v[r[i]];
+        psp_vfpu_regs(0x04, 4, r); for (int i = 0; i < 4; i++) qt[i] = psp_cpu.v[r[i]];
+        /* sizes below 4 index the same quad: the operands start at lane 0 */
+        psp_vfpu_set_prefix(0, ps);
+        psp_vfpu_set_prefix(1, pt);
+        psp_vadd(0x08, 0x00, 0x04, size);
+        int d[4];
+        psp_vfpu_regs(0x08, size, d);
+        for (int i = 0; i < size; i++) {
+            const float want = ref_src(ps, qs, i) + ref_src(pt, qt, i);
+            if (memcmp(&psp_cpu.v[d[i]], &want, 4) != 0 && bad++ < 5)
+                printf("FAIL prefix decode: size %d lane %d prefixes %05X/%05X\n", size, i, ps, pt);
+        }
+    }
+    CHECK(bad == 0, "%d prefixed lanes differ from the reference decoder", bad);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -493,6 +582,8 @@ int main(void) {
     test_matrix_transform();
     test_vidt();
     test_fast_paths();
+    test_scaled_conversions();
+    test_prefix_decode();
 
     psp_mem_free();
 

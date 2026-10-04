@@ -45,10 +45,28 @@ void psp_vfpu_reset(void) {
     g_traps = 0;
 }
 
+/* A source prefix, decoded when it is set rather than on every operand read
+ * (prefixed compares and min/max run per vertex in PSP2i's model code). */
+typedef struct { int8_t lane[4], neg[4], abs_[4], cst[4]; float k[4]; } src_pfx;
+static src_pfx g_spfx[2];
+static const float PFX_CONST[8];
+
 void psp_vfpu_set_prefix(int which, uint32_t value) {
     if (which < 0 || which > 2) return;
     g_prefix[which] = value & 0xFFFFFu;
     g_prefix_set[which] = 1;
+    if (which < 2) {
+        const uint32_t p = g_prefix[which];
+        src_pfx *d = &g_spfx[which];
+        for (int i = 0; i < 4; i++) {
+            const int swz = (int)(p >> (2 * i)) & 3;
+            d->lane[i] = (int8_t)swz;
+            d->abs_[i] = (int8_t)((p >> (8 + i)) & 1);
+            d->cst[i]  = (int8_t)((p >> (12 + i)) & 1);
+            d->neg[i]  = (int8_t)((p >> (16 + i)) & 1);
+            d->k[i] = PFX_CONST[swz + 4 * d->abs_[i]];
+        }
+    }
 }
 
 int psp_vfpu_prefix_pending(void) {
@@ -161,25 +179,19 @@ static int read_src(uint32_t vreg, int size, float out[4], int which) {
     }
     int q[4];
     quad_regs(vreg, size, q);
-    float raw[4];
-    for (int i = 0; i < 4; i++) raw[i] = psp_cpu.v[q[i]];
     if (!g_prefix_set[which]) {
-        for (int i = 0; i < size; i++) out[i] = raw[i];
+        for (int i = 0; i < size; i++) out[i] = psp_cpu.v[q[i]];
         return size;
     }
-    const uint32_t p = g_prefix[which];
+    const src_pfx *d = &g_spfx[which];
     for (int i = 0; i < size; i++) {
-        const int swz = (int)(p >> (2 * i)) & 3;
-        const int abs_ = (int)(p >> (8 + i)) & 1;
-        const int cst = (int)(p >> (12 + i)) & 1;
-        const int neg = (int)(p >> (16 + i)) & 1;
         float x;
-        if (cst) x = PFX_CONST[swz + 4 * abs_];
+        if (d->cst[i]) x = d->k[i];
         else {
-            x = raw[swz];
-            if (abs_) x = fabsf(x);
+            x = psp_cpu.v[q[d->lane[i]]];
+            if (d->abs_[i]) x = fabsf(x);
         }
-        out[i] = neg ? -x : x;
+        out[i] = d->neg[i] ? -x : x;
     }
     return size;
 }
@@ -411,6 +423,16 @@ static float sat0(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
 
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
+    if (NO_PREFIX(size) && op <= PSP_VU_NEG) {
+        const int8_t *S = g_regs_tab[size - 1][vs & 127], *D = g_regs_tab[size - 1][vd & 127];
+        float o[4];
+        for (int i = 0; i < size; i++) {
+            const float a = psp_cpu.v[S[i]];
+            o[i] = op == PSP_VU_MOV ? a : op == PSP_VU_ABS ? fabsf(a) : -a;
+        }
+        for (int i = 0; i < size; i++) psp_cpu.v[D[i]] = o[i];
+        return;
+    }
     float s[4], out[4];
     read_src(vs, size, s, 0);
     for (int i = 0; i < size; i++) {
@@ -453,12 +475,19 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
 /* vf2in / vf2iz / vf2iu / vf2id: float to int after scaling by 2^scale, with
  * the rounding mode the instruction names. Out-of-range values saturate, and
  * NaN converts to 0x7FFFFFFF. */
+/* 2^k and 2^-k for the 5-bit scale fields, exactly. A float or an int32
+ * times one of these is exact in double (no overflow or underflow at these
+ * ranges), so it equals ldexp -- which in the CRT costs a fmod and a truncf
+ * per call, about 3% of the lobby's frame in vi2f/vf2i alone. */
+static double pow2_up(uint32_t k)   { return (double)(1u << (k & 31)); }
+static double pow2_down(uint32_t k) { return 1.0 / (double)(1u << (k & 31)); }
+
 void psp_vf2i(int mode, uint32_t vd, uint32_t vs, uint32_t scale, int size) {
     float s[4];
     uint32_t out[4];
     read_src(vs, size, s, 0);
     for (int i = 0; i < size; i++) {
-        double x = ldexp((double)s[i], (int)scale);
+        double x = (double)s[i] * pow2_up(scale);
         int32_t r;
         if (x != x)                     r = 0x7FFFFFFF;
         else if (x >= 2147483647.0)     r = 0x7FFFFFFF;
@@ -482,7 +511,7 @@ void psp_vi2f(uint32_t vd, uint32_t vs, uint32_t scale, int size) {
     uint32_t s[4];
     float out[4];
     read_src_bits(vs, size, s, 0);
-    for (int i = 0; i < size; i++) out[i] = (float)ldexp((double)(int32_t)s[i], -(int)scale);
+    for (int i = 0; i < size; i++) out[i] = (float)((double)(int32_t)s[i] * pow2_down(scale));
     write_dst(vd, size, out);
     consume();
 }

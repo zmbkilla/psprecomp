@@ -1674,11 +1674,65 @@ uint64_t psp_gpu_texture_hash(void) {
 static uint32_t fb_span(void) { return ((uint32_t)g_sy1 + 1) * g_fbw * (g_psm == 3 ? 4u : 2u); }
 static uint32_t zb_span(void) { return ((uint32_t)g_sy1 + 1) * g_zbw * 2u; }
 
+/* Points and lines for the hardware backend: every pixel the software
+ * rasterizer would write (fragment() in rasterize_rows / raster_line, the
+ * same DDA and the same per-pixel colour, depth and texture coordinates)
+ * becomes a 1x1 quad on exactly that pixel. So the backend covers the same
+ * pixels as the reference without the colour buffer leaving it: before,
+ * every point or line draw read the whole target back, rasterized on the
+ * CPU and re-uploaded it -- two pipeline stalls per frame while PSP2i's
+ * player walks through the lobby. */
+static void pixel_out(const vtx *f, int x, int y, float z, float u, float v) {
+    vtx q[4];
+    for (int k = 0; k < 4; k++) {
+        q[k] = *f;
+        q[k].x = (float)(x + (k & 1));
+        q[k].y = (float)(y + (k >> 1));
+        q[k].z = z; q[k].w = 1.0f; q[k].u = u; q[k].v = v;
+    }
+    hw_push(&q[0], f); hw_push(&q[1], f); hw_push(&q[2], f);
+    hw_push(&q[1], f); hw_push(&q[3], f); hw_push(&q[2], f);
+}
+
+static void line_out(const vtx *a, const vtx *b) {
+    float dx = b->x - a->x, dy = b->y - a->y;
+    int n = (int)fmaxf(fabsf(dx), fabsf(dy));
+    if (n <= 0) n = 1;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / (float)n;
+        vtx f = *b;
+        f.r = a->r + (b->r - a->r) * t; f.g = a->g + (b->g - a->g) * t;
+        f.b = a->b + (b->b - a->b) * t; f.a = a->a + (b->a - a->a) * t;
+        pixel_out(&f, (int)(a->x + dx * t), (int)(a->y + dy * t), a->z + (b->z - a->z) * t,
+                  a->u + (b->u - a->u) * t, a->v + (b->v - a->v) * t);
+    }
+}
+
+static void collect_points_lines(uint32_t type, const pvtx *buf, uint32_t n) {
+    if (type == 0) {
+        for (uint32_t i = 0; i < n; i++)
+            if (buf[i].clip[3] > W_EPS)
+                pixel_out(&buf[i].s, (int)buf[i].s.x, (int)buf[i].s.y, buf[i].s.z, buf[i].s.u, buf[i].s.v);
+    } else if (type == 1) {
+        for (uint32_t i = 0; i + 1 < n; i += 2) line_out(&buf[i].s, &buf[i + 1].s);
+    } else {
+        for (uint32_t i = 0; i + 1 < n; i++) line_out(&buf[i].s, &buf[i + 1].s);
+    }
+}
+
 /* Draw on the hardware backend. Returns 1 if handled. Draws the backend
- * refuses, and points and lines, are rasterized in software against a VRAM
- * the backend has synchronised first and is told about afterwards. */
+ * refuses are rasterized in software against a VRAM the backend has
+ * synchronised first and is told about afterwards. */
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
-    if (type >= 3 && type <= 6) {
+    if (type <= 2) {
+        g_hwn = 0;
+        collect_points_lines(type, buf, n);
+        if (!g_hwn) return 1;
+        psp_gpu_state st;
+        fill_hw_state(&st);
+        if (g_hw->draw(&st, g_hwv, g_hwn) == 0) { g_hw_draws++; return 1; }
+        g_hw_fallback++;
+    } else if (type <= 6) {
         g_collect = 1;
         g_hwn = 0;
         rasterize_rows(type, buf, n);
