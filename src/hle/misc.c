@@ -193,11 +193,40 @@ static uint64_t buffer_us(const audio_ch *c) {
     return (uint64_t)c->samples * 1000000u / AUDIO_RATE;
 }
 
-static void output(int blocking) {
+/* The host's audio device, if it has one (psp_audio_set_sink). Each accepted
+ * buffer is handed over as interleaved stereo s16 with the channel volume
+ * already applied. */
+static psp_audio_sink_fn g_sink;
+void psp_audio_set_sink(psp_audio_sink_fn fn) { g_sink = fn; }
+
+#define AUDIO_FORMAT_MONO 0x10u
+#define AUDIO_VOLUME_MAX  0x8000
+
+static void to_sink(uint32_t ch, const audio_ch *c, uint32_t buf, int lvol, int rvol) {
+    if (!g_sink || !buf || !c->samples || c->samples > 65536) return;
+    static int16_t pcm[65536 * 2];
+    const int mono = (c->format & AUDIO_FORMAT_MONO) != 0;
+    for (uint32_t i = 0; i < c->samples; i++) {
+        int32_t l, r;
+        if (mono) l = r = (int16_t)psp_read16(buf + i * 2);
+        else {
+            l = (int16_t)psp_read16(buf + i * 4);
+            r = (int16_t)psp_read16(buf + i * 4 + 2);
+        }
+        pcm[i * 2]     = (int16_t)(l * lvol / AUDIO_VOLUME_MAX);
+        pcm[i * 2 + 1] = (int16_t)(r * rvol / AUDIO_VOLUME_MAX);
+    }
+    g_sink((int)ch, pcm, c->samples);
+}
+
+/* (ch, vol, buf) or, panned, (ch, leftVol, rightVol, buf). */
+static void output(int blocking, int panned) {
     uint32_t ch = psp_arg(0);
     if (ch >= AUDIO_CHANNELS) { psp_ret(0x80260003); return; }          /* INVALID_CHANNEL */
     if (!g_audio[ch].reserved) { psp_ret(0x80260008); return; }         /* NOT_RESERVED */
     audio_ch *c = &g_audio[ch];
+    const int lvol = (int)(psp_arg(1) & 0xFFFF), rvol = (int)(psp_arg(panned ? 2 : 1) & 0xFFFF);
+    const uint32_t buf = psp_arg(panned ? 3 : 2);
     g_audio_blocks++;
     if (psp_sched_active()) {
         uint64_t now = psp_sched_now_us();
@@ -208,10 +237,12 @@ static void output(int blocking) {
         }
         c->busy_until = (c->busy_until > now ? c->busy_until : now) + buffer_us(c);
     }
+    to_sink(ch, c, buf, lvol, rvol);
     psp_ret(c->samples);
 }
-static void hle_Output(void)         { output(1); }
-static void hle_OutputNonBlock(void) { output(0); }
+static void hle_Output(void)               { output(1, 0); }
+static void hle_OutputPanned(void)         { output(1, 1); }
+static void hle_OutputPannedNonBlock(void) { output(0, 1); }
 
 /* Samples still queued on the channel; zero means "ready for more". */
 static void hle_GetChannelRestLength(void) {
@@ -283,8 +314,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
     psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_Output);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_Output);
-    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputNonBlock);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPanned);
+    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPannedNonBlock);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);

@@ -156,6 +156,32 @@ void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_request_exit(void);       /* host side: window closed, time limit */
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+
+/* Audio out: called for every buffer a game outputs through sceAudio, as
+ * interleaved stereo s16 at 44.1 kHz with the channel volume applied. The
+ * host plays it (or records it); without a sink the output is discarded and
+ * only the timing is emulated. */
+typedef void (*psp_audio_sink_fn)(int channel, const int16_t *stereo, uint32_t frames);
+void psp_audio_set_sink(psp_audio_sink_fn fn);
+
+/* ATRAC3 / ATRAC3plus decoding is supplied by the host (the runtime has no
+ * codec of its own; see src/hle/atrac.c). Without one, sceAtracDecodeData
+ * produces silence of the right length. */
+typedef struct {
+    const char *name;
+    /* A decoder for one stream: ATRAC3plus (at3plus = 1) or ATRAC3, the
+     * source channel count, nBlockAlign (bytes per frame) and sample rate.
+     * NULL if the format is unsupported. */
+    void *(*open)(int at3plus, int channels, int block_align, int sample_rate);
+    /* Decode one frame of `size` bytes into interleaved stereo s16 (mono is
+     * duplicated). Returns samples written (at most max_samples), or -1 if
+     * the codec failed for good. */
+    int   (*decode)(void *dec, const uint8_t *frame, int size, int16_t *stereo, int max_samples);
+    /* Forget the previous frame (before a seek). */
+    void  (*reset)(void *dec);
+    void  (*close)(void *dec);
+} psp_atrac_codec;
+void psp_atrac_set_codec(const psp_atrac_codec *codec);
 uint64_t psp_audio_blocks(void);
 
 void psp_font_init(void);
