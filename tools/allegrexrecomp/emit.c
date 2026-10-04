@@ -551,7 +551,12 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
         return;
     case A_VCST:
-        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
+        /* The constant's index is bits 16-20 of the word (where vt would
+         * be), not the vs field: vcst.s vd, VFPU_2_PI is 0xD0650000 | vd.
+         * Taking vs (always 0 there) made every vcst load constant 0 --
+         * in PSP2i that zeroed heading * 2/pi before vsin/vcos (0x08D2FF54),
+         * so NPCs and enemies all moved along one world axis. */
+        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, (in->raw >> 16) & 31u, in->vsize);
         return;
 
     /* Immediate loads: the value is in the instruction, not a register. */

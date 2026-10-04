@@ -80,6 +80,9 @@ void psp_mem_watch_write(uint32_t addr);
 /* Called once, at the first out-of-range access (a host can dump memory). */
 void psp_mem_set_first_bad_hook(void (*fn)(uint32_t addr));
 int psp_mem_watch_hits(void);
+/* Called on each reported watch hit (after the line is printed): a host can
+ * add context, e.g. which recompiled functions are on the stack. */
+void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value));
 
 uint8_t  psp_read8 (uint32_t addr);
 uint16_t psp_read16(uint32_t addr);

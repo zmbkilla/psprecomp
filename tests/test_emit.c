@@ -271,6 +271,39 @@ int main(void) {
         a_analysis_free(&an4);
     }
 
+    /* vcst takes its constant index from bits 16-20 of the word, not from the
+     * vs field. The index used to be read from vs (always 0), so every vcst
+     * loaded constant 0: PSP2i's heading-to-rotation routine (0x08D2FF54,
+     * angle * VFPU_2_PI before vsin/vcos) became an identity rotation, and
+     * NPCs and enemies all moved along the same world axis.
+     *
+     *   0: vcst.s v32, VFPU_2_PI   (0xD0650020, the word at 0x08D2FF60)
+     *   1: vcst.s v0, VFPU_PI      (0xD0690000)
+     *   2: jr $ra
+     *   3: nop                                                              */
+    {
+        static const uint32_t CCODE[] = { 0xD0650020u, 0xD0690000u, 0x03E00008u, 0x00000000u };
+        uint8_t cc[sizeof CCODE];
+        for (size_t i = 0; i < sizeof CCODE / sizeof CCODE[0]; i++)
+            for (int k = 0; k < 4; k++) cc[i * 4 + k] = (uint8_t)(CCODE[i] >> (8 * k));
+        a_analysis an5;
+        memset(&an5, 0, sizeof an5);
+        an5.code = cc;
+        an5.base = BASE;
+        an5.size = (uint32_t)sizeof cc;
+        uint32_t seed5 = BASE;
+        CHECK(a_discover(&an5, &seed5, 1) == 0, "discovery runs (vcst)");
+        o.prefix = "t_emit5";
+        CHECK(a_emit(&an5, &o) == 0, "emission succeeds (vcst)");
+        char *s5 = slurp("./t_emit5_funcs.c", NULL);
+        if (s5) {
+            expect_contains(s5, "psp_vcst(32, 5, 1);", "vcst.s v32, VFPU_2_PI loads constant 5");
+            expect_contains(s5, "psp_vcst(0, 9, 1);", "vcst.s v0, VFPU_PI loads constant 9");
+            free(s5);
+        }
+        a_analysis_free(&an5);
+    }
+
     /* A computed jump into one of several entry points of a block, the
      * pointer adjusted in likely-branch delay slots (PSP2i's vertex decoder
      * at 0x08D8B978 picks its float path this way). Every adjusted pointer

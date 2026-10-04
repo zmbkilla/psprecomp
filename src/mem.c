@@ -18,11 +18,16 @@ static int g_whits;
 void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
 int psp_mem_watch_hits(void) { return g_whits; }
 
+static void (*g_watch_hook)(uint32_t addr, uint32_t value);
+void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value)) { g_watch_hook = fn; }
+
 static void note_write(uint32_t addr, uint32_t width, uint32_t value) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
-    if (g_whits++ < 32)
+    if (g_whits++ < 32) {
         fprintf(stderr, "write%u 0x%08X to 0x%08X (watch 0x%08X) from fn 0x%08X\n",
                 width * 8, value, addr, g_wwatch, psp_trace_last());
+        if (g_watch_hook) g_watch_hook(addr, value);
+    }
 }
 
 /* Bad accesses were only ever counted, which says an initialiser went wrong
