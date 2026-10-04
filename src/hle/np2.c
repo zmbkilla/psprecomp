@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 const psp_np_backend *psp_np_backend_get(void);     /* np.c */
 int psp_np_signed_in(void);                          /* np.c */
@@ -147,11 +148,21 @@ static uint32_t new_request(uint32_t ctx, uint32_t opt, uint32_t assigned_ptr, u
  * returns, and a callback run before that (a blocking server request leaves
  * a vblank overdue, so a posted call would run at once) is overwritten by
  * it -- PSP2i then waits forever ("connecting to world"). Callbacks are
- * queued and posted from psp_np2_poll a few vblanks later, as the
- * firmware's matching thread answers some time after the request. */
+ * queued and posted from psp_np2_poll a few vblanks *and* some real time
+ * later, as the firmware's matching thread answers some time after the
+ * request. Vblanks alone are not enough: after a blocking request the
+ * scheduler replays the missed vblanks in a burst, before the game runs
+ * another instruction. */
 #define CB_DELAY_POLLS 3
+#define CB_DELAY_MS    100
 #define MAX_PENDING 16
-static struct { uint32_t cb, a[6]; unsigned due; } g_pending[MAX_PENDING];
+static struct { uint32_t cb, a[6]; unsigned due; uint64_t due_ms; } g_pending[MAX_PENDING];
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 static int g_npending;
 static unsigned g_polls;
 
@@ -164,6 +175,7 @@ static void deliver(uint32_t ctx, uint32_t req, uint32_t ev, uint32_t err, uint3
     const uint32_t a[6] = { ctx, req, ev, err, data, cb_arg };
     memcpy(g_pending[g_npending].a, a, sizeof a);
     g_pending[g_npending].due = g_polls + CB_DELAY_POLLS;
+    g_pending[g_npending].due_ms = now_ms() + CB_DELAY_MS;
     g_npending++;
 }
 
@@ -172,7 +184,7 @@ void psp_np2_poll(void) {
     g_polls++;
     int k = 0;
     for (int i = 0; i < g_npending; i++) {
-        if ((int)(g_polls - g_pending[i].due) >= 0) {
+        if ((int)(g_polls - g_pending[i].due) >= 0 && now_ms() >= g_pending[i].due_ms) {
             const uint32_t *a = g_pending[i].a;
             psp_sched_post_call6(g_pending[i].cb, a[0], a[1], a[2], a[3], a[4], a[5]);
         } else g_pending[k++] = g_pending[i];
