@@ -17,12 +17,21 @@
  *   GetWorldInfoList                    the server's worlds (backend),
  *                                       through the request callback
  *   RegisterSignalingCallback, SignalingGetConnectionStatus, AbortRequest
- *   room requests (CreateJoinRoom, JoinRoom, SearchRoom, LeaveRoom, room
- *   data, room messages, kick, user info)  not yet carried to the server:
- *                                       logged with their parameters, and
- *                                       answered through the request
- *                                       callback with "service unavailable"
- *                                       so the game is never left waiting
+ *   room requests (SearchRoom, CreateJoinRoom, JoinRoom, LeaveRoom, room
+ *   data, room messages)                carried by the backend
+ *                                       (m2_room_request); it completes them
+ *                                       with psp_np2_request_done, and turns
+ *                                       server notifications into room
+ *                                       events / room messages
+ *   KickoutRoomMember, GetUserInfoList  the server has no such request:
+ *                                       answered as PPSSPP does (kick: OK;
+ *                                       user info: service unavailable)
+ *
+ * Room event callbacks (registered by CreateJoinRoom / JoinRoom) are called
+ * as PSP2i's handlers read them (0x08CB3410, 0x08CB37B8):
+ *   room event:   cb(ctxId, memberId, roomId lo, roomId hi, event, data, arg)
+ *   room message: cb(ctxId, 0, roomId lo, roomId hi, memberId, event, data, arg)
+ * (the 64-bit room ID in an even register pair, as the PSP EABI passes it).
  *
  * Request callbacks are called as the firmware calls them:
  *   cb(ctxId, reqId, event, errorCode, data, cbArg)
@@ -97,7 +106,12 @@ static struct {
     uint16_t servers[MAX_SERVERS];
     int nservers;
     uint32_t sig_cb, sig_arg;
+    uint32_t room_cb, room_arg, msg_cb, msg_arg;    /* from CreateJoinRoom / JoinRoom */
 } g_ctx[MAX_CTX + 1];                /* context IDs 1..7 */
+
+/* Requests waiting for the backend: request ID -> where the answer goes. */
+#define MAX_REQS 64
+static struct { int used; uint32_t id, ctx, cb, arg, ev; } g_req[MAX_REQS];
 
 /* Event data handed to callbacks: a few rotating blocks of guest memory. */
 #define EV_SLOTS 8
@@ -113,6 +127,27 @@ static uint32_t ev_block(void) {
 }
 
 static int ctx_ok(uint32_t id) { return id >= 1 && id <= MAX_CTX && g_ctx[id].used; }
+
+/* Variable-size event data (room data with its members and attributes): a
+ * ring in guest memory. The game copies what it needs during the callback;
+ * a block is reused only after the whole ring has been gone round. */
+#define RING_SIZE (256u * 1024u)
+static uint32_t g_ring, g_ring_size, g_ring_pos;
+uint32_t psp_np2_alloc(uint32_t size) {
+    if (!g_ring) {
+        for (g_ring_size = RING_SIZE; g_ring_size >= 0x10000 && !g_ring; g_ring_size /= 2)
+            g_ring = psp_sysmem_alloc(g_ring_size, 1);
+        if (!g_ring) return 0;
+        g_ring_size *= 2;                                  /* undo the loop's last halving */
+    }
+    size = (size + 7u) & ~7u;
+    if (!size || size > g_ring_size) return 0;
+    if (g_ring_pos + size > g_ring_size) g_ring_pos = 0;
+    const uint32_t a = g_ring + g_ring_pos;
+    g_ring_pos += size;
+    for (uint32_t i = 0; i < size; i += 4) psp_write32(a + i, 0);
+    return a;
+}
 
 static const char *event_name(uint32_t ev) {
     switch (ev) {
@@ -155,8 +190,8 @@ static uint32_t new_request(uint32_t ctx, uint32_t opt, uint32_t assigned_ptr, u
  * another instruction. */
 #define CB_DELAY_POLLS 3
 #define CB_DELAY_MS    100
-#define MAX_PENDING 16
-static struct { uint32_t cb, a[6]; unsigned due; uint64_t due_ms; } g_pending[MAX_PENDING];
+#define MAX_PENDING 64
+static struct { uint32_t cb, a[8]; unsigned due; uint64_t due_ms; } g_pending[MAX_PENDING];
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -166,30 +201,71 @@ static uint64_t now_ms(void) {
 static int g_npending;
 static unsigned g_polls;
 
-static void deliver(uint32_t ctx, uint32_t req, uint32_t ev, uint32_t err, uint32_t data, uint32_t cb, uint32_t cb_arg) {
-    m2_log("-> %s callback 0x%08X(ctx %u, req %u, event 0x%04X, error 0x%08X, data 0x%08X, arg 0x%08X)%s",
-           event_name(ev), cb, ctx, req, ev, err, data, cb_arg, cb ? "" : " -- no callback, dropped");
-    if (!cb) return;
+static void queue_call(uint32_t cb, const uint32_t a[8]) {
     if (g_npending >= MAX_PENDING) { m2_log("callback queue full: dropped"); return; }
     g_pending[g_npending].cb = cb;
-    const uint32_t a[6] = { ctx, req, ev, err, data, cb_arg };
-    memcpy(g_pending[g_npending].a, a, sizeof a);
+    memcpy(g_pending[g_npending].a, a, sizeof g_pending[g_npending].a);
     g_pending[g_npending].due = g_polls + CB_DELAY_POLLS;
     g_pending[g_npending].due_ms = now_ms() + CB_DELAY_MS;
     g_npending++;
 }
 
+static void deliver(uint32_t ctx, uint32_t req, uint32_t ev, uint32_t err, uint32_t data, uint32_t cb, uint32_t cb_arg) {
+    m2_log("-> %s callback 0x%08X(ctx %u, req %u, event 0x%04X, error 0x%08X, data 0x%08X, arg 0x%08X)%s",
+           event_name(ev), cb, ctx, req, ev, err, data, cb_arg, cb ? "" : " -- no callback, dropped");
+    if (!cb) return;
+    const uint32_t a[8] = { ctx, req, ev, err, data, cb_arg, 0, 0 };
+    queue_call(cb, a);
+}
+
 /* Once per vblank (from psp_np_poll). */
 void psp_np2_poll(void) {
     g_polls++;
+    const psp_np_backend *be = psp_np_backend_get();
+    if (g_inited && be && be->m2_poll) be->m2_poll();
     int k = 0;
     for (int i = 0; i < g_npending; i++) {
-        if ((int)(g_polls - g_pending[i].due) >= 0 && now_ms() >= g_pending[i].due_ms) {
-            const uint32_t *a = g_pending[i].a;
-            psp_sched_post_call6(g_pending[i].cb, a[0], a[1], a[2], a[3], a[4], a[5]);
-        } else g_pending[k++] = g_pending[i];
+        if ((int)(g_polls - g_pending[i].due) >= 0 && now_ms() >= g_pending[i].due_ms)
+            psp_sched_post_call8(g_pending[i].cb, g_pending[i].a);
+        else g_pending[k++] = g_pending[i];
     }
     g_npending = k;
+}
+
+/* ---- what the backend calls ----------------------------------------------------------- */
+
+void psp_np2_request_done(uint32_t req_id, uint32_t error, uint32_t data) {
+    for (int i = 0; i < MAX_REQS; i++) {
+        if (!g_req[i].used || g_req[i].id != req_id) continue;
+        g_req[i].used = 0;
+        deliver(g_req[i].ctx, req_id, g_req[i].ev, error, data, g_req[i].cb, g_req[i].arg);
+        return;
+    }
+    m2_log("answer for request %u, which no longer waits: dropped", req_id);
+}
+
+/* The context with room callbacks (the one that created or joined the room). */
+static int room_ctx(void) {
+    for (int i = 1; i <= MAX_CTX; i++) if (g_ctx[i].used && (g_ctx[i].room_cb || g_ctx[i].msg_cb)) return i;
+    return 0;
+}
+
+void psp_np2_room_event(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data) {
+    const int c = room_ctx();
+    m2_log("-> room event 0x%04X (room 0x%016llX, member %u, data 0x%08X) to callback 0x%08X",
+           event, (unsigned long long)room_id, member_id, data, c ? g_ctx[c].room_cb : 0);
+    if (!c || !g_ctx[c].room_cb) return;
+    const uint32_t a[8] = { (uint32_t)c, member_id, (uint32_t)room_id, (uint32_t)(room_id >> 32), event, data, g_ctx[c].room_arg, 0 };
+    queue_call(g_ctx[c].room_cb, a);
+}
+
+void psp_np2_room_message(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data) {
+    const int c = room_ctx();
+    m2_log("-> room message 0x%04X (room 0x%016llX, from member %u, data 0x%08X) to callback 0x%08X",
+           event, (unsigned long long)room_id, member_id, data, c ? g_ctx[c].msg_cb : 0);
+    if (!c || !g_ctx[c].msg_cb) return;
+    const uint32_t a[8] = { (uint32_t)c, 0, (uint32_t)room_id, (uint32_t)(room_id >> 32), member_id, event, data, g_ctx[c].msg_arg };
+    queue_call(g_ctx[c].msg_cb, a);
 }
 
 /* ---- init / contexts ----------------------------------------------------------------- */
@@ -206,6 +282,7 @@ static void hle_Init(void) {
 static void hle_Term(void) {
     m2_log("Term()");
     memset(g_ctx, 0, sizeof g_ctx);
+    memset(g_req, 0, sizeof g_req);
     g_npending = 0;
     g_inited = 0;
     psp_ret(M2_OK);
@@ -407,6 +484,43 @@ static void log_param(const char *what, uint32_t p, uint32_t n) {
     }
 }
 
+/* A room request carried by the backend: (ctx, reqParam *, optParam *,
+ * [roomEventOpt *, roomMsgOpt *,] u32 *assignedReqId). The room option
+ * structures are {callback, argument}. */
+static void room_request(const char *name, int kind, uint32_t ev, int assigned_arg) {
+    const uint32_t ctx = psp_arg(0), req = psp_arg(1), opt = psp_arg(2), assigned = psp_arg(assigned_arg);
+    if (!g_inited) { psp_ret(M2_ERROR_NOT_INITIALIZED); return; }
+    if (!ctx_ok(ctx)) { psp_ret(M2_ERROR_CONTEXT_NOT_FOUND); return; }
+    if (!assigned || !req) { psp_ret(M2_ERROR_INVALID_ARGUMENT); return; }
+    uint32_t cb, arg;
+    uint32_t id = new_request(ctx, opt, assigned, &cb, &arg);
+    if (kind == PSP_M2_SEND_ROOM_MESSAGE && !cb) { id = 0; psp_write32(assigned, 0); }   /* PSP2i: no callback, ID 0 */
+    if (assigned_arg == 5) {
+        const uint32_t ro = psp_arg(3), mo = psp_arg(4);
+        if (ro) { g_ctx[ctx].room_cb = psp_read32(ro); g_ctx[ctx].room_arg = psp_read32(ro + 4); }
+        if (mo) { g_ctx[ctx].msg_cb = psp_read32(mo); g_ctx[ctx].msg_arg = psp_read32(mo + 4); }
+        m2_log("%s: room event callback 0x%08X (arg 0x%08X), room message callback 0x%08X (arg 0x%08X)", name,
+               g_ctx[ctx].room_cb, g_ctx[ctx].room_arg, g_ctx[ctx].msg_cb, g_ctx[ctx].msg_arg);
+    }
+    m2_log("%s(ctx %u, param 0x%08X) request %u", name, ctx, req, id);
+    const psp_np_backend *be = psp_np_backend_get();
+    uint32_t err = M2_SERVER_ERROR_SERVICE_UNAVAILABLE;
+    if (psp_np_signed_in() && be && be->m2_room_request) {
+        int slot = -1;
+        for (int i = 0; i < MAX_REQS; i++) if (!g_req[i].used) { slot = i; break; }
+        if (slot >= 0) {
+            g_req[slot].used = 1; g_req[slot].id = id; g_req[slot].ctx = ctx;
+            g_req[slot].cb = cb; g_req[slot].arg = arg; g_req[slot].ev = ev;
+            const int rc = be->m2_room_request(kind, g_ctx[ctx].com_id, id, req);
+            if (rc == 0) { psp_ret(M2_OK); return; }
+            g_req[slot].used = 0;
+            err = (uint32_t)rc;
+        } else m2_log("%s: too many requests in flight", name);
+    } else m2_log("%s: not signed in, or no matching backend -> service unavailable", name);
+    deliver(ctx, id, ev, err, 0, cb, arg);
+    psp_ret(M2_OK);
+}
+
 /* Async request (ctx, reqParam *, optParam *, [roomEventCb, roomMsgCb,] u32 *assignedReqId). */
 static void unimplemented_request(const char *name, uint32_t ev, int assigned_arg) {
     const uint32_t ctx = psp_arg(0), req = psp_arg(1), opt = psp_arg(2), assigned = psp_arg(assigned_arg);
@@ -423,16 +537,28 @@ static void unimplemented_request(const char *name, uint32_t ev, int assigned_ar
     psp_ret(M2_OK);
 }
 
-static void hle_CreateJoinRoom(void)          { unimplemented_request("CreateJoinRoom", EV_CreateJoinRoom, 5); }
-static void hle_JoinRoom(void)                { unimplemented_request("JoinRoom", EV_JoinRoom, 5); }
-static void hle_LeaveRoom(void)               { unimplemented_request("LeaveRoom", EV_LeaveRoom, 3); }
-static void hle_SearchRoom(void)              { unimplemented_request("SearchRoom", EV_SearchRoom, 3); }
-static void hle_GetRoomDataExternalList(void) { unimplemented_request("GetRoomDataExternalList", EV_GetRoomDataExternalList, 3); }
-static void hle_SetRoomDataExternal(void)     { unimplemented_request("SetRoomDataExternal", EV_SetRoomDataExternal, 3); }
-static void hle_SetRoomDataInternal(void)     { unimplemented_request("SetRoomDataInternal", EV_SetRoomDataInternal, 3); }
-static void hle_SendRoomMessage(void)         { unimplemented_request("SendRoomMessage", EV_SendRoomMessage, 3); }
-static void hle_KickoutRoomMember(void)       { unimplemented_request("KickoutRoomMember", EV_KickoutRoomMember, 3); }
+static void hle_CreateJoinRoom(void)          { room_request("CreateJoinRoom", PSP_M2_CREATE_JOIN_ROOM, EV_CreateJoinRoom, 5); }
+static void hle_JoinRoom(void)                { room_request("JoinRoom", PSP_M2_JOIN_ROOM, EV_JoinRoom, 5); }
+static void hle_LeaveRoom(void)               { room_request("LeaveRoom", PSP_M2_LEAVE_ROOM, EV_LeaveRoom, 3); }
+static void hle_SearchRoom(void)              { room_request("SearchRoom", PSP_M2_SEARCH_ROOM, EV_SearchRoom, 3); }
+static void hle_GetRoomDataExternalList(void) { room_request("GetRoomDataExternalList", PSP_M2_GET_ROOM_DATA_EXTERNAL_LIST, EV_GetRoomDataExternalList, 3); }
+static void hle_SetRoomDataExternal(void)     { room_request("SetRoomDataExternal", PSP_M2_SET_ROOM_DATA_EXTERNAL, EV_SetRoomDataExternal, 3); }
+static void hle_SetRoomDataInternal(void)     { room_request("SetRoomDataInternal", PSP_M2_SET_ROOM_DATA_INTERNAL, EV_SetRoomDataInternal, 3); }
+static void hle_SendRoomMessage(void)         { room_request("SendRoomMessage", PSP_M2_SEND_ROOM_MESSAGE, EV_SendRoomMessage, 3); }
 static void hle_GetUserInfoList(void)         { unimplemented_request("GetUserInfoList", EV_GetUserInfoList, 3); }
+
+/* RPCN has no kick request; answered OK, as PPSSPP does. */
+static void hle_KickoutRoomMember(void) {
+    const uint32_t ctx = psp_arg(0), req = psp_arg(1), opt = psp_arg(2), assigned = psp_arg(3);
+    m2_log("KickoutRoomMember(ctx %u, param 0x%08X): not supported by the matching server -- answered OK", ctx, req);
+    if (!g_inited) { psp_ret(M2_ERROR_NOT_INITIALIZED); return; }
+    if (!ctx_ok(ctx)) { psp_ret(M2_ERROR_CONTEXT_NOT_FOUND); return; }
+    if (!assigned) { psp_ret(M2_ERROR_INVALID_ARGUMENT); return; }
+    uint32_t cb, arg;
+    const uint32_t id = new_request(ctx, opt, assigned, &cb, &arg);
+    deliver(ctx, id, EV_KickoutRoomMember, M2_OK, 0, cb, arg);
+    psp_ret(M2_OK);
+}
 
 void psp_np2_register(void) {
     psp_hle_register(0x2E61F6E1, "sceNpMatching2", NULL, hle_Init);                          /* sceNpMatching2Init */

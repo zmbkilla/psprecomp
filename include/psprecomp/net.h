@@ -79,11 +79,30 @@ typedef struct {
      * May be NULL: matching then reports the server unavailable. */
     int         (*m2_server_list)(const char *com_id, uint16_t *ids, int max, uint32_t *err);
     int         (*m2_world_list)(const char *com_id, uint16_t server_id, uint32_t *ids, int max, uint32_t *err);
+    /* Room requests (kind = PSP_M2_*): read the game's request at guest
+     * address `param` now (game thread), send it, and complete it later with
+     * psp_np2_request_done(req_id, ...). 0 = sent, else an SCE error to
+     * report. May be NULL (rooms then report the service unavailable). */
+    int         (*m2_room_request)(int kind, const char *com_id, uint32_t req_id, uint32_t param);
+    /* Once per vblank on the game thread: deliver replies and notifications
+     * (psp_np2_request_done / psp_np2_room_event / psp_np2_room_message). */
+    void        (*m2_poll)(void);
     /* Where NP log lines go besides stderr (may be NULL). */
     void        (*log)(const char *line);
 } psp_np_backend;
 
 void psp_np_set_backend(const psp_np_backend *be);
+
+enum {
+    PSP_M2_SEARCH_ROOM = 1, PSP_M2_CREATE_JOIN_ROOM, PSP_M2_JOIN_ROOM, PSP_M2_LEAVE_ROOM,
+    PSP_M2_GET_ROOM_DATA_EXTERNAL_LIST, PSP_M2_SET_ROOM_DATA_EXTERNAL, PSP_M2_SET_ROOM_DATA_INTERNAL,
+    PSP_M2_SEND_ROOM_MESSAGE,
+};
+/* For the matching backend (game thread only). */
+void     psp_np2_request_done(uint32_t req_id, uint32_t error, uint32_t data);   /* the request's callback */
+void     psp_np2_room_event(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data);
+void     psp_np2_room_message(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data);
+uint32_t psp_np2_alloc(uint32_t size);   /* zeroed guest memory for event data (a ring: valid for a while) */
 /* Deliver backend results (ticket callbacks) to the game: call once per vblank. */
 void psp_np_poll(void);
 

@@ -259,6 +259,8 @@ uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1);
 int      psp_sched_post_call(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4);
 /* The same with a sixth argument, in $t1. */
 int      psp_sched_post_call6(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5);
+/* Eight arguments: $a0-$a3, $t0-$t3. */
+int      psp_sched_post_call8(uint32_t func, const uint32_t a[8]);
 
 /* Interrupt mask state (sceKernelCpuSuspendIntr/ResumeIntr). */
 int  psp_intr_enabled(void);
