@@ -21,6 +21,13 @@
  *     ignored: both ends are this runtime, and the traffic is plain.
  *   - connect() to 0.0.0.0 goes to the local host, as on the PSP's BSD
  *     stack (Windows refuses it): a room owner connecting to its own room.
+ *   - The PSP's player-to-player socket types -- 6 (connection-oriented
+ *     datagram), 7 (DCCP, the P2P "master") and 10 (packet: a TCP-like
+ *     stream) -- take the local route PPSSPP uses for destinations that are
+ *     not remote peers: 10 on a host TCP socket, 6 and 7 on host UDP. The
+ *     address's virtual port (sin_vport) is ignored on this route. Traffic
+ *     to remote players needs the virtual-port protocol over UDP 3658 and
+ *     signaling (not yet).
  *
  * Constants follow PPSSPP's NetInetConstants.h (Komak57/ppsspp master). */
 
@@ -68,7 +75,8 @@ enum { SOL_SOCKET_P = 0xFFFF, SO_SNDTIMEO_P = 0x1005, SO_RCVTIMEO_P = 0x1006, SO
        SO_TYPE_P = 0x1008, SO_NBIO_P = 0x1009, SO_BIO_P = 0x100A, SO_USECRYPTO_RX_P = 0x1000,
        SO_USECRYPTO_TX_P = 0x2000 };
 enum { MSG_OOB_P = 0x1, MSG_PEEK_P = 0x2, MSG_DONTROUTE_P = 0x4, MSG_WAITALL_P = 0x40, MSG_DONTWAIT_P = 0x80 };
-enum { SOCK_STREAM_P = 1, SOCK_DGRAM_P = 2, SOCK_NONBLOCK_P = 0x20000000 };
+enum { SOCK_STREAM_P = 1, SOCK_DGRAM_P = 2, SOCK_CONN_DGRAM_P = 6, SOCK_DCCP_P = 7, SOCK_PACKET_P = 10,
+       SOCK_NONBLOCK_P = 0x20000000 };
 
 #define MAX_FD 256
 static struct {
@@ -162,6 +170,12 @@ static void set_host_nonblocking(hsock s) {
 
 static int fd_ok(uint32_t fd) { return fd > 0 && fd < MAX_FD && g_fd[fd].used; }
 
+static uint32_t bad_fd(uint32_t fd, const char *fn) {
+    static int logged;
+    if (logged++ < 20) psp_net_log_line("%s: socket %u is not open (EBADF)", fn + 4, fd);
+    return fail(P_EBADF);
+}
+
 /* Park the calling PSP thread for a moment (other PSP threads run). */
 static void nap(void) { psp_sched_sleep_until(psp_sched_now_us() + 1000); }
 
@@ -219,27 +233,42 @@ static int wait_sock(uint32_t fd, int want_write, uint64_t timeout_us) {
 static void hle_Socket(void) {
     const uint32_t domain = psp_arg(0), type = psp_arg(1), proto = psp_arg(2);
     wsa_up();
-    if (domain != 2) { psp_ret(fail(P_EAFNOSUPPORT)); return; }
+    if (domain != 2) { psp_net_log_line("socket(domain %u, type 0x%X, protocol %u): unsupported domain", domain, type, proto); psp_ret(fail(P_EAFNOSUPPORT)); return; }
     const uint32_t t = type & 0xF;
-    if (t != SOCK_STREAM_P && t != SOCK_DGRAM_P) { psp_ret(fail(P_EOPNOTSUPP)); return; }
+    int htype;
+    switch (t) {
+    case SOCK_STREAM_P: case SOCK_PACKET_P: htype = SOCK_STREAM; break;
+    case SOCK_DGRAM_P: case SOCK_CONN_DGRAM_P: case SOCK_DCCP_P: htype = SOCK_DGRAM; break;
+    default:
+        psp_net_log_line("socket(domain %u, type 0x%X, protocol %u): unsupported type", domain, type, proto);
+        psp_ret(fail(P_EOPNOTSUPP));
+        return;
+    }
     uint32_t fd = 0;
     for (uint32_t i = 1; i < MAX_FD; i++) if (!g_fd[i].used) { fd = i; break; }
-    if (!fd) { psp_ret(fail(P_ENOBUFS)); return; }
-    const hsock s = socket(AF_INET, t == SOCK_STREAM_P ? SOCK_STREAM : SOCK_DGRAM, (int)proto);
-    if (s == BAD_SOCK) { psp_ret(fail(map_err(last_error()))); return; }
+    if (!fd) { psp_net_log_line("socket: no free descriptor"); psp_ret(fail(P_ENOBUFS)); return; }
+    const hsock s = socket(AF_INET, htype, htype == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
+    if (s == BAD_SOCK) {
+        const uint32_t e = map_err(last_error());
+        psp_net_log_line("socket(type 0x%X): host socket failed (errno %u)", type, e);
+        psp_ret(fail(e));
+        return;
+    }
     set_host_nonblocking(s);
+    if (htype == SOCK_DGRAM) { const int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one); }
     memset(&g_fd[fd], 0, sizeof g_fd[fd]);
     g_fd[fd].used = 1;
     g_fd[fd].s = s;
     g_fd[fd].type = (int)t;
     g_fd[fd].nonblock = (type & SOCK_NONBLOCK_P) != 0;
-    psp_net_log_line("socket %u: %s%s", fd, t == SOCK_STREAM_P ? "TCP" : "UDP", g_fd[fd].nonblock ? " (non-blocking)" : "");
+    static const char *const TN[] = { "?", "TCP", "UDP", "?", "?", "?", "P2P datagram (UDP)", "P2P master (UDP)", "?", "?", "P2P stream (TCP)" };
+    psp_net_log_line("socket %u: %s%s", fd, TN[t <= 10 ? t : 0], g_fd[fd].nonblock ? " (non-blocking)" : "");
     psp_ret(ok(fd));
 }
 
 static void hle_Bind(void) {
     const uint32_t fd = psp_arg(0), a = psp_arg(1), len = psp_arg(2);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     struct sockaddr_in sa;
     if (read_addr(a, len, &sa)) { psp_ret(fail(P_EINVAL)); return; }
     char t[32];
@@ -255,15 +284,20 @@ static void hle_Bind(void) {
 
 static void hle_Listen(void) {
     const uint32_t fd = psp_arg(0), backlog = psp_arg(1);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
-    if (listen(g_fd[fd].s, (int)(backlog ? backlog : 1)) != 0) { psp_ret(fail(map_err(last_error()))); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
+    if (listen(g_fd[fd].s, (int)(backlog ? backlog : 1)) != 0) {
+        const uint32_t e = map_err(last_error());
+        psp_net_log_line("socket %u: listen failed (errno %u)", fd, e);
+        psp_ret(fail(e));
+        return;
+    }
     psp_net_log_line("socket %u: listening (backlog %u)", fd, backlog);
     psp_ret(ok(0));
 }
 
 static void hle_Accept(void) {
     const uint32_t fd = psp_arg(0), a = psp_arg(1), lenp = psp_arg(2);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     for (;;) {
         struct sockaddr_in peer;
         socklen_t pl = sizeof peer;
@@ -276,7 +310,7 @@ static void hle_Accept(void) {
             memset(&g_fd[nfd], 0, sizeof g_fd[nfd]);
             g_fd[nfd].used = 1;
             g_fd[nfd].s = s;
-            g_fd[nfd].type = SOCK_STREAM_P;
+            g_fd[nfd].type = g_fd[fd].type;
             g_fd[nfd].nonblock = g_fd[fd].nonblock;
             write_addr(a, lenp, &peer);
             char t[32];
@@ -292,7 +326,7 @@ static void hle_Accept(void) {
 
 static void hle_Connect(void) {
     const uint32_t fd = psp_arg(0), a = psp_arg(1), len = psp_arg(2);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     struct sockaddr_in sa;
     if (read_addr(a, len, &sa)) { psp_ret(fail(P_EINVAL)); return; }
     char t[32];
@@ -346,7 +380,7 @@ static int host_flags(uint32_t f) {
 
 /* send / sendto */
 static uint32_t do_send(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags, const struct sockaddr_in *to) {
-    if (!fd_ok(fd)) return fail(P_EBADF);
+    if (!fd_ok(fd)) return bad_fd(fd, __func__);
     if (len > 0x100000) return fail(P_EMSGSIZE);
     uint8_t stackbuf[2048], *tmp = len <= sizeof stackbuf ? stackbuf : (uint8_t *)malloc(len ? len : 1);
     if (!tmp) return fail(P_ENOBUFS);
@@ -369,7 +403,7 @@ static uint32_t do_send(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags,
 
 /* recv / recvfrom */
 static uint32_t do_recv(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags, uint32_t from, uint32_t fromlen) {
-    if (!fd_ok(fd)) return fail(P_EBADF);
+    if (!fd_ok(fd)) return bad_fd(fd, __func__);
     if (len > 0x100000) len = 0x100000;
     uint8_t stackbuf[2048], *tmp = len <= sizeof stackbuf ? stackbuf : (uint8_t *)malloc(len ? len : 1);
     if (!tmp) return fail(P_ENOBUFS);
@@ -432,7 +466,7 @@ static void hle_Recvfrom(void) {
 
 static void hle_Close(void) {
     const uint32_t fd = psp_arg(0);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     close_sock(g_fd[fd].s);
     psp_net_log_line("socket %u: closed (%u sends, %u receives)", fd, g_fd[fd].sends, g_fd[fd].recvs);
     memset(&g_fd[fd], 0, sizeof g_fd[fd]);
@@ -447,7 +481,7 @@ static uint64_t timeo_from_guest(uint32_t v, uint32_t len) {
 
 static void hle_Setsockopt(void) {
     const uint32_t fd = psp_arg(0), level = psp_arg(1), name = psp_arg(2), val = psp_arg(3), len = psp_arg(4);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     const uint32_t iv = val && len >= 4 ? psp_read32(val) : (val && len ? psp_read8(val) : 0);
     if (level == SOL_SOCKET_P) {
         switch (name) {
@@ -492,7 +526,7 @@ static void hle_Setsockopt(void) {
 
 static void hle_Getsockopt(void) {
     const uint32_t fd = psp_arg(0), level = psp_arg(1), name = psp_arg(2), val = psp_arg(3), lenp = psp_arg(4);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     int v = 0;
     if (level == SOL_SOCKET_P && name == SO_ERROR_P) {
         socklen_t sl = sizeof v;
@@ -519,7 +553,7 @@ static void hle_Getsockopt(void) {
 
 static void hle_Shutdown(void) {
     const uint32_t fd = psp_arg(0), how = psp_arg(1);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     if (shutdown(g_fd[fd].s, (int)how) != 0) { psp_ret(fail(map_err(last_error()))); return; }
     psp_ret(ok(0));
 }
@@ -545,7 +579,7 @@ static void hle_Select(void) {
         for (uint32_t fd = 1; fd < n; fd++) {
             const uint32_t bit = 1u << (fd & 31), k = fd >> 5;
             if (!((rin[k] | win[k] | xin[k]) & bit)) continue;
-            if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+            if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
             if (rin[k] & bit) FD_SET(g_fd[fd].s, &r);
             if (win[k] & bit) FD_SET(g_fd[fd].s, &w);
             if (xin[k] & bit) FD_SET(g_fd[fd].s, &x);
@@ -579,7 +613,7 @@ static void hle_Select(void) {
 /* Abort: a call blocked on the socket returns with EINTR. */
 static void hle_SocketAbort(void) {
     const uint32_t fd = psp_arg(0);
-    if (!fd_ok(fd)) { psp_ret(fail(P_EBADF)); return; }
+    if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
     g_fd[fd].aborted = 1;
     psp_net_log_line("socket %u: aborted", fd);
     psp_ret(ok(0));
