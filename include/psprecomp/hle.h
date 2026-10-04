@@ -219,6 +219,8 @@ int      psp_sched_active(void);
 uint64_t psp_sched_now_us(void);
 uint64_t psp_sched_idle_us(void);    /* host time with nothing runnable */
 uint64_t psp_display_flips(void);    /* sceDisplaySetFrameBuf calls */
+/* How many flips came 1, 2, 3 and 4+ vblanks after the previous one. */
+void psp_display_flip_spacing(uint64_t out[4]);
 uint64_t psp_ge_host_us(void);       /* host time executing display lists */
 uint64_t psp_gpu_host_us(void);      /* ...of which rasterizing primitives */
 uint64_t psp_sched_vblank_count(void);

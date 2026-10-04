@@ -25,6 +25,8 @@ typedef struct {
     uint8_t *is_slot;      /* per word: consumed as a delay slot */
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
     int nentries, centries;
+    const uint32_t *hooks; /* functions with a run-time hook (emit_opts) */
+    int nhooks;
 } ectx;
 
 static void entry_push(ectx *c, uint32_t a) {
@@ -1052,8 +1054,21 @@ static void emit_function(ectx *c, const a_func *fn) {
 
     /* The real entry, plus one thunk per interior label so anything that can be
      * jumped to can also be dispatched to. */
-    fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
-            fn->addr, fn->addr, fn->addr);
+    int hooked = 0;
+    for (int h = 0; h < c->nhooks; h++) if (c->hooks[h] == fn->addr) hooked = 1;
+    if (hooked) {
+        /* A hooked function: the hook (if one is registered at run time)
+         * receives the original and decides what runs. */
+        fprintf(f, "static void psp_orig_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
+                fn->addr, fn->addr, fn->addr);
+        fprintf(f, "void psp_func_%08X(void) {\n"
+                   "    psp_hook_fn h_ = psp_hook_find(0x%08Xu);\n"
+                   "    if (h_) h_(psp_orig_%08X); else psp_orig_%08X();\n"
+                   "}\n", fn->addr, fn->addr, fn->addr, fn->addr);
+    } else {
+        fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
+                fn->addr, fn->addr, fn->addr);
+    }
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
         if (c->is_slot[widx(an, a)] || a == fn->addr) continue;
@@ -1239,6 +1254,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     mark_continuations(&c);
     for (int i = 0; i < an->nfuncs; i++) {
         c.func = &an->funcs[i];
+        c.hooks = o->hooks; c.nhooks = o->nhooks;
         emit_function(&c, &an->funcs[i]);
     }
 

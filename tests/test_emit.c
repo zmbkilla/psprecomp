@@ -207,6 +207,35 @@ int main(void) {
         a_analysis_free(&an2);
     }
 
+    /* A hooked function: its public entry asks the run-time hook table and
+     * falls back to the original body. (CODE from the first test.) */
+    {
+        a_analysis an5;
+        memset(&an5, 0, sizeof an5);
+        an5.code = code;
+        an5.base = BASE;
+        an5.size = (uint32_t)sizeof code;
+        uint32_t seed5 = BASE;
+        CHECK(a_discover(&an5, &seed5, 1) == 0, "discovery runs (hook)");
+        static const uint32_t HOOKS[1] = { BASE };
+        emit_opts o5 = o;
+        o5.prefix = "t_emit5";
+        o5.hooks = HOOKS;
+        o5.nhooks = 1;
+        CHECK(a_emit(&an5, &o5) == 0, "emission succeeds (hook)");
+        char *s5 = slurp("./t_emit5_funcs.c", NULL);
+        if (s5) {
+            expect_contains(s5, "static void psp_orig_08804000(void) { psp_body_08804000(0x08804000u); }",
+                            "the original body stays callable");
+            expect_contains(s5, "psp_hook_fn h_ = psp_hook_find(0x08804000u);",
+                            "the hooked entry looks the hook up");
+            expect_contains(s5, "if (h_) h_(psp_orig_08804000); else psp_orig_08804000();",
+                            "the hook gets the original; no hook runs the original");
+            free(s5);
+        }
+        a_analysis_free(&an5);
+    }
+
     /* VFPU condition branches test the vcmp condition bit named by bits
      * 18-20. They used to be emitted as never taken, which made PSP2i's
      * polygon clipper keep and split every vertex at every plane.

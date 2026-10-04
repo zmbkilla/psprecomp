@@ -119,6 +119,9 @@ static void hle_SetMode(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static uint64_t g_spacing[4];
+void psp_display_flip_spacing(uint64_t out[4]) { for (int i = 0; i < 4; i++) out[i] = g_spacing[i]; }
+
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
     g_fb_addr   = psp_arg(0);
@@ -126,6 +129,12 @@ static void hle_SetFrameBuf(void) {
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
     g_flips++;
+    {   /* vblanks since the previous flip: 1, 2, 3, 4+ (psp_display_flip_spacing) */
+        static uint64_t last;
+        uint64_t now = psp_sched_active() ? psp_sched_vblank_count() : 0, d = now - last;
+        last = now;
+        g_spacing[d >= 4 ? 3 : d ? d - 1 : 0]++;
+    }
     {
         /* PSPRECOMP_DISPLAY_TRACE: report every change of what is displayed. */
         static int trace = -1;

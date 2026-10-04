@@ -33,7 +33,7 @@ static int usage(void) {
         "  allegrexrecomp dis     <file> [start-addr] [count]\n"
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
-        "  allegrexrecomp emit    <file> <outdir> [prefix]\n"
+        "  allegrexrecomp emit    <file> <outdir> [prefix] [--hooks FILE] [--fixes FILE]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
@@ -717,12 +717,54 @@ static int cmd_funcs(const char *path, int list) {
 
 /* ---- the emitter --------------------------------------------------------- */
 
-static int cmd_emit(const char *path, const char *outdir, const char *prefix) {
+/* Lines of "0xADDR [0xWORD] [# comment]" -- hook list (one value) or
+ * instruction fixes (address and replacement word). Returns the count. */
+static int read_addr_file(const char *path, uint32_t *out, int max, int pairs) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot read %s\n", path); return -1; }
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        unsigned long a, w;
+        int k = sscanf(line, "%lx %lx", &a, &w);
+        if (k < (pairs ? 2 : 1)) continue;
+        if (n >= max) break;
+        out[n * (pairs ? 2 : 1)] = (uint32_t)a;
+        if (pairs) out[n * 2 + 1] = (uint32_t)w;
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static int cmd_emit(const char *path, const char *outdir, const char *prefix,
+                    const char *hooks_path, const char *fixes_path) {
     psp_blob b;
     elf_info e;
     a_analysis an;
 
     if (load_and_discover(path, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
+
+    /* Instruction fixes: a replacement word per address, applied to the code
+     * before it is translated. For genuine bugs only, each justified in the
+     * fixes file; the control-flow analysis above is not redone, so a fix
+     * must not change control flow. */
+    static uint32_t fixes[2 * 256];
+    int nfix = fixes_path ? read_addr_file(fixes_path, fixes, 256, 1) : 0;
+    if (nfix < 0) return 1;
+    for (int i = 0; i < nfix; i++) {
+        uint32_t a = fixes[2 * i], w = fixes[2 * i + 1];
+        if (!a_in_range(&an, a)) { fprintf(stderr, "fix 0x%08X: outside the code\n", a); return 1; }
+        uint8_t *p = (uint8_t *)an.code + (a - an.base);
+        uint32_t was = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p[0] = (uint8_t)w; p[1] = (uint8_t)(w >> 8); p[2] = (uint8_t)(w >> 16); p[3] = (uint8_t)(w >> 24);
+        printf("fix:        0x%08X  %08X -> %08X\n", a, was, w);
+    }
+    static uint32_t hooks[256];
+    int nhook = hooks_path ? read_addr_file(hooks_path, hooks, 256, 0) : 0;
+    if (nhook < 0) return 1;
 
     psp_module_info mi;
     const char *module = "(unknown)";
@@ -750,6 +792,9 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix) {
     o.module = module;
     o.imports = imp;
     o.nimports = nimp;
+    o.hooks = hooks;
+    o.nhooks = nhook;
+    if (nhook) printf("hooks:      %d\n", nhook);
 
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
@@ -986,7 +1031,13 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "funcs"))   return cmd_funcs(argv[2], argc > 3 && !strcmp(argv[3], "--list"));
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
-        return cmd_emit(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+        const char *prefix = NULL, *hooks = NULL, *fixes = NULL;
+        for (int i = 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--hooks") && i + 1 < argc) hooks = argv[++i];
+            else if (!strcmp(argv[i], "--fixes") && i + 1 < argc) fixes = argv[++i];
+            else if (!prefix) prefix = argv[i];
+        }
+        return cmd_emit(argv[2], argv[3], prefix, hooks, fixes);
     }
     if (!strcmp(cmd, "extract")) {
         if (argc < 5) return usage();

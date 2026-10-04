@@ -31,6 +31,12 @@ typedef struct {
      * comment. Without it the thunks can only trap. */
     const psp_import_entry *imports;
     int                     nimports;
+
+    /* Functions whose public entry goes through a run-time hook
+     * (psp_hook_set, dispatch.h): the hook receives the original as a
+     * callback and may wrap or replace it. Sorted or not; small. */
+    const uint32_t *hooks;
+    int             nhooks;
 } emit_opts;
 
 /* Emit <outdir>/<prefix>_funcs.c, <prefix>_funcs.h and <prefix>_imports.c.

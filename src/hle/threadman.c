@@ -181,6 +181,9 @@ typedef struct psp_thread {
     uint64_t wait_until;   /* absolute us; 0 = no timeout */
     int      wait_cb;
     uint64_t wait_seq;
+    uint64_t wait_start;          /* when the current wait began (accounting) */
+    uint64_t waited_us[11];       /* total time blocked, by wait kind */
+    struct { uint32_t kind, id; uint64_t us; } wait_top[6];   /* biggest waits by object */
     uint32_t wait_result;
     int      wake_cb;      /* woken only to deliver callbacks */
     uint32_t wakeup_count;
@@ -411,6 +414,17 @@ static void wake(psp_thread *t, uint32_t result) {
             left = (uint32_t)(t->wait_until - now);
         psp_write32(t->wait_timeout_ptr, left);
     }
+    {   /* accounting: time blocked by kind and by object (psp_sched_dump) */
+        uint64_t d = psp_sched_now_us() - t->wait_start;
+        if (t->wait < 11) t->waited_us[t->wait] += d;
+        int slot = -1, small = 0;
+        for (int i = 0; i < 6; i++) {
+            if (t->wait_top[i].us && t->wait_top[i].kind == (uint32_t)t->wait && t->wait_top[i].id == t->wait_id) { slot = i; break; }
+            if (t->wait_top[i].us < t->wait_top[small].us) small = i;
+        }
+        if (slot < 0) { slot = small; t->wait_top[slot].kind = (uint32_t)t->wait; t->wait_top[slot].id = t->wait_id; t->wait_top[slot].us = 0; }
+        t->wait_top[slot].us += d;
+    }
     t->wait = W_NONE;
     t->wait_result = result;
     t->wake_cb = 0;
@@ -485,7 +499,7 @@ static uint32_t wait_current(int type, uint32_t id, uint32_t timeout_ptr, int cb
         t->wait_cb = cb;
         t->wait_seq = ++g_wait_seq;
         t->wake_cb = 0;
-        t->state = TH_WAITING;
+        t->state = TH_WAITING; t->wait_start = psp_sched_now_us();
         yield_to_scheduler();
         if (t->wake_cb) continue;       /* callbacks to run; keep waiting */
         break;
@@ -503,7 +517,7 @@ uint32_t psp_sched_sleep_until(uint64_t when_us) {
     t->wait_until = when_us ? when_us : 1;
     t->wait_cb = 0;
     t->wait_seq = ++g_wait_seq;
-    t->state = TH_WAITING;
+    t->state = TH_WAITING; t->wait_start = psp_sched_now_us();
     yield_to_scheduler();
     return t->wait_result;
 }
@@ -796,6 +810,13 @@ void psp_sched_dump(FILE *out) {
             fprintf(out, " on %s 0x%X%s", WAIT_NAME[t->wait], t->wait_id,
                     t->wait_until ? " (timed)" : "");
         fprintf(out, "  pc~ra 0x%08X\n", t->ctx.r[PSP_REG_RA]);
+        fprintf(out, "        blocked:");
+        for (int k = 1; k < 11; k++)
+            if (t->waited_us[k]) fprintf(out, " %s %.1fs", WAIT_NAME[k], t->waited_us[k] / 1e6);
+        fprintf(out, "\n        top:");
+        for (int i = 0; i < 6; i++)
+            if (t->wait_top[i].us) fprintf(out, " %s 0x%X %.1fs;", WAIT_NAME[t->wait_top[i].kind], t->wait_top[i].id, t->wait_top[i].us / 1e6);
+        fprintf(out, "\n");
     }
 }
 
@@ -1036,7 +1057,7 @@ static void hle_DelayThread(void) {
     psp_thread *t = g_current;
     t->wait = W_DELAY; t->wait_id = 0; t->wait_timeout_ptr = 0;
     t->wait_until = until; t->wait_cb = 0; t->wait_seq = ++g_wait_seq;
-    t->state = TH_WAITING;
+    t->state = TH_WAITING; t->wait_start = psp_sched_now_us();
     yield_to_scheduler();
     psp_ret(0);
 }
@@ -1052,7 +1073,7 @@ static void hle_DelayThreadCB(void) {
         t->wait = W_DELAY; t->wait_id = 0; t->wait_timeout_ptr = 0;
         t->wait_until = until; t->wait_cb = 1; t->wait_seq = ++g_wait_seq;
         t->wake_cb = 0;
-        t->state = TH_WAITING;
+        t->state = TH_WAITING; t->wait_start = psp_sched_now_us();
         yield_to_scheduler();
         if (!t->wake_cb) break;
     }

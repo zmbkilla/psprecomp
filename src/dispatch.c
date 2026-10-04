@@ -109,6 +109,22 @@ static uint64_t g_trace_n;
 static uint32_t g_watch_addr;
 static void (*g_watch_fn)(uint32_t);
 
+/* Function hooks (dispatch.h). Few, looked up only by hooked functions. */
+#define MAX_HOOKS 64
+static struct { uint32_t addr; psp_hook_fn fn; } g_hooks[MAX_HOOKS];
+static int g_nhooks;
+
+void psp_hook_set(uint32_t addr, psp_hook_fn fn) {
+    for (int i = 0; i < g_nhooks; i++)
+        if (g_hooks[i].addr == addr) { g_hooks[i].fn = fn; return; }
+    if (g_nhooks < MAX_HOOKS) { g_hooks[g_nhooks].addr = addr; g_hooks[g_nhooks].fn = fn; g_nhooks++; }
+}
+
+psp_hook_fn psp_hook_find(uint32_t addr) {
+    for (int i = 0; i < g_nhooks; i++) if (g_hooks[i].addr == addr) return g_hooks[i].fn;
+    return NULL;
+}
+
 void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t)) {
     g_watch_addr = addr;
     g_watch_fn = fn;

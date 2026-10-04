@@ -54,6 +54,14 @@ void psp_trace_dump(void);
 void psp_trace_reset(void);
 uint32_t psp_trace_last(void);
 void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t));
+
+/* Function hooks. A function listed in the recompiler's --hooks file calls
+ * psp_hook_find on entry; a registered hook receives the original function
+ * and may run it (before/after its own work, with altered arguments) or not.
+ * For a port's deliberate, documented changes to game behaviour. */
+typedef void (*psp_hook_fn)(void (*original)(void));
+void        psp_hook_set(uint32_t addr, psp_hook_fn fn);
+psp_hook_fn psp_hook_find(uint32_t addr);
 void psp_trace_loop(uint32_t addr);
 void psp_trace_mark(uint32_t addr);
 void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
