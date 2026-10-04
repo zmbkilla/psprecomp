@@ -56,6 +56,7 @@ add_library(psprecomp STATIC
     src/hle/net.c
     src/hle/http.c
     src/hle/np.c
+    src/hle/np2.c
 )
 
 target_include_directories(psprecomp PUBLIC

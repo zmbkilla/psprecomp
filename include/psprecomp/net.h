@@ -73,6 +73,14 @@ typedef struct {
     void        (*ticket_begin)(int slot, const char *service_id, const uint8_t *cookie, uint32_t cookie_len);
     int         (*ticket_state)(int slot, const uint8_t **data, uint32_t *len, uint32_t *err);
     void        (*ticket_cancel)(int slot);
+    /* NP matching 2 (sceNpMatching2), on the signed-in session. Blocking;
+     * com_id is "NPWRnnnnn_nn". Return the number of IDs written to `ids`
+     * (at most `max`), or -1 with *err = an SCE_NP_MATCHING2_* error code.
+     * May be NULL: matching then reports the server unavailable. */
+    int         (*m2_server_list)(const char *com_id, uint16_t *ids, int max, uint32_t *err);
+    int         (*m2_world_list)(const char *com_id, uint16_t server_id, uint32_t *ids, int max, uint32_t *err);
+    /* Where NP log lines go besides stderr (may be NULL). */
+    void        (*log)(const char *line);
 } psp_np_backend;
 
 void psp_np_set_backend(const psp_np_backend *be);
@@ -82,6 +90,7 @@ void psp_np_poll(void);
 void psp_net_register(void);
 void psp_http_register(void);
 void psp_np_register(void);
+void psp_np2_register(void);
 
 #ifdef __cplusplus
 }

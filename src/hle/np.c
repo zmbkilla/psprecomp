@@ -48,13 +48,22 @@ static void np_log(const char *fmt, ...) {
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
     fprintf(stderr, "np: %s\n", line);
+    if (g_be && g_be->log) {
+        char l2[520];
+        snprintf(l2, sizeof l2, "np: %s", line);
+        g_be->log(l2);
+    }
 }
+
+const psp_np_backend *psp_np_backend_get(void) { return g_be; }
+int psp_np_signed_in(void);
 
 static int g_np_inited, g_service_inited, g_auth_inited, g_commerce_inited;
 
 /* ---- sign-in state ------------------------------------------------------------------- */
 
 static int signed_in(void) { return g_be && g_be->signin_state && g_be->signin_state() == PSP_NP_SIGNIN_OK; }
+int psp_np_signed_in(void) { return signed_in(); }
 
 /* ---- sceNp -------------------------------------------------------------------------------- */
 
