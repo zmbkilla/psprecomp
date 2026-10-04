@@ -186,6 +186,7 @@ static void hle_SendRequest(void) {
         if (body) psp_mem_read_block(body, psp_arg(1), q.body_len);
     }
     q.body = body;
+    hlog("request %d: game sends %u bytes from 0x%08X", (int)psp_arg(0), q.body_len, psp_arg(1));
     free(r->resp.body);
     memset(&r->resp, 0, sizeof r->resp);
     int rc = g_tr && g_tr->send ? g_tr->send(&q, &r->resp) : (int)SCE_HTTP_ERROR_NETWORK;
@@ -222,8 +223,8 @@ static void hle_ReadData(void) {
     if (n > want) n = want;
     if (n && psp_arg(1)) psp_mem_write_block(psp_arg(1), r->resp.body + r->read_pos, n);
     r->read_pos += n;
-    hlog("request %d: game read %u of %u requested bytes (at %u of %u)", (int)psp_arg(0), n, want,
-         r->read_pos - n, r->resp.len);
+    hlog("request %d: game read %u of %u requested bytes (at %u of %u) into 0x%08X", (int)psp_arg(0), n, want,
+         r->read_pos - n, r->resp.len, psp_arg(1));
     psp_ret(n);
 }
 
