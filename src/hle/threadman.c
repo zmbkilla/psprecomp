@@ -610,6 +610,41 @@ uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1) {
 
 static int interrupts_enabled(void);
 
+/* Calls from a firmware library into the game (NP auth ticket callbacks,
+ * Apctl state handlers): queued by the HLE module and delivered at the next
+ * scheduler event, on the interrupt stack -- as the firmware's own library
+ * threads deliver them, outside the caller's HLE call. Up to five arguments. */
+#define MAX_POSTED 32
+static struct { uint32_t func, a[5]; } g_posted[MAX_POSTED];
+static int g_nposted;
+
+int psp_sched_post_call(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4) {
+    if (!func || g_nposted >= MAX_POSTED) return -1;
+    g_posted[g_nposted].func = func;
+    g_posted[g_nposted].a[0] = a0; g_posted[g_nposted].a[1] = a1; g_posted[g_nposted].a[2] = a2;
+    g_posted[g_nposted].a[3] = a3; g_posted[g_nposted].a[4] = a4;
+    g_nposted++;
+    return 0;
+}
+
+static void run_posted(void) {
+    if (!g_nposted) return;
+    if (!g_intr_stack) g_intr_stack = psp_sysmem_alloc(0x4000, 1);
+    int n = g_nposted;
+    g_nposted = 0;
+    for (int i = 0; i < n; i++) {
+        psp_cpu_state saved = psp_cpu;
+        psp_cpu.r[PSP_REG_A3] = g_posted[i].a[3];
+        psp_cpu.r[8] = g_posted[i].a[4];                  /* $t0: fifth argument */
+        g_in_interrupt++;
+        /* call_guest preserves and restores the register file around the call */
+        call_guest(g_posted[i].func, g_posted[i].a[0], g_posted[i].a[1], g_posted[i].a[2],
+                   g_intr_stack + 0x4000 - 0x40);
+        g_in_interrupt--;
+        psp_cpu = saved;
+    }
+}
+
 static void process_events(uint64_t now) {
     if (g_in_interrupt) return;
 
@@ -621,6 +656,7 @@ static void process_events(uint64_t now) {
             if (t->used && t->state == TH_WAITING && t->wait == W_VBLANK) wake(t, 0);
         }
         if (interrupts_enabled()) run_interrupt(PSP_VBLANK_INT);
+        if (interrupts_enabled()) run_posted();
         if (g_vblank_hook) g_vblank_hook();
         /* A host that falls far behind should not replay hundreds of
          * vblanks in a burst. */

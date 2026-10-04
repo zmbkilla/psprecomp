@@ -53,11 +53,19 @@ add_library(psprecomp STATIC
     src/hle/atrac.c
     src/hle/utility.c
     src/hle/font.c
+    src/hle/net.c
+    src/hle/http.c
+    src/hle/np.c
 )
 
 target_include_directories(psprecomp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# Networking HLE (src/hle/net.c) uses the host's sockets and adapter list.
+if(WIN32)
+    target_link_libraries(psprecomp PUBLIC ws2_32 iphlpapi)
+endif()
 
 # --- the recompiler -----------------------------------------------------------
 

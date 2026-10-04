@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/net.h"
 #include "psprecomp/dispatch.h"
 
 #include <stdio.h>
@@ -215,4 +216,7 @@ void psp_hle_init(void) {
     psp_atrac_register();
     psp_modules_init();
     psp_modules_register();
+    psp_net_register();
+    psp_http_register();
+    psp_np_register();
 }
