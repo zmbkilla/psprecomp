@@ -378,6 +378,17 @@ static int host_flags(uint32_t f) {
     return h;                                    /* DONTWAIT is handled here; CRYPT flags: plain traffic */
 }
 
+/* The first bytes of each message on a socket, for following a game's own
+ * protocol (PSP2i's session server). The first 400 messages per socket. */
+static void log_data(uint32_t fd, const char *dir, const uint8_t *p, int n) {
+    if (n <= 0 || g_fd[fd].sends + g_fd[fd].recvs > 400) return;
+    char hex[3 * 48 + 1];
+    const int k = n < 48 ? n : 48;
+    for (int i = 0; i < k; i++) snprintf(hex + 3 * i, 4, "%02x ", p[i]);
+    hex[3 * k] = '\0';
+    psp_net_log_line("socket %u: %s %d bytes: %s%s", fd, dir, n, hex, n > k ? "..." : "");
+}
+
 /* send / sendto */
 static uint32_t do_send(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags, const struct sockaddr_in *to) {
     if (!fd_ok(fd)) return bad_fd(fd, __func__);
@@ -391,7 +402,7 @@ static uint32_t do_send(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags,
     for (;;) {
         const int n = to ? sendto(g_fd[fd].s, (const char *)tmp, (int)len, host_flags(flags), (const struct sockaddr *)to, sizeof *to)
                          : send(g_fd[fd].s, (const char *)tmp, (int)len, host_flags(flags));
-        if (n >= 0) { r = ok((uint32_t)n); g_fd[fd].sends++; break; }
+        if (n >= 0) { log_data(fd, "sent", tmp, n); r = ok((uint32_t)n); g_fd[fd].sends++; break; }
         const int e = last_error();
         if (!would_block(e) || nb) { r = fail(map_err(e)); break; }
         if (end && psp_sched_now_us() >= end) { r = fail(P_EAGAIN); break; }
@@ -418,6 +429,7 @@ static uint32_t do_recv(uint32_t fd, uint32_t buf, uint32_t len, uint32_t flags,
                            : recv(g_fd[fd].s, (char *)tmp, (int)len, host_flags(flags));
         if (n >= 0) {
             if (n) psp_mem_write_block(buf, tmp, (uint32_t)n);
+            log_data(fd, n ? "received" : "received end of stream", tmp, n ? n : 1);
             if (from) write_addr(from, fromlen, &peer);
             g_fd[fd].recvs++;
             r = ok((uint32_t)n);
