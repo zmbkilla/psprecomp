@@ -176,6 +176,10 @@ void psp_io_init(void) { g_root[0] = '\0'; psp_io_reset(); }
 
 uint64_t psp_io_bytes_read(void) { return g_bytes_read; }
 
+/* Host callback for memory-stick opens (ms0:), e.g. a game's download data. */
+static void (*g_ms_log)(const char *line);
+void psp_io_set_ms_log(void (*fn)(const char *line)) { g_ms_log = fn; }
+
 static int tracing(void) {
     if (g_trace < 0) g_trace = getenv("PSPRECOMP_IO_TRACE") != NULL;
     return g_trace;
@@ -243,6 +247,11 @@ static uint32_t do_open(const char *guest, uint32_t flags, int keep_on_error, in
     if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     *err = 0;
     if (tracing()) fprintf(stderr, "sceIoOpen(%s, 0x%X)%s\n", guest, flags, f ? "" : " -> not found");
+    if (g_ms_log && (!strncmp(guest, "ms0:", 4) || !strncmp(guest, "fatms0:", 7))) {
+        char line[600];
+        snprintf(line, sizeof line, "sceIoOpen(%s, 0x%X)%s", guest, flags, f ? "" : " -> not found");
+        g_ms_log(line);
+    }
     if (!f) {
         /* A failed open is normal (a game probing for a save file) and is not
          * worth a warning; PSPRECOMP_IO_TRACE shows them when a game cannot

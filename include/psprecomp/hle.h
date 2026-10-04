@@ -191,6 +191,8 @@ void psp_font_reset(void);
 void psp_utility_init(void);
 void psp_utility_register(void);
 void psp_utility_reset(void);
+/* Memory-stick (ms0:) file opens, reported to the host (may be NULL). */
+void psp_io_set_ms_log(void (*fn)(const char *line));
 
 /* PSP savedata encryption, supplied by the host (the toolkit carries none).
  * With it, saves are read and written as on hardware -- encrypted with the
