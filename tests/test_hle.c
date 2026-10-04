@@ -170,15 +170,17 @@ static void test_semaphores(void) {
     CHECK(call(SIGNAL, sem, 1, 0, 0) == 0, "signal succeeds");
     CHECK(call(WAIT, sem, 1, 0, 0) == 0, "and the signalled count is available");
 
-    /* The count must saturate at max, not run away. */
-    call(SIGNAL, sem, 100, 0, 0);
-    CHECK(call(WAIT, sem, 4, 0, 0) == 0, "count saturates at max (4 available)");
+    /* A signal that would take the count past max is refused outright, and
+     * the count is left as it was -- the firmware does not saturate. */
+    CHECK(call(SIGNAL, sem, 100, 0, 0) == 0x800201AEu, "overflowing signal is refused (SEMA_OVF)");
     CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
-          "and no more than max");
+          "and the refused signal added nothing");
+    CHECK(call(SIGNAL, sem, 4, 0, 0) == 0, "signalling up to max is fine");
+    CHECK(call(WAIT, sem, 4, 0, 0) == 0, "and all of it is available");
 
     CHECK(call(DELETE, sem, 0, 0, 0) == 0, "delete succeeds");
-    CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_UID,
-          "a deleted semaphore is gone");
+    CHECK(call(WAIT, sem, 1, 0, 0) == 0x80020199u,
+          "a deleted semaphore is gone (UNKNOWN_SEMID)");
 }
 
 static void test_event_flags(void) {
@@ -257,10 +259,12 @@ static void test_threads(void) {
     CHECK(psp_cpu.r[PSP_REG_S0] == 0xC0FFEE, "caller's registers restored");
     CHECK(psp_cpu.r[PSP_REG_SP] == caller_sp, "caller's stack pointer restored");
 
-    /* The exit status the thread returned is what a waiter sees. */
-    uint32_t out = 0x08802000u;
-    CHECK(call(WAITEND, thid, out, 0, 0) == 0, "wait-for-end succeeds");
-    CHECK(psp_read32(out) == 0x1234, "exit status recorded, got 0x%X", psp_read32(out));
+    /* sceKernelWaitThreadEnd(thid, SceUInt *timeout) returns the exit status;
+     * its second argument is a timeout, which must not be written with it. */
+    uint32_t tmo = 0x08802000u;
+    psp_write32(tmo, 777);
+    CHECK(call(WAITEND, thid, tmo, 0, 0) == 0x1234, "wait-for-end returns the exit status");
+    CHECK(psp_read32(tmo) == 777, "and leaves the timeout argument alone, got %u", psp_read32(tmo));
 
     /* Deleting frees the stack. */
     uint32_t before_delete = psp_sysmem_free();
@@ -321,7 +325,9 @@ static void test_ge_display_list(void) {
     CHECK(qid != 0, "list enqueued, got 0x%08X", qid);
 
     uint64_t executed = psp_ge_command_count() - before;
-    CHECK(executed == 6, "walked BASE,VTYPE,PRIM,JUMP,PRIM,FINISH = 6, got %llu",
+    /* FINISH raises the finish interrupt; the END after it is what stops the
+     * list, and it is executed like any other command. */
+    CHECK(executed == 7, "walked BASE,VTYPE,PRIM,JUMP,PRIM,FINISH,END = 7, got %llu",
           (unsigned long long)executed);
     CHECK(psp_ge_vertex_count() == 8,
           "counted 6+2 vertices and skipped the jumped-over PRIM, got %llu",
@@ -401,6 +407,77 @@ static void test_display(void) {
           "vblank waits advance the frame counter (the bring-up heartbeat)");
 }
 
+/* sceUtilitySavedata save -> load round trip through the HLE, as PSP2i does it
+ * after character creation: AUTOSAVE (mode 1) with saveName "<>". "<>" means
+ * no particular save, so the directory is the game name alone; using it
+ * literally produced "NPJH50332<>", an invalid Windows path, and mode 1
+ * failed with SAVE_ACCESS_ERROR (0x80110385). */
+static int host_file_size(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    int n = (int)ftell(f);
+    fclose(f);
+    return n;
+}
+
+static void savedata_param(uint32_t p, uint32_t mode, uint32_t data, uint32_t size) {
+    for (uint32_t i = 0; i < 0x600; i += 4) psp_write32(p + i, 0);
+    psp_write32(p + 0x00, 0x600);                       /* base.size */
+    psp_write32(p + 0x30, mode);
+    const char *game = "NPJH50332", *save = "<>", *file = "SAVEDATA.BIN", *title = "Test Title";
+    for (uint32_t i = 0; game[i]; i++)  psp_write8(p + 0x3C + i, (uint8_t)game[i]);
+    for (uint32_t i = 0; save[i]; i++)  psp_write8(p + 0x4C + i, (uint8_t)save[i]);
+    for (uint32_t i = 0; file[i]; i++)  psp_write8(p + 0x64 + i, (uint8_t)file[i]);
+    for (uint32_t i = 0; title[i]; i++) psp_write8(p + 0x80 + i, (uint8_t)title[i]);
+    psp_write32(p + 0x74, data);
+    psp_write32(p + 0x78, size);                        /* buffer size */
+    psp_write32(p + 0x7C, size);                        /* data size */
+}
+
+static uint32_t savedata_run(uint32_t p) {
+    const uint32_t INIT = psp_nid("sceUtilitySavedataInitStart");
+    const uint32_t STATUS = psp_nid("sceUtilitySavedataGetStatus");
+    const uint32_t SHUT = psp_nid("sceUtilitySavedataShutdownStart");
+    CHECK(call(INIT, p, 0, 0, 0) == 0, "savedata InitStart accepted");
+    int guard = 0;
+    while (call(STATUS, 0, 0, 0, 0) != 3 && guard++ < 16) {}
+    uint32_t result = psp_read32(p + 0x1C);
+    CHECK(call(SHUT, 0, 0, 0, 0) == 0, "savedata ShutdownStart accepted");
+    guard = 0;
+    while (call(STATUS, 0, 0, 0, 0) != 0 && guard++ < 16) {}
+    return result;
+}
+
+static void test_savedata_roundtrip(void) {
+    char root[256], path[512];
+    snprintf(root, sizeof root, "psprecomp_test_savedata_%u", (unsigned)psp_cpu.r[PSP_REG_SP]);
+    psp_io_set_root(root);
+    const uint32_t P = 0x08840000u, DATA = 0x08842000u, BACK = 0x08844000u, N = 1000;
+    for (uint32_t i = 0; i < N; i++) psp_write8(DATA + i, (uint8_t)(i * 7 + 3));
+
+    savedata_param(P, 1, DATA, N);
+    CHECK(savedata_run(P) == 0, "AUTOSAVE with saveName \"<>\" succeeds");
+    snprintf(path, sizeof path, "%s/ms/PSP/SAVEDATA/NPJH50332/SAVEDATA.BIN", root);
+    CHECK(host_file_size(path) == (int)N, "data file written to NPJH50332/ (size %d)", host_file_size(path));
+    snprintf(path, sizeof path, "%s/ms/PSP/SAVEDATA/NPJH50332/PARAM.SFO", root);
+    CHECK(host_file_size(path) > 20, "PARAM.SFO written");
+
+    savedata_param(P, 0, BACK, N);
+    for (uint32_t i = 0; i < N; i++) psp_write8(BACK + i, 0);
+    CHECK(savedata_run(P) == 0, "AUTOLOAD finds the save");
+    int same = 1;
+    for (uint32_t i = 0; i < N; i++) same &= psp_read8(BACK + i) == (uint8_t)(i * 7 + 3);
+    CHECK(same && psp_read32(P + 0x7C) == N, "loaded bytes match what was saved");
+
+    savedata_param(P, 22, 0, 0);
+    CHECK(savedata_run(P) == 0, "GETSIZE now reports an existing save (0, not RW_NO_DATA)");
+
+    /* Tidy up the host files. */
+    snprintf(path, sizeof path, "%s/ms/PSP/SAVEDATA/NPJH50332/SAVEDATA.BIN", root); remove(path);
+    snprintf(path, sizeof path, "%s/ms/PSP/SAVEDATA/NPJH50332/PARAM.SFO", root); remove(path);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -420,6 +497,7 @@ int main(void) {
     test_ge_infinite_list();
     test_sas_adpcm();
     test_display();
+    test_savedata_roundtrip();
 
     psp_mem_free();
 

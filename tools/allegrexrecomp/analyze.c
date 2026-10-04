@@ -652,6 +652,120 @@ int a_scan_data_pointers(const a_analysis *an,
     return found;
 }
 
+/* Code pointers materialised in code rather than stored in data.
+ *
+ * A static module takes the address of a function with a lui/addiu (or
+ * lui/ori) pair, exactly as it takes the address of anything else:
+ *
+ *     08804160  lui   $s1, 0x880
+ *     088041F4  addiu $a1, $s1, 16968     ; 0x08804248 -- user_main
+ *     088041F8  jal   sceKernelCreateThread
+ *
+ * That is how crt0 hands the main thread's entry to the kernel, so a module
+ * whose discovery misses it stops forty instructions in. It has no relocation
+ * (ET_EXEC), it is not a `jal` target, and it is not a word in .data -- none
+ * of the other seed sources can see it.
+ *
+ * Heuristic, like the data-pointer scan, and validated the same way: the
+ * target must lie in the scan range, be aligned, and decode. The pairing is
+ * by register within a short window that ends at the first unconditional
+ * transfer or the first other write of the `lui` register. */
+#define CP_WINDOW 32
+
+static int writes_reg(const a_insn *in, uint8_t r) {
+    switch (in->op) {
+    case A_ADDI: case A_ADDIU: case A_SLTI: case A_SLTIU: case A_ANDI:
+    case A_ORI: case A_XORI: case A_LUI:
+    case A_LB: case A_LH: case A_LWL: case A_LW: case A_LBU: case A_LHU:
+    case A_LWR: case A_LL: case A_SC: case A_MFC1: case A_CFC1: case A_MFV:
+    case A_MFVC: case A_EXT: case A_INS:
+        return in->rt == r;
+    case A_JAL: case A_BLTZAL: case A_BGEZAL: case A_BLTZALL: case A_BGEZALL:
+        return r == PSP_RA_INDEX;
+    default:
+        /* R-type forms write rd. */
+        return in->fmt == F_RD_RS_RT || in->fmt == F_RD_RT_SA ||
+               in->fmt == F_RD_RT_RS || in->fmt == F_RD_RS ||
+               in->fmt == F_RD_RT || in->fmt == F_RD ||
+               in->fmt == F_RD_RS_RT_SA
+               ? in->rd == r : 0;
+    }
+}
+
+int a_scan_code_pointers(const a_analysis *an, uint32_t *out, int max) {
+    uint32_t sbase = an->scan_size ? an->scan_base : an->base;
+    uint32_t ssize = an->scan_size ? an->scan_size : an->size;
+    int found = 0;
+
+    for (uint32_t off = 0; off + 4 <= ssize; off += 4) {
+        uint32_t a = sbase + off;
+        if (!a_in_range(an, a)) continue;
+        a_insn lui;
+        a_decode(fetch(an, a), a, &lui);
+        if (lui.op != A_LUI || lui.rt == 0) continue;
+        const uint8_t r = lui.rt;
+        const uint32_t hi = (uint32_t)lui.imm << 16;
+
+        int stop_after = -1;            /* delay slot of a terminating transfer */
+        uint32_t base = 0;              /* code pointer now held in r (0: none) */
+        int likely_slot = -1;           /* index of a likely branch's delay slot */
+        for (int i = 1; i <= CP_WINDOW; i++) {
+            uint32_t b = a + (uint32_t)i * 4;
+            if (!a_in_range(an, b)) break;
+            a_insn in;
+            a_decode(fetch(an, b), b, &in);
+            if (in.op == A_INVALID) break;
+
+            /* Hand-written code selects one of several entry points into a
+             * block by adjusting the pointer in a likely branch's delay slot
+             * and then jumping through it:
+             *
+             *     08D8B978  lui   $t3, 0x8D9
+             *     08D8B97C  addiu $t3, $t3, -18024    ; 0x08D8B998
+             *     08D8B980  beql  $a3, $zero, 0x08D8B990
+             *     08D8B984  addiu $t3, $t3, 24        ; 0x08D8B9B0
+             *     08D8B988  bgtzl $a3, 0x08D8B990
+             *     08D8B98C  addiu $t3, $t3, 56        ; 0x08D8B9D0
+             *     08D8B990  jr    $t3
+             *
+             * Each adjusted pointer is a target of the `jr`, and it is
+             * relative to the base: at most one of the slots runs. */
+            if (base && likely_slot == i && in.op == A_ADDIU && in.rs == r && in.rt == r) {
+                uint32_t t = base + (uint32_t)in.imm;
+                if (t >= sbase && t < sbase + ssize && (t & 3) == 0 && !is_import_stub(an, t)) {
+                    a_insn probe;
+                    if (a_decode(fetch(an, t), t, &probe) && probe.op != A_INVALID) {
+                        if (found < max) out[found] = t;
+                        found++;
+                    }
+                }
+                continue;
+            }
+            if (in.is_branch && in.is_likely) likely_slot = i + 1;
+
+            if ((in.op == A_ADDIU || in.op == A_ORI) && in.rs == r) {
+                uint32_t t = in.op == A_ADDIU ? hi + (uint32_t)in.imm
+                                              : hi | ((uint32_t)in.imm & 0xFFFFu);
+                if (t >= sbase && t < sbase + ssize && (t & 3) == 0 &&
+                    !is_import_stub(an, t)) {
+                    a_insn probe;
+                    if (a_decode(fetch(an, t), t, &probe) && probe.op != A_INVALID) {
+                        if (found < max) out[found] = t;
+                        found++;
+                        /* The pair completed in place: keep following r. */
+                        if (in.rt == r && in.op == A_ADDIU && !base) { base = t; continue; }
+                    }
+                }
+            }
+            if (writes_reg(&in, r)) break;
+            if (stop_after == i) break;
+            if (in.is_jump || in.is_return || (in.is_indirect && !in.is_call))
+                stop_after = i + 1;     /* the delay slot still executes */
+        }
+    }
+    return found;
+}
+
 void a_analysis_free(a_analysis *an) {
     free(an->funcs);
     free(an->imports);

@@ -182,6 +182,54 @@ static void test_transformed_is_skipped(void) {
           (unsigned long long)psp_ge_pixels());
 }
 
+/* Back-face culling of transformed geometry. The front-face register 0x9B is
+ * 0 for counter-clockwise (sceGuFrontFace(GU_CCW)) and 1 for clockwise. It was
+ * read inverted, which dropped PSP2i's character faces and floors. Identity
+ * matrices, a game-style viewport (y scale negative, so NDC y is up), and a
+ * triangle that is counter-clockwise on screen. */
+static uint32_t f24(float f) { uint32_t b; memcpy(&b, &f, 4); return b >> 8; }
+
+static int draw_culled_triangle(uint32_t front_face) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0xD4, 0);                                   /* scissor 0,0 - 479,271 */
+    cmd(0xD5, (271u << 10) | 479u);
+    cmd(0x12, (7u << 2) | (3u << 7));               /* 8888 colour, float position, transformed */
+    cmd(0x01, VERTS & 0xFFFFFF);
+    static const float I43[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+    static const float I44[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    cmd(0x3A, 0); for (int i = 0; i < 12; i++) cmd(0x3B, f24(I43[i]));
+    cmd(0x3C, 0); for (int i = 0; i < 12; i++) cmd(0x3D, f24(I43[i]));
+    cmd(0x3E, 0); for (int i = 0; i < 16; i++) cmd(0x3F, f24(I44[i]));
+    cmd(0x42, f24(240.0f)); cmd(0x43, f24(-136.0f)); cmd(0x44, f24(0.0f));
+    cmd(0x45, f24(2048.0f)); cmd(0x46, f24(2048.0f)); cmd(0x47, f24(0.0f));
+    cmd(0x4C, 1808u * 16); cmd(0x4D, 1912u * 16);   /* screen offset, 12.4 */
+    cmd(0x1D, 1);                                   /* culling on */
+    cmd(0x9B, front_face);
+    /* NDC (-0.5,-0.5), (0.5,-0.5), (0,0.5): counter-clockwise with y up, and
+     * still counter-clockwise on screen once the viewport flips y. */
+    static const float P[3][2] = { { -0.5f, -0.5f }, { 0.5f, -0.5f }, { 0.0f, 0.5f } };
+    for (int i = 0; i < 3; i++) {
+        uint32_t a = VERTS + (uint32_t)i * 16, w;
+        psp_write32(a, 0xFFFFFFFFu);
+        memcpy(&w, &P[i][0], 4); psp_write32(a + 4, w);
+        memcpy(&w, &P[i][1], 4); psp_write32(a + 8, w);
+        psp_write32(a + 12, 0);
+    }
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    return pixel(240, 136) == 0xFFFFFFFFu;
+}
+
+static void test_cull_front_face(void) {
+    CHECK(draw_culled_triangle(0), "front face CCW (0x9B = 0): a CCW triangle is drawn");
+    CHECK(!draw_culled_triangle(1), "front face CW (0x9B = 1): a CCW triangle is culled");
+}
+
 static void test_triangle_strip(void) {
     psp_ge_reset();
     clear_fb();
@@ -245,6 +293,7 @@ int main(void) {
     test_clipping();
     test_transformed_is_skipped();
     test_triangle_strip();
+    test_cull_front_face();
     test_backend_selection();
 
     psp_mem_free();

@@ -556,6 +556,21 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         }
     }
 
+    /* Code pointers built by lui/addiu in .text. Needed by static modules
+     * above all -- crt0 passes the main thread's entry this way -- but a
+     * relocatable module forms the same pairs, so it is not conditional. */
+    {
+        int avail = a_scan_code_pointers(an, NULL, 0);
+        uint32_t *bigger = (uint32_t *)realloc(seeds, (size_t)(nseeds + avail + 1) * sizeof *seeds);
+        if (bigger) {
+            seeds = bigger;
+            int ncode = a_scan_code_pointers(an, seeds + nseeds, avail);
+            if (ncode > avail) ncode = avail;
+            nseeds += ncode;
+            fprintf(stderr, "code-pointer seeds (lui/addiu heuristic): %d\n", ncode);
+        }
+    }
+
     int rc = a_discover(an, seeds, nseeds);
     free(seeds);
     if (rc != 0) {

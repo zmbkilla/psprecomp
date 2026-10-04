@@ -72,6 +72,7 @@ static void expect_contains(const char *hay, const char *needle, const char *why
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* progress survives a crash */
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
         code[i * 4 + 0] = (uint8_t)(CODE[i]);
@@ -96,6 +97,7 @@ int main(void) {
           (unsigned long long)an.insns);
 
     emit_opts o;
+    memset(&o, 0, sizeof o);           /* no import table: imports must be NULL, not stack garbage */
     o.outdir = ".";
     o.prefix = "t_emit";
     o.module = "synthetic";
@@ -163,6 +165,120 @@ int main(void) {
     }
 
     a_analysis_free(&an);
+
+    /* A conditional call: `bltzal` links and branches only when taken, and the
+     * callee returns to the instruction after the delay slot. The caller must
+     * continue there -- emitting the taken path as `call; return;` silently
+     * dropped the rest of the caller (observed in a game's decompressor).
+     *
+     *   A: bltzal $a0, B     B: jr $ra
+     *      nop                  nop
+     *      addiu $v0,$zero,7
+     *      jr    $ra
+     *      nop                                                              */
+    {
+        static const uint32_t CALLCODE[] = {
+            0x04900004u, 0x00000000u, 0x24020007u, 0x03E00008u,
+            0x00000000u, 0x03E00008u, 0x00000000u,
+        };
+        uint8_t cc[sizeof CALLCODE];
+        for (size_t i = 0; i < sizeof CALLCODE / sizeof CALLCODE[0]; i++)
+            for (int k = 0; k < 4; k++) cc[i * 4 + k] = (uint8_t)(CALLCODE[i] >> (8 * k));
+        a_analysis an2;
+        memset(&an2, 0, sizeof an2);
+        an2.code = cc;
+        an2.base = BASE;
+        an2.size = (uint32_t)sizeof cc;
+        uint32_t seed2 = BASE;
+        CHECK(a_discover(&an2, &seed2, 1) == 0, "discovery runs (bltzal)");
+        CHECK(an2.nfuncs == 2, "caller and conditional-call target, got %d", an2.nfuncs);
+        o.prefix = "t_emit2";
+        CHECK(a_emit(&an2, &o) == 0, "emission succeeds (bltzal)");
+        char *s2 = slurp("./t_emit2_funcs.c", NULL);
+        if (s2) {
+            expect_contains(s2, "if (_c) { psp_func_08804014(); if (r_ra != 0x08804008u) return; } }",
+                            "a conditional call continues after the callee returns "
+                            "(unless the callee returned past it)");
+            CHECK(strstr(s2, "psp_func_08804014(); return;") == NULL,
+                  "a conditional call is not emitted as a tail transfer");
+            expect_contains(s2, "r_ra = 0x08804008u;", "bltzal links past its delay slot");
+            free(s2);
+        }
+        a_analysis_free(&an2);
+    }
+
+    /* VFPU condition branches test the vcmp condition bit named by bits
+     * 18-20. They used to be emitted as never taken, which made PSP2i's
+     * polygon clipper keep and split every vertex at every plane.
+     *
+     *   0: bvt  cc5, 3     (rt = 5 << 2 | 1)
+     *   1: nop
+     *   2: addiu $v0, $zero, 1
+     *   3: jr   $ra
+     *   4: nop                                                              */
+    {
+        static const uint32_t BCODE[] = {
+            0x49150002u, 0x00000000u, 0x24020001u, 0x03E00008u, 0x00000000u,
+        };
+        uint8_t bc[sizeof BCODE];
+        for (size_t i = 0; i < sizeof BCODE / sizeof BCODE[0]; i++)
+            for (int k = 0; k < 4; k++) bc[i * 4 + k] = (uint8_t)(BCODE[i] >> (8 * k));
+        a_analysis an4;
+        memset(&an4, 0, sizeof an4);
+        an4.code = bc;
+        an4.base = BASE;
+        an4.size = (uint32_t)sizeof bc;
+        uint32_t seed4 = BASE;
+        CHECK(a_discover(&an4, &seed4, 1) == 0, "discovery runs (bvt)");
+        o.prefix = "t_emit4";
+        CHECK(a_emit(&an4, &o) == 0, "emission succeeds (bvt)");
+        char *s4 = slurp("./t_emit4_funcs.c", NULL);
+        if (s4) {
+            expect_contains(s4, "int _c = (((psp_cpu.vfpu_cc >> 5) & 1));",
+                            "bvt tests condition bit 5, read before the delay slot");
+            CHECK(strstr(s4, "unhandled branch") == NULL, "no VFPU branch is left unhandled");
+            free(s4);
+        }
+        a_analysis_free(&an4);
+    }
+
+    /* A computed jump into one of several entry points of a block, the
+     * pointer adjusted in likely-branch delay slots (PSP2i's vertex decoder
+     * at 0x08D8B978 picks its float path this way). Every adjusted pointer
+     * is a `jr` target and must be a seed -- only the base used to be, so
+     * the float path was not a dispatchable entry and the game stopped with
+     * "indirect call to 0x08D8B9D0, which is not a recompiled function".
+     *
+     *   0: lui   $t3, 0x0880           6: jr  $t3
+     *   1: addiu $t3, $t3, 0x4020  (8)  7: nop
+     *   2: beql  $a3, $zero, 6          8..11: nop
+     *   3:  addiu $t3, $t3, 8      (10) 12: jr $ra
+     *   4: bgtzl $a3, 6                 13: nop
+     *   5:  addiu $t3, $t3, 16     (12)                                     */
+    {
+        static const uint32_t JCODE[] = {
+            0x3C0B0880u, 0x256B4020u, 0x50E00003u, 0x256B0008u, 0x5CE00001u,
+            0x256B0010u, 0x01600008u, 0x00000000u, 0x00000000u, 0x00000000u,
+            0x00000000u, 0x00000000u, 0x03E00008u, 0x00000000u,
+        };
+        uint8_t jc[sizeof JCODE];
+        for (size_t i = 0; i < sizeof JCODE / sizeof JCODE[0]; i++)
+            for (int k = 0; k < 4; k++) jc[i * 4 + k] = (uint8_t)(JCODE[i] >> (8 * k));
+        a_analysis an3;
+        memset(&an3, 0, sizeof an3);
+        an3.code = jc;
+        an3.base = BASE;
+        an3.size = (uint32_t)sizeof jc;
+        uint32_t ptrs[8];
+        int n = a_scan_code_pointers(&an3, ptrs, 8);
+        CHECK(n == 3, "base and both adjusted jump targets found, got %d", n);
+        if (n == 3) {
+            CHECK(ptrs[0] == BASE + 0x20, "base pointer, got 0x%08X", ptrs[0]);
+            CHECK(ptrs[1] == BASE + 0x28, "base + 8 (beql slot), got 0x%08X", ptrs[1]);
+            CHECK(ptrs[2] == BASE + 0x30, "base + 16 (bgtzl slot, relative to the base), got 0x%08X",
+                  ptrs[2]);
+        }
+    }
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

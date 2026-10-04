@@ -1,4 +1,4 @@
-/* psprecomp — sceGe_user.
+/* psprecomp — sceGe_user: display-list execution.
  *
  * The GE is the PSP's GPU. It is not driven by function calls: user code builds
  * a **display list** — an array of 32-bit words, each an 8-bit command and 24
@@ -7,38 +7,30 @@
  * writes more. That producer/consumer arrangement is the whole API.
  *
  * So `sceGu*` (the list-building library) is ordinary user code and gets
- * recompiled like anything else. Only list *execution* is emulated, and that is
- * this file.
+ * recompiled like anything else. Only list *execution* is emulated: this file
+ * walks lists and follows their control flow; every state command and every
+ * primitive goes to gpu.c, which holds the register file and rasterizes.
  *
- * ## What this does and does not do
- *
- * It walks the list, follows control flow (JUMP/CALL/RET/END/FINISH), and
- * tracks the state commands that matter — framebuffer, vertex format,
- * primitive counts. It does **not rasterize**. No triangles are drawn.
- *
- * That is deliberately the useful half to build first. During bring-up the
- * question is not "does it look right" but "is the game drawing anything at
- * all, and what?" — and a command-stream summary answers that, while a
- * half-working rasterizer answers it misleadingly. psp_ge_dump_stats() reports
- * what the game asked for; making those triangles appear is a separate phase
- * with its own correctness problem.
+ * Lists run synchronously, inside the call that enqueues them or moves their
+ * stall address. Every way a game can observe progress -- ListSync, DrawSync,
+ * the finish and signal callbacks -- then sees a completed list, which is
+ * indistinguishable from a GE that happens to be fast.
  */
 
 #include "psprecomp/hle.h"
 #include "psprecomp/render.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* Display-list opcodes. Only the ones the walk needs to be correct about are
- * named; everything else is counted rather than guessed at, because a
- * misidentified state command silently changes rendering. */
 #define GE_NOP          0x00
 #define GE_VADDR        0x01
 #define GE_IADDR        0x02
 #define GE_PRIM         0x04
 #define GE_BEZIER       0x05
 #define GE_SPLINE       0x06
+#define GE_BBOX         0x07
 #define GE_JUMP         0x08
 #define GE_BJUMP        0x09
 #define GE_CALL         0x0A
@@ -50,13 +42,34 @@
 #define GE_VTYPE        0x12
 #define GE_OFFSET_ADDR  0x13
 #define GE_ORIGIN_ADDR  0x14
-#define GE_FBP          0x9C
-#define GE_FBW          0x9D
 
-#define MAX_QUEUES 8
-#define GE_STACK   8
+/* SIGNAL behaviours (bits 16-23 of the SIGNAL argument), acted on by the END
+ * that follows the SIGNAL. */
+#define SIG_SUSPEND  0x01
+#define SIG_CONTINUE 0x02
+#define SIG_PAUSE    0x03
+#define SIG_SYNC     0x08
+#define SIG_JUMP     0x10
+#define SIG_CALL     0x11
+#define SIG_RET      0x12
+#define SIG_RJUMP    0x13
+#define SIG_RCALL    0x14
+#define SIG_OJUMP    0x15
+#define SIG_OCALL    0x16
 
-/* Primitive types, from the PRIM argument's type field. */
+#define MAX_QUEUES 16
+#define GE_STACK   32
+#define MAX_CB     16
+
+void psp_gpu_reset(void);
+void psp_gpu_cmd(uint32_t cmd, uint32_t arg);
+void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr);
+uint32_t psp_gpu_reg(uint32_t cmd);
+uint64_t psp_gpu_pixels(void);
+void psp_gpu_dump_stats(FILE *out);
+uint32_t psp_gpu_vertex_bytes(uint32_t count);
+uint32_t psp_gpu_index_bytes(uint32_t count);
+
 static const char *const PRIM_NAME[8] = {
     "points", "lines", "line-strip", "triangles",
     "triangle-strip", "triangle-fan", "sprites", "?"
@@ -64,287 +77,213 @@ static const char *const PRIM_NAME[8] = {
 
 typedef struct {
     uint32_t id;
+    uint32_t start;     /* where the list began */
     uint32_t list;      /* current read pointer */
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
-    uint32_t base;      /* GE_BASE: high bits for addresses */
-    uint32_t origin;
+    int      cbid;      /* callback set for FINISH / SIGNAL, or -1 */
+    uint32_t stack[GE_STACK];
+    int      sp;
     int      used;
     int      done;
 } ge_queue;
 
+typedef struct { uint32_t signal_func, signal_arg, finish_func, finish_arg; int used; } ge_cb;
+
 static ge_queue g_queue[MAX_QUEUES];
+static ge_cb    g_cb[MAX_CB];
 static uint32_t g_next_id;
 
-static uint64_t g_unsupported;     /* vertices in a format we do not read */
+/* Address state shared by every list: BASE supplies the high bits, OFFSET
+ * (or ORIGIN) a displacement, and VADDR/IADDR are resolved against both. */
+static uint32_t g_vaddr, g_iaddr, g_offset;
 
-/* Tracked state, and the counters that make the report worth reading. */
 static struct {
-    uint32_t fbp, fbw, vtype, vaddr;
-    uint64_t commands;
+    uint64_t commands, vertices, lists, finishes, signals;
     uint64_t prims[8];
-    uint64_t vertices;
-    uint64_t unknown;
-    uint64_t lists;
-    uint64_t finishes;
+    uint64_t by_cmd[256];
 } g_ge;
 
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
+    memset(g_cb, 0, sizeof g_cb);
     memset(&g_ge, 0, sizeof g_ge);
+    g_vaddr = g_iaddr = g_offset = 0;
+    psp_gpu_reset();
     psp_render_reset_pixels();
-    g_unsupported = 0;
     g_next_id = 0x00080000u;
 }
 
 void psp_ge_init(void) { psp_ge_reset(); }
 
+uint64_t psp_ge_command_count(void) { return g_ge.commands; }
+uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+uint64_t psp_ge_pixels(void)        { return psp_gpu_pixels(); }
+
 void psp_ge_dump_stats(FILE *out) {
-    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
-            (unsigned long long)g_ge.lists,
-            (unsigned long long)g_ge.commands,
-            (unsigned long long)g_ge.finishes);
-    fprintf(out, "    framebuffer 0x%08X stride %u, vertex type 0x%06X\n",
-            g_ge.fbp, g_ge.fbw, g_ge.vtype);
+    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes, %llu signals\n",
+            (unsigned long long)g_ge.lists, (unsigned long long)g_ge.commands,
+            (unsigned long long)g_ge.finishes, (unsigned long long)g_ge.signals);
+    fprintf(out, "    framebuffer 0x%06X stride %u format %u, vertex type 0x%06X\n",
+            psp_gpu_reg(0x9C), psp_gpu_reg(0x9D) & 0x7FF, psp_gpu_reg(0xD2), psp_gpu_reg(0x12));
     fprintf(out, "    vertices submitted: %llu\n", (unsigned long long)g_ge.vertices);
     for (int i = 0; i < 8; i++)
         if (g_ge.prims[i])
             fprintf(out, "    %-15s %llu\n", PRIM_NAME[i], (unsigned long long)g_ge.prims[i]);
-    if (g_ge.unknown)
-        fprintf(out, "    %llu commands not individually decoded\n",
-                (unsigned long long)g_ge.unknown);
-    fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
-    if (g_unsupported)
-        fprintf(out, "    %llu vertices in an unsupported format (transformed, or no position)\n",
-                (unsigned long long)g_unsupported);
+    fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_gpu_pixels());
+    psp_gpu_dump_stats(out);
+    fprintf(out, "    commands by opcode:");
+    for (int c = 0, k = 0; c < 256; c++)
+        if (g_ge.by_cmd[c])
+            fprintf(out, "%s %02X:%llu", (k++ % 10) ? "" : "\n     ", c, (unsigned long long)g_ge.by_cmd[c]);
+    fprintf(out, "\n");
 }
 
-uint64_t psp_ge_command_count(void) { return g_ge.commands; }
-uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
-
-/* ---- rasterizer ----------------------------------------------------------
- *
- * Enough of the GE to put pixels in the framebuffer. Deliberately narrow:
- *
- *  - "through" mode only (VTYPE bit 23), where vertex coordinates are already
- *    in screen space. That is what 2D games and every UI layer use. Transformed
- *    geometry needs the matrix pipeline and is not attempted here -- drawing it
- *    with the wrong transform would look like a rendering bug rather than a
- *    missing feature.
- *  - Position as 16-bit or float; colour as 8888 or none.
- *  - Flat/interpolated colour, no texturing, no depth, no blending.
- *
- * The point is to close the loop from display list to visible pixels so the
- * rest can be measured against something. Everything omitted is omitted
- * loudly: unsupported vertex formats are counted, not guessed at.
- */
-
-/* VTYPE field extraction. */
-#define VT_TEX(v)     ((v) & 3)
-#define VT_COLOR(v)   (((v) >> 2) & 7)
-#define VT_NORMAL(v)  (((v) >> 5) & 3)
-#define VT_POS(v)     (((v) >> 7) & 3)
-#define VT_WEIGHT(v)  (((v) >> 9) & 3)
-#define VT_INDEX(v)   (((v) >> 11) & 3)
-#define VT_THROUGH(v) (((v) >> 23) & 1)
-
-
-uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
-
-/* Size of one vertex in bytes, and the offsets within it. Components appear in
- * a fixed order (weights, texture, colour, normal, position) and each is
- * aligned to its own size, which is what makes the stride awkward enough to be
- * worth computing rather than assuming. */
-static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off) {
-    static const int tex_sz[4]   = { 0, 1, 2, 4 };
-    static const int col_sz[8]   = { 0, 0, 0, 0, 2, 2, 2, 4 };
-    static const int norm_sz[4]  = { 0, 1, 2, 4 };
-    static const int pos_sz[4]   = { 0, 1, 2, 4 };
-
-    int off = 0, align = 1;
-    int t = tex_sz[VT_TEX(vtype)] * 2;
-    int c = col_sz[VT_COLOR(vtype)];
-    int n = norm_sz[VT_NORMAL(vtype)] * 3;
-    int p = pos_sz[VT_POS(vtype)] * 3;
-
-    if (VT_WEIGHT(vtype)) return 0;          /* skinning: not handled */
-
-    int ts = tex_sz[VT_TEX(vtype)];
-    if (ts) { off = (off + ts - 1) & ~(ts - 1); off += t; if (ts > align) align = ts; }
-    int cs = col_sz[VT_COLOR(vtype)];
-    if (cs) { off = (off + cs - 1) & ~(cs - 1); *col_off = off; off += c; if (cs > align) align = cs; }
-    else *col_off = -1;
-    int ns = norm_sz[VT_NORMAL(vtype)];
-    if (ns) { off = (off + ns - 1) & ~(ns - 1); off += n; if (ns > align) align = ns; }
-    int ps = pos_sz[VT_POS(vtype)];
-    if (!ps) return 0;                        /* no position: nothing to draw */
-    off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
-    if (ps > align) align = ps;
-
-    return (off + align - 1) & ~(align - 1);  /* stride */
+static uint32_t rel(uint32_t arg) {
+    return (((psp_gpu_reg(GE_BASE) & 0x0F0000u) << 8) | (arg & 0xFFFFFFu)) + g_offset;
 }
 
-static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
-                       psp_vertex *out) {
-    out->rgba = 0xFFFFFFFFu;
-    if (col_off >= 0 && VT_COLOR(vtype) == 7)
-        out->rgba = psp_read32(addr + (uint32_t)col_off);
-
-    switch (VT_POS(vtype)) {
-    case 2:   /* 16-bit */
-        out->x = (int16_t)psp_read16(addr + (uint32_t)pos_off);
-        out->y = (int16_t)psp_read16(addr + (uint32_t)pos_off + 2);
-        return 1;
-    case 3: { /* float */
-        out->x = (int)psp_read_f32(addr + (uint32_t)pos_off);
-        out->y = (int)psp_read_f32(addr + (uint32_t)pos_off + 4);
-        return 1;
-    }
-    default:
-        return 0;
-    }
+static void callback(const ge_queue *q, int finish, uint32_t value) {
+    if (q->cbid < 0 || q->cbid >= MAX_CB || !g_cb[q->cbid].used) return;
+    const ge_cb *c = &g_cb[q->cbid];
+    if (finish) psp_sched_call_interrupt(c->finish_func, value, c->finish_arg);
+    else        psp_sched_call_interrupt(c->signal_func, value, c->signal_arg);
 }
 
+/* Walk a list until it ends, reaches its stall address, or exhausts a step
+ * budget. The budget is not paranoia: a list whose JUMP forms a cycle is a
+ * normal intermediate state while the CPU is still writing, and without a
+ * bound a malformed or partially-written list hangs the host. */
+static uint64_t g_list_us, g_prim_us;
+uint64_t psp_ge_host_us(void)   { return g_list_us; }
+uint64_t psp_gpu_host_us(void)  { return g_prim_us; }
 
-static void draw_prim(uint32_t type, uint32_t count) {
-    if (!VT_THROUGH(g_ge.vtype)) { g_unsupported += count; return; }
-    if (!g_ge.vaddr) { g_unsupported += count; return; }
-
-    int col_off = -1, pos_off = 0;
-    int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off);
-    if (!stride) { g_unsupported += count; return; }
-
-    /* Decode the whole batch, then hand it to the backend in one call.
-     *
-     * Format decoding stays here rather than in each backend: the stride
-     * arithmetic and component alignment are fiddly, and duplicating them per
-     * backend means every backend is wrong in its own way. Wrong once,
-     * centrally, is at least diagnosable. */
-    enum { BATCH = 256 };
-    psp_vertex v[BATCH];
-    const psp_render_backend *be = psp_render_current();
-
-    uint32_t done = 0;
-    while (done < count) {
-        uint32_t n = count - done;
-        if (n > BATCH) n = BATCH;
-
-        /* Strips are order-dependent, so a batch boundary must overlap by two
-         * vertices or the triangle spanning it is lost. */
-        uint32_t decoded = 0;
-        for (; decoded < n; decoded++) {
-            if (!read_vertex(g_ge.vaddr + (done + decoded) * (uint32_t)stride,
-                             g_ge.vtype, col_off, pos_off, &v[decoded]))
-                break;
-        }
-        if (!decoded) break;
-
-        be->draw((int)type, v, (int)decoded);
-
-        if (type == 4 && decoded == BATCH && done + decoded < count)
-            done += decoded - 2;     /* strip overlap */
-        else
-            done += decoded;
-    }
-}
-
-/* Walk a list until END/FINISH, the stall address, or a step budget.
- *
- * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
- * intermediate state while the CPU is still writing, and without a bound a
- * malformed or partially-written list hangs the host with no diagnostic. */
+static void run_list_inner(ge_queue *q);
 static void run_list(ge_queue *q) {
-    uint32_t stack[GE_STACK];
-    int sp = 0;
-    uint64_t budget = 1u << 22;
+    uint64_t t0 = psp_sched_now_us();
+    run_list_inner(q);
+    g_list_us += psp_sched_now_us() - t0;
+}
+
+static void run_list_inner(ge_queue *q) {
+    uint64_t budget = 1u << 24;
+    uint32_t pending_signal = 0;
+    int have_signal = 0;
 
     g_ge.lists++;
 
     while (budget--) {
-        if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+        if (q->stall && q->list == q->stall) return;   /* caught up to the CPU */
 
-        uint32_t word = psp_read32(q->list);
+        const uint32_t at = q->list;
+        uint32_t word = psp_read32(at);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
         q->list += 4;
         g_ge.commands++;
+        g_ge.by_cmd[cmd]++;
 
         switch (cmd) {
         case GE_NOP:
             break;
+        case GE_VADDR: g_vaddr = rel(arg); break;
+        case GE_IADDR: g_iaddr = rel(arg); break;
 
         case GE_PRIM: {
             uint32_t type  = (arg >> 16) & 7;
             uint32_t count = arg & 0xFFFF;
             g_ge.prims[type]++;
             g_ge.vertices += count;
-            draw_prim(type, count);
+            { uint64_t t1 = psp_sched_now_us();
+              psp_gpu_prim(type, count, g_vaddr, g_iaddr);
+              g_prim_us += psp_sched_now_us() - t1; }
+            /* The hardware leaves the vertex (or index) pointer just past
+             * what it consumed, so consecutive PRIMs continue the buffer. */
+            if ((psp_gpu_reg(GE_VTYPE) >> 11) & 3) g_iaddr += psp_gpu_index_bytes(count);
+            else                                    g_vaddr += psp_gpu_vertex_bytes(count);
             break;
         }
-        case GE_BEZIER:
-        case GE_SPLINE:
-            /* Patches expand to triangles on hardware; counted as their own
-             * thing rather than folded into the triangle count. */
-            g_ge.prims[3]++;
-            break;
 
         case GE_JUMP:
-            q->list = (q->base | (arg & 0xFFFFFC));
-            break;
-        case GE_CALL:
-            if (sp < GE_STACK) stack[sp++] = q->list;
-            q->list = (q->base | (arg & 0xFFFFFC));
-            break;
-        case GE_RET:
-            if (sp > 0) q->list = stack[--sp];
+            q->list = rel(arg) & ~3u;
             break;
         case GE_BJUMP:
-            /* Conditional on the bounding-box test, which needs geometry we do
-             * not process. Not taking it means we walk the enclosed commands
-             * rather than skipping them -- the conservative direction, since
-             * skipping would under-report what the game drew. */
+            /* Conditional on the bounding-box test (BBOX), which is not
+             * evaluated: not taking it draws the enclosed geometry, the
+             * conservative direction. */
+            break;
+        case GE_CALL:
+            if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
+            q->list = rel(arg) & ~3u;
+            break;
+        case GE_RET:
+            if (q->sp > 0) q->list = q->stack[--q->sp];
+            break;
+
+        case GE_SIGNAL:
+            pending_signal = arg;
+            have_signal = 1;
+            g_ge.signals++;
+            continue;                                   /* keep have_signal for the END */
+
+        case GE_FINISH:
+            g_ge.finishes++;
+            callback(q, 1, arg & 0xFFFF);
             break;
 
         case GE_END:
-        case GE_FINISH:
-            if (cmd == GE_FINISH) g_ge.finishes++;
+            if (have_signal) {
+                /* SIGNAL + END: the signal's behaviour decides what happens. */
+                const uint32_t beh = (pending_signal >> 16) & 0xFF;
+                const uint32_t target = (((pending_signal & 0xFFFF) << 16) | (arg & 0xFFFF)) & 0x0FFFFFFCu;
+                have_signal = 0;
+                switch (beh) {
+                case SIG_SUSPEND: case SIG_CONTINUE: case SIG_PAUSE:
+                    callback(q, 0, pending_signal & 0xFFFF);
+                    break;
+                case SIG_SYNC:
+                    break;
+                case SIG_JUMP:  q->list = target; break;
+                case SIG_RJUMP: q->list = at + target; break;
+                case SIG_OJUMP: q->list = q->start + target; break;
+                case SIG_CALL: case SIG_RCALL: case SIG_OCALL:
+                    if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
+                    q->list = beh == SIG_CALL ? target : beh == SIG_RCALL ? at + target : q->start + target;
+                    break;
+                case SIG_RET:
+                    if (q->sp > 0) q->list = q->stack[--q->sp];
+                    break;
+                default:
+                    fprintf(stderr, "psprecomp: GE signal behaviour 0x%02X not handled\n", beh);
+                    break;
+                }
+                continue;
+            }
+            /* A bare END (normally after FINISH) ends the list. */
             q->done = 1;
             return;
 
-        case GE_SIGNAL:
-            /* Raises a callback on hardware. Callbacks are not delivered yet
-             * (no scheduler), so this is recorded and ignored. */
+        case GE_BASE:
+            psp_gpu_cmd(cmd, arg);
             break;
-
-        case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
-        case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
-        case GE_OFFSET_ADDR: q->base = arg << 8; break;
-
-        case GE_VTYPE: g_ge.vtype = arg; break;
-        case GE_FBP:
-            g_ge.fbp = (g_ge.fbp & 0xFF000000u) | arg;
-            psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
-            break;
-        case GE_FBW:
-            g_ge.fbw = arg & 0xFFFF;
-            g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
-            psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
-            break;
-
-        case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
-        case GE_IADDR: break;
+        case GE_OFFSET_ADDR: g_offset = arg << 8; break;
+        case GE_ORIGIN_ADDR: g_offset = at; break;
 
         default:
-            /* A real state command we do not decode individually. Counted --
-             * and, for the first few, named. "240 commands not individually
-             * decoded" hides whether the game is configuring a draw or just
-             * poking state, which is the difference between a rendering bug
-             * and a game that has not asked to render yet. */
-            if (g_ge.unknown < 64)
-                fprintf(stderr, "  GE cmd 0x%02X arg 0x%06X\n", cmd, arg);
-            g_ge.unknown++;
+            {
+                /* PSP2I_GE_MATRIX_FLIP=N: where in memory frame N's matrix
+                 * uploads come from (to find the code that built them). */
+                static long want = -2;
+                if (want == -2) { const char *e = getenv("PSP2I_GE_MATRIX_FLIP"); want = e ? atol(e) : -1; }
+                if (want >= 0 && psp_display_flips() == (uint64_t)want && cmd >= 0x3A && cmd <= 0x3F)
+                    fprintf(stderr, "ge-matrix: cmd 0x%02X arg 0x%06X at list 0x%08X\n", cmd, arg, at);
+            }
+            psp_gpu_cmd(cmd, arg);
             break;
         }
+        have_signal = 0;
     }
+    fprintf(stderr, "psprecomp: GE list at 0x%08X exceeded its step budget\n", q->start);
+    q->done = 1;
 }
 
 /* ---- the calls ----------------------------------------------------------- */
@@ -357,21 +296,23 @@ static ge_queue *find_queue(uint32_t id) {
 
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
+    /* A completed list has left the hardware queue, so its slot is free. Not
+     * reusing completed slots filled the queue after a handful of frames, and
+     * every list after that was refused -- the game kept rendering into lists
+     * that never ran. (A completed list's id stays findable until its slot is
+     * reused, so a late ListSync on it still reports completion.) */
     ge_queue *q = NULL;
-    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
+    for (int i = 0; i < MAX_QUEUES && !q; i++) if (!g_queue[i].used) q = &g_queue[i];
+    for (int i = 0; i < MAX_QUEUES && !q; i++) if (g_queue[i].done) q = &g_queue[i];
     if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(q, 0, sizeof *q);
     q->id    = g_next_id++;
-    q->list  = psp_arg(0) & ~3u;
-    q->stall = psp_arg(1) & ~3u;
+    q->start = q->list = psp_arg(0) & 0x0FFFFFFCu;
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
+    q->cbid  = (int32_t)psp_arg(2);
     q->used  = 1;
     (void)head;
-
-    /* Hardware runs the list asynchronously. We run it here and finish before
-     * returning, which is indistinguishable from the game's point of view
-     * because every way it can observe progress -- ListSync, DrawSync -- then
-     * reports completion. */
     run_list(q);
     psp_ret(q->id);
 }
@@ -379,24 +320,64 @@ static void enqueue(int head) {
 static void hle_ListEnQueue(void)     { enqueue(0); }
 static void hle_ListEnQueueHead(void) { enqueue(1); }
 
+static void hle_ListDeQueue(void) {
+    ge_queue *q = find_queue(psp_arg(0));
+    if (!q) { psp_ret(0x80000100); return; }
+    q->used = 0;
+    psp_ret(0);
+}
+
 static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
-    if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    q->stall = psp_arg(1) & ~3u;
+    if (!q) { psp_ret(0x80000100); return; }
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
     if (!q->done) run_list(q);          /* the new stall released more commands */
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Lists are complete by the time they are enqueued, so every sync succeeds
- * immediately. */
-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* Lists complete synchronously, so a sync never waits. In query mode (1) the
+ * answer is "completed" (0) for a finished list and "drawing" (2) for one
+ * still parked at its stall address. */
+static void hle_ListSync(void) {
+    ge_queue *q = find_queue(psp_arg(0));
+    if (psp_arg(1) == 1) { psp_ret(q && !q->done ? 3 : 0); return; }   /* 3: stall reached */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_DrawSync(void) {
+    if (psp_arg(0) == 1) {
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].used && !g_queue[i].done) { psp_ret(2); return; }
+        psp_ret(0);
+        return;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
-static void hle_SetCallback(void)   { psp_ret(0); }
-static void hle_UnsetCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* (PspGeCallbackData *): signal func/arg, finish func/arg. Returns an id. */
+static void hle_SetCallback(void) {
+    uint32_t d = psp_arg(0);
+    for (int i = 0; i < MAX_CB; i++) {
+        if (g_cb[i].used) continue;
+        g_cb[i].signal_func = psp_read32(d);
+        g_cb[i].signal_arg  = psp_read32(d + 4);
+        g_cb[i].finish_func = psp_read32(d + 8);
+        g_cb[i].finish_arg  = psp_read32(d + 12);
+        g_cb[i].used = 1;
+        psp_ret((uint32_t)i);
+        return;
+    }
+    psp_ret(0x80000022);
+}
+
+static void hle_UnsetCallback(void) {
+    uint32_t i = psp_arg(0);
+    if (i >= MAX_CB || !g_cb[i].used) { psp_ret(0x80000100); return; }
+    g_cb[i].used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
 static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }
@@ -405,6 +386,7 @@ static void hle_EdramGetSize(void) { psp_ret(PSP_VRAM_SIZE); }
 void psp_ge_register(void) {
     psp_hle_register(0xAB49E76A, "sceGe_user", "sceGeListEnQueue",         hle_ListEnQueue);
     psp_hle_register(0x1C0D95A6, "sceGe_user", "sceGeListEnQueueHead",     hle_ListEnQueueHead);
+    psp_hle_register(0x5FB86AB0, "sceGe_user", "sceGeListDeQueue",         hle_ListDeQueue);
     psp_hle_register(0xE0D68148, "sceGe_user", "sceGeListUpdateStallAddr", hle_ListUpdateStallAddr);
     psp_hle_register(0x03444EB4, "sceGe_user", "sceGeListSync",            hle_ListSync);
     psp_hle_register(0xB287BD61, "sceGe_user", "sceGeDrawSync",            hle_DrawSync);

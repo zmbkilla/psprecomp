@@ -13,6 +13,7 @@
 #include "psprecomp/hle.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define PSP_SCREEN_W 480
@@ -29,6 +30,7 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
 static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
+static uint64_t g_flips;            /* SetFrameBuf calls: the game's frame count */
 
 void psp_display_reset(void) {
     g_fb_addr = 0;
@@ -44,6 +46,7 @@ void psp_display_init(void) { psp_display_reset(); }
 
 uint64_t psp_display_vblanks(void) { return g_vblank_count; }
 uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
+uint64_t psp_display_flips(void) { return g_flips; }
 
 /* Expand one source pixel to RGBA8888. The 16-bit formats replicate their high
  * bits into the low ones on expansion; simply shifting left leaves the maximum
@@ -122,22 +125,65 @@ static void hle_SetFrameBuf(void) {
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    g_flips++;
+    {
+        /* PSPRECOMP_DISPLAY_TRACE: report every change of what is displayed. */
+        static int trace = -1;
+        static uint32_t la, lw, lf;
+        if (trace < 0) trace = getenv("PSPRECOMP_DISPLAY_TRACE") != NULL;
+        if (trace && (g_fb_addr != la || g_fb_width != lw || g_fb_format != lf))
+            fprintf(stderr, "display: framebuffer 0x%08X stride %u format %u (flip %llu)\n",
+                    g_fb_addr, g_fb_width, g_fb_format, (unsigned long long)g_flips);
+        la = g_fb_addr; lw = g_fb_width; lf = g_fb_format;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* There is no scanout, so a vblank wait returns immediately and bumps the
- * counter. A game's main loop is usually `render(); WaitVblank();`, which
- * means this counter is the frame number -- the most useful single number to
- * have during bring-up, because it tells you whether the game is looping or
- * stuck. */
-static void hle_WaitVblank(void) {
-    g_vblank_count++;
+/* Under the scheduler a vblank wait blocks the calling thread until the next
+ * vblank on the system clock (59.94 Hz). Without it there is nothing to wait
+ * for, so it returns immediately and bumps the counter. Either way the count
+ * is the frame number -- the most useful single number to have during
+ * bring-up, because it tells you whether the game is looping or stuck. */
+static void wait_vblank(int cb) {
+    psp_sched_wait_vblank(cb);
+    g_vblank_count = psp_sched_active() ? psp_sched_vblank_count() : g_vblank_count + 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_WaitVblank(void)   { wait_vblank(0); }
+static void hle_WaitVblankCB(void) { wait_vblank(1); }
+
+static void hle_GetVcount(void) {
+    psp_ret((uint32_t)(psp_sched_active() ? psp_sched_vblank_count() : g_vblank_count));
+}
+
+/* Returns a float, in $f0: the panel's refresh rate. */
+static void hle_GetFramePerSec(void) {
+    psp_cpu.f[0] = 59.9400599f;
+}
+
+/* (topaddr*, bufferwidth*, pixelformat*, sync) */
+static void hle_GetFrameBuf(void) {
+    if (psp_arg(0)) psp_write32(psp_arg(0), g_fb_addr);
+    if (psp_arg(1)) psp_write32(psp_arg(1), g_fb_width);
+    if (psp_arg(2)) psp_write32(psp_arg(2), g_fb_format);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* For the host's presenter. */
+void psp_display_get(uint32_t *addr, uint32_t *stride, uint32_t *fmt) {
+    if (addr)   *addr = g_fb_addr;
+    if (stride) *stride = g_fb_width;
+    if (fmt)    *fmt = g_fb_format;
 }
 
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
+    psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
-    psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
+    psp_hle_register(0x8EB9EC49, "sceDisplay", "sceDisplayWaitVblankCB",      hle_WaitVblankCB);
+    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
+    psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblankCB);
+    psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);
+    psp_hle_register(0xDBA6C4C4, "sceDisplay", "sceDisplayGetFramePerSec",    hle_GetFramePerSec);
 }

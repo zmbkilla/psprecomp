@@ -43,9 +43,16 @@ add_library(psprecomp STATIC
     src/hle/threadman.c
     src/hle/display.c
     src/hle/ge.c
+    src/hle/gpu.c
+    src/hle/ge_vertex.c
     src/hle/sascore.c
     src/hle/iofilemgr.c
     src/hle/misc.c
+    src/hle/system.c
+    src/hle/modules.c
+    src/hle/atrac.c
+    src/hle/utility.c
+    src/hle/font.c
 )
 
 target_include_directories(psprecomp PUBLIC

@@ -154,6 +154,12 @@ void a_analysis_free(a_analysis *an);
 /* Is `addr` inside the discovered code extent? */
 int a_in_range(const a_analysis *an, uint32_t addr);
 
+/* Heuristic: function addresses formed in code by lui + addiu/ori pairs
+ * within the scan range (the thread entry crt0 hands to CreateThread, for
+ * one). Validated like a_scan_data_pointers. Returns the total found; at most
+ * `max` are written to `out`. See analyze.c. */
+int a_scan_code_pointers(const a_analysis *an, uint32_t *out, int max);
+
 #ifdef __cplusplus
 }
 #endif

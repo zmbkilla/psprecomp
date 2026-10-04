@@ -59,6 +59,11 @@ const psp_hle_entry *psp_hle_entries(int *count);
  * wild pointer shows up far from its cause. */
 void psp_hle_dump_recent(FILE *out);
 
+/* Every unimplemented NID the game called, with call counts. */
+void psp_hle_dump_unimplemented(FILE *out);
+/* The most frequently called firmware functions, with counts. */
+void psp_hle_dump_calls(FILE *out, int top);
+
 /* Register everything the toolkit implements. Call once at startup. */
 void psp_hle_init(void);
 
@@ -121,6 +126,7 @@ void psp_display_reset(void);
 int      psp_display_capture(const char *path);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
+void     psp_display_get(uint32_t *addr, uint32_t *stride, uint32_t *fmt);
 
 void psp_ge_init(void);
 void psp_ge_register(void);
@@ -140,18 +146,71 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+/* The host path a guest path (disc0:, ms0:, flash0:, ...) maps to. */
+void psp_io_host_path(const char *guest, char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);
 
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
 int  psp_exit_requested(void);
+void psp_request_exit(void);       /* host side: window closed, time limit */
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
+
+void psp_font_init(void);
+void psp_font_register(void);
+void psp_font_reset(void);
+
+void psp_utility_init(void);
+void psp_utility_register(void);
+void psp_utility_reset(void);
+
+void psp_atrac_init(void);
+void psp_atrac_register(void);
+void psp_atrac_reset(void);
+
+void psp_modules_init(void);
+void psp_modules_register(void);
+void psp_modules_reset(void);
+
+void psp_system_init(void);
+void psp_system_register(void);
+void psp_system_reset(void);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
+
+/* ---- the scheduler (opt-in; see src/hle/threadman.c) ---------------------
+ *
+ * Without psp_sched_run, threads run to completion inside StartThread and
+ * blocking waits report a timeout. psp_sched_run gives every PSP thread its
+ * own host fiber and schedules them the way the PSP kernel does. */
+int      psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+                       uint32_t prio, uint32_t stack_size, uint32_t gp);
+int      psp_sched_active(void);
+uint64_t psp_sched_now_us(void);
+uint64_t psp_sched_idle_us(void);    /* host time with nothing runnable */
+uint64_t psp_display_flips(void);    /* sceDisplaySetFrameBuf calls */
+uint64_t psp_ge_host_us(void);       /* host time executing display lists */
+uint64_t psp_gpu_host_us(void);      /* ...of which rasterizing primitives */
+uint64_t psp_sched_vblank_count(void);
+/* Called once per vblank on the scheduler's clock: present, pump input. */
+void     psp_sched_set_vblank_hook(void (*fn)(void));
+/* Block the calling PSP thread. Return immediately outside the scheduler. */
+uint32_t psp_sched_wait_vblank(int allow_callbacks);
+uint32_t psp_sched_sleep_until(uint64_t when_us);
+/* Queue a notification for a callback; delivered on its owning thread. */
+int      psp_sched_notify_callback(uint32_t cbid, uint32_t arg);
+/* The preemption point every firmware call ends with. */
+void     psp_sched_after_hle(void);
+void     psp_sched_dump(FILE *out);
+/* Call guest code as an interrupt handler would run (GE callbacks). */
+uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1);
+
+/* Interrupt mask state (sceKernelCpuSuspendIntr/ResumeIntr). */
+int  psp_intr_enabled(void);
 
 /* Bytes of user memory still available — the cheapest end-to-end check that
  * the allocator is behaving. */
@@ -161,6 +220,7 @@ uint32_t psp_sysmem_free(void);
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high);
+void     psp_sysmem_set_heap(uint32_t lo, uint32_t hi);
 void     psp_sysmem_release(uint32_t addr);
 
 #ifdef __cplusplus

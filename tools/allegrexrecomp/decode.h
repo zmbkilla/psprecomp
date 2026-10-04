@@ -98,6 +98,11 @@ typedef enum {
      * these is a hard error rather than a silent wrong answer. */
     A_VIIM,
     A_VFIM,
+    /* Opcode 0x34 rs=1 (integer packing) and rs=2 (butterflies,
+     * one's complement, funnel add, sign): the rt field picks the
+     * operation, so each family is one op with a sub-opcode. */
+    A_VFPU7,
+    A_VFPU9,
     A_VFPU_UNKNOWN,
 
     A_NOP,          /* canonical: sll $zero, $zero, 0 */

@@ -102,13 +102,61 @@ void psp_hle_dump_recent(FILE *out) {
     }
 }
 
+/* Unimplemented NIDs, counted. A game polling an unimplemented call every
+ * frame would otherwise bury every other message; the first few calls of
+ * each are reported as they happen and the totals at exit. */
+#define UNIMPL_MAX 256
+static struct { uint32_t nid; uint64_t count; } g_unimpl[UNIMPL_MAX];
+static int g_unimpl_n;
+
+static void note_unimplemented(uint32_t nid) {
+    int i;
+    for (i = 0; i < g_unimpl_n; i++) if (g_unimpl[i].nid == nid) break;
+    if (i == g_unimpl_n) {
+        if (g_unimpl_n == UNIMPL_MAX) return;
+        g_unimpl[i].nid = nid;
+        g_unimpl[i].count = 0;
+        g_unimpl_n++;
+    }
+    if (++g_unimpl[i].count <= 3)
+        fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X%s\n", nid,
+                g_unimpl[i].count == 3 ? " (further calls counted, not shown)" : "");
+}
+
+void psp_hle_dump_unimplemented(FILE *out) {
+    if (!g_unimpl_n) { fprintf(out, "  (no unimplemented firmware calls)\n"); return; }
+    fprintf(out, "  unimplemented firmware calls (NID, times called):\n");
+    for (int i = 0; i < g_unimpl_n; i++)
+        fprintf(out, "    0x%08X  x%llu\n", g_unimpl[i].nid, (unsigned long long)g_unimpl[i].count);
+}
+
+/* Calls per registered function: what a game's main loop is actually doing
+ * is the first question when it runs but does not progress. */
+static uint64_t g_calls[HLE_MAX];
+
+void psp_hle_dump_calls(FILE *out, int top) {
+    int idx[HLE_MAX], n = 0;
+    for (int i = 0; i < g_count; i++) if (g_calls[i]) idx[n++] = i;
+    for (int i = 1; i < n; i++) {
+        int k = idx[i], j = i - 1;
+        while (j >= 0 && g_calls[idx[j]] < g_calls[k]) { idx[j + 1] = idx[j]; j--; }
+        idx[j + 1] = k;
+    }
+    fprintf(out, "  firmware calls (most frequent first):\n");
+    for (int i = 0; i < n && i < top; i++)
+        fprintf(out, "    %-36s x%llu\n", g_entry[idx[i]].name ? g_entry[idx[i]].name : "(unnamed)",
+                (unsigned long long)g_calls[idx[i]]);
+}
+
 void psp_hle_call(uint32_t nid) {
-    if (nid == 0x237DBD4Fu)
-        fprintf(stderr, "psp_hle_call ENTERED for 0x237DBD4F (%d entries registered)\n", g_count);
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
+            g_calls[i]++;
             g_fn[i]();
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
+            /* Firmware calls are where a higher-priority thread made ready by
+             * this call (or by an event that fell due) takes over. */
+            psp_sched_after_hle();
             return;
         }
     }
@@ -122,8 +170,9 @@ void psp_hle_call(uint32_t nid) {
      * advisory (version reporting, profiling hooks) and a game will run past
      * them happily. One that genuinely needed the result will fail visibly
      * soon after, with this line already in the log. */
-    fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
+    note_unimplemented(nid);
     psp_ret(0);
+    psp_sched_after_hle();
 }
 
 const char *psp_str(uint32_t addr, char *dst, size_t cap) {
@@ -156,4 +205,14 @@ void psp_hle_init(void) {
     psp_io_register();
     psp_misc_init();
     psp_misc_register();
+    psp_system_init();
+    psp_system_register();
+    psp_font_init();
+    psp_font_register();
+    psp_utility_init();
+    psp_utility_register();
+    psp_atrac_init();
+    psp_atrac_register();
+    psp_modules_init();
+    psp_modules_register();
 }

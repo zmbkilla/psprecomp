@@ -215,6 +215,27 @@ static void test_vfpu(void) {
     dec(0xC8000000, 0x08900000, A_LV_S, "lv.s");
     dec(0xE8000000, 0x08900000, A_SV_S, "sv.s");
 
+    /* Their vector register is bits 20..16 plus high bits taken from the
+     * offset -- not bits 22..16, which overlap the base GPR. Base $sp (29)
+     * is the case that exposes it: bits 22..21 of the word are then 01. */
+    in = dec(0xCBA10012, 0x08900000, A_LV_S, "lv.s S..., 16($sp)");
+    CHECK(in.rs == 29, "lv.s base register is $sp, got %u", in.rs);
+    CHECK(in.vt == (1 | (2 << 5)), "lv.s vt = 20..16 | (imm&3)<<5 = 65, got %u", in.vt);
+    CHECK((in.imm & ~3) == 16, "lv.s offset is imm with the register bits masked");
+    in = dec(0xDBA30021, 0x08900000, A_LV_Q, "lv.q C..., 32($sp)");
+    CHECK(in.vt == (3 | (1 << 5)), "lv.q vt = 20..16 | (imm&1)<<5 = 35, got %u", in.vt);
+    in = dec(0xFBA30021, 0x08900000, A_SV_Q, "sv.q");
+    CHECK(in.vt == 35, "sv.q uses the same register encoding, got %u", in.vt);
+
+    /* viim / vfim: destination in bits 22..16, immediate in 15..0. A decoder
+     * that took the register from the low bits would target register 5 here. */
+    in = dec((0x37u << 26) | (6u << 23) | (0x21u << 16) | 0x0005u, 0x08900000, A_VIIM, "viim");
+    CHECK(in.vd == 0x21, "viim destination is bits 22..16 (0x21), got 0x%02X", in.vd);
+    CHECK(in.imm == 5, "viim immediate, got %d", in.imm);
+    in = dec((0x37u << 26) | (7u << 23) | (0x5Au << 16) | 0xBC00u, 0x08900000, A_VFIM, "vfim");
+    CHECK(in.vd == 0x5A, "vfim destination is bits 22..16 (0x5A), got 0x%02X", in.vd);
+    CHECK((in.imm & 0xFFFF) == 0xBC00, "vfim half-float bits (-1.0), got 0x%04X", in.imm & 0xFFFF);
+
     /* VFPU0 family: sub-opcode in bits 25..23. */
     dec(0x60000000, 0x08900000, A_VADD, "vadd");
     dec(0x60800000, 0x08900000, A_VSUB, "vsub");

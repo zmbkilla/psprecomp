@@ -243,6 +243,8 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VPFXD]    = { "vpfxd",    F_UNKNOWN },
         [A_VIIM]     = { "viim",     F_UNKNOWN },
     [A_VFIM]     = { "vfim",     F_UNKNOWN },
+    [A_VFPU7]    = { "vfpu7",    F_VD_VS },
+    [A_VFPU9]    = { "vfpu9",    F_VD_VS },
     [A_VFPU_UNKNOWN] = { "vfpu?", F_UNKNOWN },
 };
 
@@ -554,9 +556,14 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         case 7: op = A_VFIM; break;
         default: op = A_VFPU_UNKNOWN; break;
         }
-        out->vd = (word >> 16) & 0x7F;
-        out->imm = (int32_t)(int16_t)(word & 0xFFFF);
-        out->vsize = 1;
+        /* These set `in`, not `out`: `*out = in` at the end overwrites `out`,
+         * and writing `out` here left viim/vfim targeting the register named
+         * by the immediate's low seven bits. That scattered every matrix
+         * constant the game built this way -- PSP2i's character creation
+         * uploaded a projection with its diagonal in row 0 and a world matrix
+         * full of infinities, so all of its 3D geometry collapsed to one row. */
+        in.vd = (uint8_t)((word >> 16) & 0x7F);
+        in.vsize = 1;
         break;
     case 0x19:
         switch ((word >> 23) & 7) {
@@ -619,6 +626,17 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
             default:   op = A_VFPU_UNKNOWN; break;
             }
             break;
+        case 0x01:                                  /* VFPU7: packing conversions */
+            op = RT_F(word) >= 0x18 ? A_VFPU7 : A_VFPU_UNKNOWN;
+            break;
+        case 0x02:                                  /* VFPU9 */
+            switch (RT_F(word)) {
+            case 0x02: case 0x03: case 0x04: case 0x05:
+            case 0x06: case 0x07: case 0x0A:
+                op = A_VFPU9; break;
+            default: op = A_VFPU_UNKNOWN; break;
+            }
+            break;
         case 0x03: op = A_VCST;  break;
         case 0x10: op = A_VF2IN; break;
         case 0x11: op = A_VF2IZ; break;
@@ -657,8 +675,15 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         }
         break;
 
+    /* vnop / vsync / vflush: VFPU pipeline control, no architectural effect
+     * on a machine that executes one instruction at a time. */
+    case 0x3F:
+        op = (word == 0xFFFF0000u || word == 0xFFFF0320u || word == 0xFFFF040Du)
+           ? A_SYNC : A_VFPU_UNKNOWN;
+        break;
+
     case 0x1C: case 0x1D: case 0x1E:
-    case 0x35: case 0x3D: case 0x3F:
+    case 0x35: case 0x3D:
         op = A_VFPU_UNKNOWN;
         break;
 
@@ -669,6 +694,22 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
 
     in.op  = op;
     in.fmt = (op > A_INVALID && op < A_OP_COUNT) ? OPINFO[op].fmt : F_UNKNOWN;
+
+    /* VFPU load/store register numbers do not live in bits 22..16. Bits 25..21
+     * are the base GPR as for any load; the vector register's low five bits
+     * are 20..16 and its high bits are borrowed from the offset, which is
+     * word- (or quad-) aligned and so has them spare:
+     *
+     *     lv.s / sv.s   vt = bits 20..16 | (imm & 3) << 5
+     *     lv.q / sv.q   vt = bits 20..16 | (imm & 1) << 5
+     *
+     * Reading 22..16 instead mixes the base register into the vector
+     * register -- every access relative to $sp (29 = 0b11101) lands 32
+     * registers away -- while dropping the true high bits. */
+    if (op == A_LV_S || op == A_SV_S)
+        in.vt = (uint8_t)(((word >> 16) & 0x1F) | ((word & 3) << 5));
+    else if (op == A_LV_Q || op == A_SV_Q)
+        in.vt = (uint8_t)(((word >> 16) & 0x1F) | ((word & 1) << 5));
 
     /* Immediate: signed for the arithmetic forms and every memory offset,
      * zero-extended for the logical forms. */

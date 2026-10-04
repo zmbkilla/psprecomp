@@ -43,3 +43,13 @@ add_test(NAME ctors COMMAND test_ctors)
 add_executable(test_raster test_raster.c)
 target_link_libraries(test_raster PRIVATE psprecomp)
 add_test(NAME raster COMMAND test_raster)
+
+# PGF font parsing. Synthetic data only; set PSPRECOMP_FONT_DIR to a directory
+# holding the PSP's own font files to run the extra real-font checks.
+add_executable(test_font test_font.c)
+target_link_libraries(test_font PRIVATE psprecomp)
+add_test(NAME font COMMAND test_font)
+
+add_executable(test_ge_vertex test_ge_vertex.c)
+target_link_libraries(test_ge_vertex PRIVATE psprecomp)
+add_test(NAME ge_vertex COMMAND test_ge_vertex)

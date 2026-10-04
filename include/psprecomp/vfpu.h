@@ -12,23 +12,15 @@
  * a matrix by columns and reads it by rows -- which is exactly what a
  * transpose does -- only works if this matches.
  *
- * ## What is implemented, and what deliberately is not
+ * ## Prefixes
  *
- * Measured against a real module (WTF's Lumberjack, 1276 VFPU-space words in
- * .text), the distribution is heavily skewed: quad load/store is 48% of it,
- * and vscl/vmul/vadd/vdot another 18%. Those, plus the compare/min/max family,
- * are implemented here and unit-tested.
- *
- * The **prefix** instructions are not. `vpfxs`/`vpfxt`/`vpfxd` do not compute
- * anything -- they set a register that rewrites the *operands of the next
- * instruction*, swizzling lanes, negating, forcing constants, masking writes.
- * An arithmetic op executed while a prefix is pending computes something
- * different from the same op without one.
- *
- * So a pending prefix makes the next arithmetic op **trap** rather than
- * compute. Implementing the arithmetic while ignoring the prefixes would be
- * worse than not implementing it at all: it would produce numbers that are
- * silently wrong instead of an error that says so. Loud beats plausible.
+ * `vpfxs`/`vpfxt`/`vpfxd` do not compute anything -- they set a register that
+ * rewrites the *operands of the next instruction*: swizzling lanes, taking
+ * absolute values, substituting constants, negating, saturating and masking
+ * writes. They are implemented (see src/vfpu.c for the bit layout): every
+ * element-wise operation reads its sources and writes its destination through
+ * them, and they are consumed by that one instruction. Matrix instructions do
+ * not take prefixes and simply discard a pending one.
  */
 #ifndef PSPRECOMP_VFPU_H
 #define PSPRECOMP_VFPU_H
@@ -94,9 +86,47 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
 void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+/* Homogeneous transform: vector one lane narrower than the matrix order,
+ * with an implicit 1.0 in the last lane. `size` is the matrix order. */
+void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* Set-if comparisons (1.0 / 0.0 per lane) and the cross products. vcrsp at
+ * quad width is vqmul, the quaternion product. */
+void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vslt(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* Scaled conversions: vf2i* multiply by 2^scale then round; vi2f divides. */
+enum { PSP_VF2I_NEAREST = 0, PSP_VF2I_ZERO, PSP_VF2I_UP, PSP_VF2I_DOWN };
+void psp_vf2i(int mode, uint32_t vd, uint32_t vs, uint32_t scale, int size);
+void psp_vi2f(uint32_t vd, uint32_t vs, uint32_t scale, int size);
+
+/* Conditional move on the VFPU condition codes. */
+void psp_vcmov(uint32_t vd, uint32_t vs, int size, int tf, int imm3);
+/* Rotation row from one angle; imm5 places cosine and sine. */
+void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm5, int size);
+
+/* VFPU9 (opcode 0x34, rs 2), by rt sub-opcode. */
+enum {
+    PSP_V9_BFY1 = 0x02, PSP_V9_BFY2 = 0x03, PSP_V9_OCP = 0x04, PSP_V9_SOCP = 0x05,
+    PSP_V9_FAD = 0x06, PSP_V9_AVG = 0x07, PSP_V9_SGN = 0x0A
+};
+void psp_vfpu9(int op, uint32_t vd, uint32_t vs, int size);
+
+/* VFPU7 integer packing conversions (opcode 0x34, rs 1), by rt sub-opcode. */
+enum {
+    PSP_V7_UC2I = 0x18, PSP_V7_C2I = 0x19, PSP_V7_US2I = 0x1A, PSP_V7_S2I = 0x1B,
+    PSP_V7_I2UC = 0x1C, PSP_V7_I2C = 0x1D, PSP_V7_I2US = 0x1E, PSP_V7_I2S = 0x1F
+};
+void psp_vconv(int op, uint32_t vd, uint32_t vs, int size);
+
+/* mtv / mfv: 8-bit register number, 128+ being the control registers. */
+void     psp_mtv(uint32_t reg, uint32_t value);
+uint32_t psp_mfv(uint32_t reg);
 
 /* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next
- * arithmetic instruction. While any is pending, arithmetic traps. */
+ * arithmetic instruction. */
 void psp_vfpu_set_prefix(int which, uint32_t value);
 int  psp_vfpu_prefix_pending(void);
 void psp_vfpu_reset(void);

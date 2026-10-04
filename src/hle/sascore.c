@@ -317,6 +317,15 @@ static void hle_GetEnvelopeHeight(void) {
     psp_ret(v ? (uint32_t)v->env : 0);
 }
 
+/* (sasCore, int heights[32]): every voice's envelope level at once. */
+static void hle_GetAllEnvelopeHeights(void) {
+    uint32_t out = psp_arg(1);
+    if (out) for (int i = 0; i < SAS_VOICES; i++) psp_write32(out + (uint32_t)i * 4, (uint32_t)g_voice[i].env);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
+
 static void mix_to_guest(uint32_t out_addr, int add) {
     int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
     uint32_t n = g_grain;
@@ -369,6 +378,8 @@ void psp_sas_register(void) {
     psp_hle_register(0x787D04D5, "sceSasCore", "__sceSasSetPause",          hle_SetPause);
     psp_hle_register(0x2C8E6AB3, "sceSasCore", "__sceSasGetPauseFlag",      hle_GetPauseFlag);
     psp_hle_register(0x74AE582A, "sceSasCore", "__sceSasGetEnvelopeHeight", hle_GetEnvelopeHeight);
+    psp_hle_register(0x07F58C24, "sceSasCore", "__sceSasGetAllEnvelopeHeights", hle_GetAllEnvelopeHeights);
+    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputmode);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_accept);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);

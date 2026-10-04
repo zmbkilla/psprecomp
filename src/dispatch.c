@@ -114,8 +114,12 @@ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t)) {
     g_watch_fn = fn;
 }
 
+static void (*g_enter_hook)(uint32_t);
+void psp_trace_set_enter_hook(void (*fn)(uint32_t)) { g_enter_hook = fn; }
+
 void psp_trace_enter(uint32_t addr) {
     if (addr == g_watch_addr && g_watch_fn) g_watch_fn(addr);
+    if (g_enter_hook) g_enter_hook(addr);
     g_trace[g_trace_n % TRACE_DEPTH] = addr;
     g_trace_n++;
 }
@@ -250,10 +254,14 @@ static void (*g_mark_fn)(uint32_t);
 static uint8_t *g_marked;
 static uint32_t g_marked_lo, g_marked_n;
 
+static void (*g_mark_hook)(uint32_t);
+void psp_trace_set_mark_hook(void (*fn)(uint32_t)) { g_mark_hook = fn; }
+
 void psp_trace_mark(uint32_t addr) {
     if (g_marked && addr >= g_marked_lo && addr - g_marked_lo < g_marked_n * 4)
         g_marked[(addr - g_marked_lo) >> 2] = 1;
     if (addr == g_mark_addr && g_mark_fn) g_mark_fn(addr);
+    if (g_mark_hook) g_mark_hook(addr);
 }
 
 void psp_trace_watch_label(uint32_t addr, void (*fn)(uint32_t)) {

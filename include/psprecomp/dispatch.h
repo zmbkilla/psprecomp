@@ -63,6 +63,11 @@ uint64_t psp_sp_violations(void);
 uint32_t psp_sp_first_bad(void);
 int32_t  psp_sp_first_delta(void);
 void psp_trace_watch_label(uint32_t addr, void (*fn)(uint32_t));
+/* Called for *every* label executed (trace builds). The differential oracle
+ * uses it to stop recompiled code after exactly N labels. */
+void psp_trace_set_mark_hook(void (*fn)(uint32_t));
+/* Called on every function entry (trace builds). */
+void psp_trace_set_enter_hook(void (*fn)(uint32_t));
 void psp_trace_marks_init(uint32_t lo, uint32_t words);
 int psp_trace_was_marked(uint32_t addr);
 uint32_t psp_trace_loop_addr(void);

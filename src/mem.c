@@ -28,9 +28,13 @@ static void note_write(uint32_t addr, uint32_t width) {
 /* Bad accesses were only ever counted, which says an initialiser went wrong
  * without saying which one. The addresses are what identify it, and there are
  * few enough of them (28 in the current run) to simply print. */
+static void (*g_first_bad_hook)(uint32_t addr);
+void psp_mem_set_first_bad_hook(void (*fn)(uint32_t addr)) { g_first_bad_hook = fn; }
+
 static void bad_access(uint32_t addr, int write, int width) {
     /* The first one matters most: everything after it may be cascade from a
      * register that was already wrong. Dump the whole file once. */
+    if (psp_mem_bad_access == 0 && g_first_bad_hook) g_first_bad_hook(addr);
     if (psp_mem_bad_access == 0) {
         static const char *N[32] = {
             "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
@@ -54,6 +58,8 @@ int psp_mem_init(void) {
     psp_mem.vram    = (uint8_t *)calloc(1, PSP_VRAM_SIZE);
     psp_mem.scratch = (uint8_t *)calloc(1, PSP_SCRATCH_SIZE);
     if (!psp_mem.ram || !psp_mem.vram || !psp_mem.scratch) {
+        fprintf(stderr, "psp_mem_init: ram=%p vram=%p scratch=%p\n",
+                (void *)psp_mem.ram, (void *)psp_mem.vram, (void *)psp_mem.scratch);
         psp_mem_free();
         return -1;
     }

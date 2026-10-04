@@ -2,10 +2,10 @@
  *
  * Two things get pinned here. The first is register addressing, because the
  * layout is what makes a matrix row and column alias correctly and everything
- * else is built on it. The second is that a pending prefix makes arithmetic
- * *trap* rather than compute: partial VFPU that ignores prefixes produces
- * silently wrong numbers, which is the one failure mode this project has spent
- * its whole life avoiding.
+ * else is built on it. The second is prefix semantics: swizzle, constants,
+ * negation, saturation and write masking, each consumed by exactly one
+ * instruction. Ignoring a prefix produces silently wrong numbers, which is
+ * the one failure mode this project has spent its whole life avoiding.
  */
 
 #include "psprecomp/vfpu.h"
@@ -160,36 +160,59 @@ static void test_arithmetic(void) {
     for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + b[i], "vadd into its own source");
 }
 
-static void test_prefix_traps(void) {
+static void test_prefixes(void) {
     psp_vfpu_reset();
 
     const float a[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float out[4];
     set_quad(0x00, a);
     set_quad(0x04, a);
 
     uint64_t before = psp_vfpu_trap_count();
 
-    /* With no prefix pending, arithmetic computes. */
-    psp_vadd(0x08, 0x00, 0x04, 4);
-    CHECK(psp_vfpu_trap_count() == before, "no prefix, no trap");
-
-    /* With one pending, it must trap instead of quietly ignoring it. */
+    /* Source swizzle: 0x55 reads lane 1 into every lane. */
     psp_vfpu_set_prefix(0, 0x00000055);
     CHECK(psp_vfpu_prefix_pending(), "prefix registers as pending");
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[1] + a[i], "vpfxs swizzle [y,y,y,y]");
+    CHECK(!psp_vfpu_prefix_pending(), "the prefix is consumed by one instruction");
+    CHECK(psp_vfpu_trap_count() == before, "a prefixed op computes, it does not trap");
 
-    float before_out[4];
-    get_quad(0x0C, before_out);
-    psp_vadd(0x0C, 0x00, 0x04, 4);
+    /* And only one: the next op is unprefixed. */
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + a[i], "prefix gone after one use");
 
-    CHECK(psp_vfpu_trap_count() == before + 1,
-          "a pending prefix traps rather than computing");
-    CHECK(!psp_vfpu_prefix_pending(), "the prefix is consumed by the attempt");
+    /* Constants: cst bits set, swizzle 1 with abs clear selects 1.0; with abs
+     * set the same swizzle selects the high table entry 1/3. */
+    psp_vfpu_set_prefix(1, 0x0000F055);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + 1.0f, "vpfxt constant 1");
+    psp_vfpu_set_prefix(1, 0x0000FF55);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + 1.0f / 3.0f, "vpfxt constant 1/3");
 
-    float after_out[4];
-    get_quad(0x0C, after_out);
-    CHECK(memcmp(before_out, after_out, sizeof after_out) == 0,
-          "the trapped op wrote nothing -- silently wrong output is the one "
-          "outcome worse than an error");
+    /* Negate lane 0 of s, identity swizzle elsewhere. */
+    psp_vfpu_set_prefix(0, 0x000100E4);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 0.0f, "vpfxs negate lane 0: -1 + 1");
+    CHECK_F(out[1], 4.0f, "other lanes untouched");
+
+    /* Destination: saturate lane 0 to [0,1], mask lane 3. */
+    const float keep = 42.0f;
+    int d[4];
+    psp_vfpu_regs(0x08, 4, d);
+    psp_cpu.v[d[3]] = keep;
+    psp_vfpu_set_prefix(2, 0x00000801);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 1.0f, "vpfxd sat0 clamps 2.0 to 1.0");
+    CHECK_F(out[2], 6.0f, "unsaturated lane written");
+    CHECK_F(out[3], keep, "masked lane not written");
 }
 
 static void test_compare(void) {
@@ -273,9 +296,11 @@ static void test_matrix_transform(void) {
     psp_vfpu_reset();
     float m[4][4], v[4];
 
-    /* Transforming a basis vector must yield the corresponding matrix column.
-     * That is the property which distinguishes this convention from its
-     * transpose -- an identity test would pass either way. */
+    /* The hardware transforms by the TRANSPOSE of the matrix as addressed
+     * (PPSSPP Int_Vtfm), so code that wants M * v names the transposed view:
+     * transforming a basis vector through E200 yields M200's column, and
+     * through M200 itself yields its row. An identity test passes either
+     * way; these do not. */
     for (int c = 0; c < 4; c++)
         for (int r = 0; r < 4; r++) m[c][r] = (float)(c * 4 + r + 1);
     set_matrix(0x08, 4, m);
@@ -285,29 +310,33 @@ static void test_matrix_transform(void) {
         psp_vfpu_regs(0x40, 4, t);
         for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = (i == basis) ? 1.0f : 0.0f;
 
-        psp_vtfm(0x44, 0x08, 0x40, 4);
+        psp_vtfm(0x44, 0x28, 0x40, 4);                     /* E200 */
         psp_vfpu_regs(0x44, 4, d);
         for (int r = 0; r < 4; r++)
-            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm of a basis vector is that column");
+            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm through the transposed view: the column");
+        psp_vtfm(0x44, 0x08, 0x40, 4);                     /* M200 */
+        psp_vfpu_regs(0x44, 4, d);
+        for (int r = 0; r < 4; r++)
+            CHECK_F(psp_cpu.v[d[r]], m[r][basis], "vtfm through the matrix as addressed: the row");
     }
 
-    /* Multiplying by the identity must be a no-op, in both operand positions. */
+    /* vmmul is S^T * T (PPSSPP Int_Vmmul). With the identity as S the
+     * result is T; with the identity as T it is S transposed. */
     psp_vmidt(0x00, 4);
     psp_vmmul(0x0C, 0x08, 0x00, 4);
     float out[4][4];
     get_matrix(0x0C, 4, out);
     for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "M * I == M");
+        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[r][c], "vmmul(M, I) == M^T");
 
     psp_vmmul(0x0C, 0x00, 0x08, 4);
     get_matrix(0x0C, 4, out);
     for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "I * M == M");
+        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "vmmul(I, M) == M");
 
-    /* vmmul and vtfm must agree: transforming by a product is the same as
-     * transforming twice. This is the strongest check available without an
-     * external oracle -- it pins the two against each other, though it still
-     * cannot detect a consistent transpose of both. */
+    /* vmmul and vtfm must agree: vmmul(A, B) = A^T B, and transforming by
+     * that (vtfm applies the transpose) is B^T (A x) -- A x through A's
+     * transposed view, then B as addressed. */
     float a[4][4], b[4][4];
     for (int c = 0; c < 4; c++)
         for (int r = 0; r < 4; r++) {
@@ -326,7 +355,7 @@ static void test_matrix_transform(void) {
     const float in[4] = { 1.0f, -2.0f, 0.5f, 3.0f };
     for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = in[i];
 
-    /* (A*B) * x */
+    /* vtfm by vmmul(A, B) */
     psp_vmmul(0x14, 0x08, 0x10, 4);       /* matrix 5 */
     psp_vtfm(0x1C, 0x14, 0x18, 4);        /* matrix 7 */
     float combined[4];
@@ -334,13 +363,73 @@ static void test_matrix_transform(void) {
     psp_vfpu_regs(0x1C, 4, d);
     for (int i = 0; i < 4; i++) combined[i] = psp_cpu.v[d[i]];
 
-    /* A * (B * x) */
-    psp_vtfm(0x00, 0x10, 0x18, 4);        /* matrix 0 */
-    psp_vtfm(0x04, 0x08, 0x00, 4);        /* matrix 1 */
+    /* B^T (A x) */
+    psp_vtfm(0x00, 0x28, 0x18, 4);        /* matrix 0 = A x (E200) */
+    psp_vtfm(0x04, 0x10, 0x00, 4);        /* matrix 1 = B^T (A x) */
     psp_vfpu_regs(0x04, 4, d);
     for (int i = 0; i < 4; i++)
         CHECK_F(psp_cpu.v[d[i]], combined[i],
-                "vmmul and vtfm agree: (A*B)x == A(Bx)");
+                "vmmul and vtfm agree: vtfm(vmmul(A, B), x) == B^T (A x)");
+
+    /* PSP2i's matrix multiply, 0x08D7AED4 (out, a, b): lv.q a's columns into
+     * M100 and b's into M200, `vmmul.q E000, M200, E100`, sv.q M000's
+     * columns. It must store a * b -- the earlier S * T stored a * b^T, and
+     * every projection the game composed came out transposed. */
+    float ga[4][4], gb[4][4], want[4][4];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            ga[c][r] = (float)(c * 4 + r + 1);
+            gb[c][r] = (float)((c * 3 + r * 5) % 7) - 2.0f;
+        }
+    for (int c = 0; c < 4; c++)                /* want = a * b, column-major */
+        for (int r = 0; r < 4; r++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; k++) sum += ga[k][r] * gb[c][k];
+            want[c][r] = sum;
+        }
+    set_matrix(0x04, 4, ga);                   /* M100 */
+    set_matrix(0x08, 4, gb);                   /* M200 */
+    psp_vmmul(32, 8, 36, 4);                   /* E000, M200, E100 */
+    get_matrix(0x00, 4, out);
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], want[c][r], "the game's multiply stores a * b");
+
+    /* vhtfm4: three source lanes plus an implicit 1, and all four result
+     * lanes written (PSP2i's clip test reads the w lane). Through E100 the
+     * result is M * (x, y, z, 1). */
+    psp_vfpu_regs(0x18, 4, t);
+    for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = 0.0f;
+    psp_cpu.v[t[0]] = 1.0f; psp_cpu.v[t[1]] = 2.0f; psp_cpu.v[t[2]] = 3.0f;
+    psp_vfpu_regs(0x1C, 4, d);
+    psp_cpu.v[d[3]] = -999.0f;
+    psp_vhtfm(0x1C, 36, 0x18, 4);              /* E100 = transposed view of ga */
+    for (int r = 0; r < 4; r++) {
+        const float e = ga[0][r] * 1.0f + ga[1][r] * 2.0f + ga[2][r] * 3.0f + ga[3][r];
+        CHECK_F(psp_cpu.v[d[r]], e, "vhtfm4 through E100: M * (x, y, z, 1), all four lanes");
+    }
+}
+
+/* vidt: the 1.0 goes in the lane given by the register's column bits (vd & 3
+ * for a quad, vd & 1 for a pair), so vidt.q on C000, C010, C020, C030 builds
+ * the identity matrix column by column. This is exactly how PSP2i builds its
+ * translation matrices (0x08D7AD18); taking the lane from bits 6..7 instead
+ * put every column's 1.0 in row 0, and every projection the game composed
+ * from those matrices came out with its diagonal in row 0. */
+static void test_vidt(void) {
+    psp_vfpu_reset();
+    for (uint32_t c = 0; c < 4; c++) psp_vidt(c, 4);       /* C000, C010, C020, C030 */
+    float m[4][4];
+    get_matrix(0x00, 4, m);
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            CHECK_F(m[c][r], (c == r) ? 1.0f : 0.0f, "vidt.q column by column builds the identity");
+
+    /* Pair: the lane is vd & 1. */
+    int d[4];
+    psp_vidt(0x09, 2);                                      /* column 1 of matrix 2, rows 0-1 */
+    psp_vfpu_regs(0x09, 2, d);
+    CHECK_F(psp_cpu.v[d[0]], 0.0f, "vidt.p on an odd column: lane 0 is 0");
+    CHECK_F(psp_cpu.v[d[1]], 1.0f, "vidt.p on an odd column: lane 1 is 1");
 }
 
 int main(void) {
@@ -351,10 +440,11 @@ int main(void) {
     test_register_addressing();
     test_load_store();
     test_arithmetic();
-    test_prefix_traps();
+    test_prefixes();
     test_compare();
     test_matrix_ops();
     test_matrix_transform();
+    test_vidt();
 
     psp_mem_free();
 

@@ -112,6 +112,87 @@ static void emit_static_call(ectx *c, uint32_t target) {
     }
 }
 
+/* After a call returns, $ra holds the address the callee actually returned
+ * to: a normal `jr $ra` leaves it equal to the link the caller set. When it
+ * differs, the callee left by some other route -- reloaded $ra from an outer
+ * frame and returned *past* this call (hand-written code does this: a
+ * subroutine reached by `bal` bails out through its parent's epilogue). The
+ * hardware is then executing in an outer caller, so this C frame must return
+ * too, and so on until the frame whose call site matches.
+ *
+ * Observed: the inflate routine at 0x08DE0C40 calls its bit decoder with
+ * bltzal; on end-of-stream the decoder exits through the inflate epilogue.
+ * Without this check the C call simply returned into the middle of inflate,
+ * which kept decoding past the end of the data with its frame already
+ * popped. */
+static void emit_return_check(ectx *c, const char *ind, uint32_t link) {
+    fprintf(c->out, "%sif (r_ra != 0x%08Xu) return;  /* returned past this call: keep unwinding */\n",
+            ind, link);
+}
+
+/* The function whose entry is `addr`, or NULL. */
+static const a_func *func_at(const a_analysis *an, uint32_t addr) {
+    int lo = 0, hi = an->nfuncs - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (an->funcs[mid].addr == addr) return &an->funcs[mid];
+        if (an->funcs[mid].addr < addr) lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+
+/* Does `f` contain a call whose delay slot reloads $ra (`jal g ; lw $ra, ..`)?
+ * Such a function returns to its *caller's* caller, which is the only way a
+ * direct call can come back with $ra pointing into the callee (below). */
+static int reloads_ra_in_slot(const a_analysis *an, const a_func *f) {
+    for (uint32_t a = f->start; a + 4 < f->end; a += 4) {
+        if (!owned_by(an, a, f->addr)) continue;
+        a_insn in, s;
+        a_decode(fetch(an, a), a, &in);
+        if (!in.is_call || in.is_branch) continue;
+        a_decode(fetch(an, a + 4), a + 4, &s);
+        if (s.op == A_LW && s.rt == 31) return 1;
+    }
+    return 0;
+}
+
+/* Is `target` a direct callee that can return into its own middle? */
+static int callee_can_reenter(const a_analysis *an, uint32_t target) {
+    const a_func *fc = func_at(an, target);
+    if (!fc) return 0;
+    /* The callee re-enters itself when *it* calls such a function. */
+    for (uint32_t a = fc->start; a + 4 < fc->end; a += 4) {
+        if (!owned_by(an, a, fc->addr)) continue;
+        a_insn in;
+        a_decode(fetch(an, a), a, &in);
+        if (!in.is_call || in.is_indirect || !in.has_target) continue;
+        const a_func *g = func_at(an, in.target);
+        if (g && reloads_ra_in_slot(an, g)) return 1;
+    }
+    return 0;
+}
+
+/* The same check for a direct call, where the callee's extent is known.
+ *
+ * $ra can also come back pointing *into the callee itself*. Observed at
+ * 0x08A8422C: the callee C calls a helper that pushes a frame and tail-calls
+ * with `lw $ra` in the delay slot, so control returns into C with the
+ * helper's 16-byte frame still on the stack; C's epilogue then runs twice --
+ * the first `jr $ra` jumps back into C (popping the helper's frame), the
+ * second really returns. Each `jr $ra` is a C `return`, so the first one
+ * arrives here with $ra inside C. The hardware is still executing C, so
+ * resume it there; any other mismatch is an unwind, as before. */
+static void emit_direct_return_check(ectx *c, const char *ind, uint32_t link, uint32_t callee) {
+    const a_func *fc = func_at(c->an, callee);
+    if (!fc) { emit_return_check(c, ind, link); return; }
+    fprintf(c->out,
+            "%swhile (r_ra != 0x%08Xu) {  /* returned somewhere other than here */\n"
+            "%s    if (r_ra - 0x%08Xu < 0x%Xu) psp_dispatch(r_ra);  /* back into the callee */\n"
+            "%s    else return;  /* past this call: keep unwinding */\n"
+            "%s}\n",
+            ind, link, ind, fc->start, fc->end - fc->start, ind, ind);
+}
+
 /* ---- one non-control-flow instruction ------------------------------------ */
 
 /* `ind` is the indentation, so a delay slot emitted inside an `if` body lines
@@ -132,121 +213,121 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
 
     /* --- ALU, register --- */
     case A_ADD: case A_ADDU:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s + %s;\n", ind, rd, rs, rt); return;
     case A_SUB: case A_SUBU:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s - %s;\n", ind, rd, rs, rt); return;
     case A_AND:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s & %s;\n", ind, rd, rs, rt); return;
     case A_OR:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s | %s;\n", ind, rd, rs, rt); return;
     case A_XOR:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s ^ %s;\n", ind, rd, rs, rt); return;
     case A_NOR:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = ~(%s | %s);\n", ind, rd, rs, rt); return;
     case A_SLT:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_slt(%s, %s);\n", ind, rd, rs, rt); return;
     case A_SLTU:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sltu(%s, %s);\n", ind, rd, rs, rt); return;
     case A_MAX:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_max(%s, %s);\n", ind, rd, rs, rt); return;
     case A_MIN:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_min(%s, %s);\n", ind, rd, rs, rt); return;
     case A_MOVZ:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%sif (%s == 0) %s = %s;\n", ind, rt, rd, rs); return;
     case A_MOVN:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%sif (%s != 0) %s = %s;\n", ind, rt, rd, rs); return;
 
     /* --- ALU, immediate --- */
     case A_ADDI: case A_ADDIU:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s + %d;\n", ind, rt, rs, in->imm); return;
     case A_SLTI:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_slt(%s, (uint32_t)%d);\n", ind, rt, rs, in->imm); return;
     case A_SLTIU:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sltu(%s, (uint32_t)%d);\n", ind, rt, rs, in->imm); return;
     case A_ANDI:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s & 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
     case A_ORI:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s | 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
     case A_XORI:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = %s ^ 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
     case A_LUI:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = 0x%08Xu;\n", ind, rt, (unsigned)in->imm << 16); return;
 
     /* --- shifts. The helpers exist because C leaves shift-by->=32 undefined
        while MIPS masks the amount to five bits. --- */
     case A_SLL:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sll(%s, %u);\n", ind, rd, rt, in->sa); return;
     case A_SRL:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_srl(%s, %u);\n", ind, rd, rt, in->sa); return;
     case A_SRA:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sra(%s, %u);\n", ind, rd, rt, in->sa); return;
     case A_ROTR:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_rotr(%s, %u);\n", ind, rd, rt, in->sa); return;
     case A_SLLV:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sll(%s, %s);\n", ind, rd, rt, rs); return;
     case A_SRLV:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_srl(%s, %s);\n", ind, rd, rt, rs); return;
     case A_SRAV:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_sra(%s, %s);\n", ind, rd, rt, rs); return;
     case A_ROTRV:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_rotr(%s, %s);\n", ind, rd, rt, rs); return;
 
     /* --- bit manipulation --- */
     case A_CLZ:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_clz(%s);\n", ind, rd, rs); return;
     case A_CLO:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_clo(%s);\n", ind, rd, rs); return;
     case A_SEB:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_seb(%s);\n", ind, rd, rt); return;
     case A_SEH:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_seh(%s);\n", ind, rd, rt); return;
     case A_WSBH:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_wsbh(%s);\n", ind, rd, rt); return;
     case A_WSBW:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_wsbw(%s);\n", ind, rd, rt); return;
     case A_BITREV:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_bitrev(%s);\n", ind, rd, rt); return;
     case A_EXT: {
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         unsigned pos = in->sa, size = in->rd + 1u;
         fprintf(f, "%s%s = psp_ext(%s, %u, %u);\n", ind, rt, rs, pos, size); return;
     }
     case A_INS: {
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         unsigned pos = in->sa, size = in->rd - in->sa + 1u;
         fprintf(f, "%s%s = psp_ins(%s, %s, %u, %u);\n", ind, rt, rt, rs, pos, size); return;
     }
@@ -261,37 +342,37 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MSUB:  fprintf(f, "%spsp_msub(%s, %s);\n",  ind, rs, rt); return;
     case A_MSUBU: fprintf(f, "%spsp_msubu(%s, %s);\n", ind, rs, rt); return;
     case A_MFHI:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_cpu.hi;\n", ind, rd); return;
     case A_MFLO:
-        if (DEST_ZERO(in->rd)) break;
+        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_cpu.lo;\n", ind, rd); return;
     case A_MTHI: fprintf(f, "%spsp_cpu.hi = %s;\n", ind, rs); return;
     case A_MTLO: fprintf(f, "%spsp_cpu.lo = %s;\n", ind, rs); return;
 
     /* --- loads --- */
     case A_LB:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = (uint32_t)(int32_t)(int8_t)psp_read8(%s + %d);\n",
                 ind, rt, rs, in->imm); return;
     case A_LBU:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_read8(%s + %d);\n", ind, rt, rs, in->imm); return;
     case A_LH:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = (uint32_t)(int32_t)(int16_t)psp_read16(%s + %d);\n",
                 ind, rt, rs, in->imm); return;
     case A_LHU:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_read16(%s + %d);\n", ind, rt, rs, in->imm); return;
     case A_LW: case A_LL:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_read32(%s + %d);\n", ind, rt, rs, in->imm); return;
     case A_LWL:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_lwl(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
     case A_LWR:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_lwr(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
 
     /* --- stores --- */
@@ -318,11 +399,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     /* --- COP1, single precision only --- */
     case A_MTC1: fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(%s);\n", ind, in->fs, rt); return;
     case A_MFC1:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
     case A_CTC1: fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt); return;
     case A_CFC1:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
     case A_LWC1:
         fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
@@ -356,7 +437,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
 
     /* --- COP0. There is no privileged state to model. --- */
     case A_MFC0: case A_CFC0: case A_MFIC:
-        if (DEST_ZERO(in->rt)) break;
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
         fprintf(f, "%s%s = 0;  /* no COP0 state modelled */\n", ind, rt); return;
     case A_MTC0: case A_CTC0: case A_MTIC:
         fprintf(f, "%s;  /* COP0 write ignored */\n", ind); return;
@@ -391,6 +472,47 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VCMP:
         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
+    case A_VSGE:
+        fprintf(f, "%spsp_vsge(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VSLT:
+        fprintf(f, "%spsp_vslt(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VCRS:
+        fprintf(f, "%spsp_vcrs(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VCRSP:
+        fprintf(f, "%spsp_vcrsp(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+
+    /* Moves between the integer and vector files. The register number is
+     * the low eight bits: 0..127 a vector register, 128+ a control one. */
+    case A_MTV:
+        fprintf(f, "%spsp_mtv(%uu, %s);\n", ind, in->raw & 0xFF, rt); return;
+    case A_MFV:
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;  /* result to $zero discarded */\n", ind); return; }
+        fprintf(f, "%s%s = psp_mfv(%uu);\n", ind, rt, in->raw & 0xFF); return;
+
+    /* Conversions carry a scale exponent in bits 20..16: vf2i* multiply by
+     * 2^scale before rounding, vi2f divides after converting. Dropping it
+     * turns fixed-point data into nonsense of the right type. */
+    case A_VF2IN: case A_VF2IZ: case A_VF2IU: case A_VF2ID: {
+        static const char *const MODE[] = { "PSP_VF2I_NEAREST", "PSP_VF2I_ZERO",
+                                            "PSP_VF2I_UP", "PSP_VF2I_DOWN" };
+        fprintf(f, "%spsp_vf2i(%s, %u, %u, %u, %u);\n", ind,
+                MODE[in->op - A_VF2IN], in->vd, in->vs, (in->raw >> 16) & 0x1F, in->vsize);
+        return;
+    }
+    case A_VI2F:
+        fprintf(f, "%spsp_vi2f(%u, %u, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1F, in->vsize);
+        return;
+    case A_VCMOV:
+        fprintf(f, "%spsp_vcmov(%u, %u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vsize,
+                (in->raw >> 19) & 1, (in->raw >> 16) & 7);
+        return;
+    case A_VROT:
+        fprintf(f, "%spsp_vrot(%u, %u, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1F, in->vsize);
+        return;
+    case A_VFPU7:
+        fprintf(f, "%spsp_vconv(0x%02X, %u, %u, %u);\n", ind, in->rt, in->vd, in->vs, in->vsize); return;
+    case A_VFPU9:
+        fprintf(f, "%spsp_vfpu9(0x%02X, %u, %u, %u);\n", ind, in->rt, in->vd, in->vs, in->vsize); return;
 
     /* Prefixes gate the arithmetic above: with one pending, the next vector op
      * traps instead of computing the unprefixed answer. Emitting these is what
@@ -400,7 +522,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VMOV: case A_VABS: case A_VNEG: case A_VZERO: case A_VONE:
     case A_VRCP: case A_VRSQ: case A_VSQRT: case A_VSIN: case A_VCOS:
     case A_VEXP2: case A_VLOG2: case A_VSAT0: case A_VSAT1:
-    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VF2IZ: case A_VI2F: {
+    case A_VNRCP: case A_VNSIN: case A_VASIN: {
         static const struct { a_op op; const char *sel; } U[] = {
             { A_VMOV, "PSP_VU_MOV" },   { A_VABS, "PSP_VU_ABS" },
             { A_VNEG, "PSP_VU_NEG" },   { A_VZERO,"PSP_VU_ZERO" },
@@ -410,8 +532,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
             { A_VEXP2,"PSP_VU_EXP2" },  { A_VLOG2,"PSP_VU_LOG2" },
             { A_VSAT0,"PSP_VU_SAT0" },  { A_VSAT1,"PSP_VU_SAT1" },
             { A_VNRCP,"PSP_VU_NRCP" },  { A_VNSIN,"PSP_VU_NSIN" },
-            { A_VASIN,"PSP_VU_ASIN" },  { A_VF2IZ,"PSP_VU_F2IZ" },
-            { A_VI2F, "PSP_VU_I2F" },
+            { A_VASIN,"PSP_VU_ASIN" },
         };
         for (size_t k = 0; k < sizeof U / sizeof U[0]; k++) {
             if (U[k].op != in->op) continue;
@@ -433,18 +554,33 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
 
     /* Immediate loads: the value is in the instruction, not a register. */
     case A_VIIM:
-        fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vd, (double)in->imm);
+        fprintf(f, "%spsp_vimm(%u, %.9ff);\n", ind, in->vd, (double)in->imm);
         return;
-    case A_VFIM:
-        fprintf(f, "%spsp_vimm(%u, %.9gf);\n", ind, in->vd,
-                (double)half_to_float((uint16_t)in->imm));
+    case A_VFIM: {
+        /* Emit the exact bit pattern. A decimal literal either loses precision
+         * on small half-floats (%f) or prints "1f"/"inff" (%g), neither of
+         * which is the constant the hardware loads. */
+        float v = half_to_float((uint16_t)in->imm);
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof bits);
+        fprintf(f, "%s{ union { uint32_t u; float f; } _k = { 0x%08Xu }; psp_vimm(%u, _k.f); }\n",
+                ind, bits, in->vd);
         return;
+    }
 
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
     case A_VMMUL:
         fprintf(f, "%spsp_vmmul(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
-    case A_VTFM2: case A_VTFM3: case A_VTFM4:
-        fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VTFM2: case A_VTFM3: case A_VTFM4: {
+        const unsigned order = 2u + (unsigned)(in->op - A_VTFM2);
+        if (in->vsize == order)
+            fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, order);
+        else if (in->vsize + 1 == order)
+            fprintf(f, "%spsp_vhtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, order);
+        else
+            break;
+        return;
+    }
     case A_VMSCL:
         fprintf(f, "%spsp_vmscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VMIDT:
@@ -495,6 +631,13 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
     case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
     case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
     case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
+    /* VFPU condition branches test one vcmp condition bit, selected by bits
+     * 18-20 (0-3 per lane, 4 any, 5 all). These used to fall to the default
+     * below -- never taken -- so PSP2i's polygon clipper (0x08D8B2C4) kept
+     * and split every vertex at every frustum plane: 3 -> 192 vertices after
+     * six planes, overrunning its stack buffers. */
+    case A_BVF: case A_BVFL:   snprintf(buf, n, "!((psp_cpu.vfpu_cc >> %u) & 1)", (in->raw >> 18) & 7); break;
+    case A_BVT: case A_BVTL:   snprintf(buf, n, "((psp_cpu.vfpu_cc >> %u) & 1)", (in->raw >> 18) & 7); break;
     default:                   snprintf(buf, n, "0 /* unhandled branch */"); break;
     }
 }
@@ -510,11 +653,64 @@ static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_t
 
     if (falls_through) {
         if (owned_by(an, after, owner)) fprintf(c->out, "    goto L_%08X;\n", after);
-        else                            fprintf(c->out, "    return;\n");
+        else {
+            /* The code after the branch belongs to another body. Returning
+             * here would skip it; continue there instead (see
+             * mark_continuations). */
+            emit_static_call(c, after);
+            fprintf(c->out, "    return;\n");
+        }
     }
     fprintf(c->out, "L_%08X:\n", a + 4);
     comment(c, slot);
     emit_simple(c, slot, "    ");
+}
+
+/* Was this import thunk reached by a direct call during discovery? Thunks
+ * that were not are still emitted -- a game can call a firmware function
+ * through a pointer -- but separately, so the two lists stay distinct. */
+static int import_called(const a_analysis *an, uint32_t addr) {
+    for (int i = 0; i < an->nimports; i++) if (an->imports[i] == addr) return 1;
+    return 0;
+}
+
+/* ---- continuations --------------------------------------------------------
+ *
+ * Discovery splits routines: a block reached from elsewhere becomes its own
+ * entry, and the instructions after it can end up owned by a different body
+ * than the instructions before. Control then flows from one C body into the
+ * *middle* of another, which is only expressible if that address is a label
+ * of its owner -- a switch case and a dispatch thunk.
+ *
+ * Labels are decided per function as it is emitted, so a continuation into a
+ * function emitted earlier would find no label. Mark every such address up
+ * front: the end of each body, the start of each interior gap, and the
+ * address after a branch whose delay slot ends the owned run. Over-marking is
+ * harmless (an unused case); a missing label loses the rest of a routine.
+ *
+ * Observed: psp_func_08DCF894, a five-instruction loop split out of
+ * 0x08DCF81C, ended by returning instead of continuing at 0x08DCF8A8. The
+ * parent then returned too, so the routine's epilogue never ran -- $sp 48
+ * bytes low, and $ra/$s1/$s2 later reloaded from the 0xFF stack fill. */
+static void mark_one(ectx *c, uint32_t a) {
+    const a_analysis *an = c->an;
+    if (!a_in_range(an, a) || is_function(an, a)) return;
+    if (an->owner[widx(an, a)] == A_NO_OWNER) return;
+    c->is_label[widx(an, a)] = 1;
+}
+
+static void mark_continuations(ectx *c) {
+    const a_analysis *an = c->an;
+    for (int k = 0; k < an->nfuncs; k++) {
+        const a_func *fn = &an->funcs[k];
+        const uint32_t owner = fn->addr;
+        mark_one(c, fn->end);
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, owner)) continue;
+            if (!owned_by(an, a + 4, owner)) mark_one(c, a + 4);
+            else if (!owned_by(an, a + 8, owner)) mark_one(c, a + 8);
+        }
+    }
 }
 
 /* ---- one function -------------------------------------------------------- */
@@ -531,13 +727,21 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (!owned_by(an, a, owner)) continue;
         a_insn in;
         a_decode(fetch(an, a), a, &in);
-        if (in.has_target && in.is_branch && owned_by(an, in.target, owner))
+        if (in.has_target && owned_by(an, in.target, owner))
             c->is_label[widx(an, in.target)] = 1;
         if (in.is_jump && !in.is_indirect && in.has_target &&
             owned_by(an, in.target, owner) && !is_function(an, in.target))
             c->is_label[widx(an, in.target)] = 1;
         if (in.has_delay_slot && owned_by(an, a + 4, owner))
             c->is_slot[widx(an, a + 4)] = 1;
+        /* A return address is a place control can arrive by `jr $ra` other
+         * than through the call: code that reloads $ra and jumps back into
+         * its own function (see emit_return_check). Make it dispatchable. */
+        if (in.is_call && !in.is_indirect && in.has_target &&
+            owned_by(an, a + 8, owner) && !is_function(an, a + 8)) {
+            const a_func *g = func_at(an, in.target);
+            if (g && reloads_ra_in_slot(an, g)) c->is_label[widx(an, a + 8)] = 1;
+        }
     }
 
     /* A delay slot can also be somebody's branch target. Arriving through the
@@ -647,13 +851,18 @@ static void emit_function(ectx *c, const a_func *fn) {
             continue;
         }
         uint32_t i = widx(an, a);
-        if (c->is_slot[i]) continue;             /* emitted with its branch */
+        if (c->is_slot[i] && !c->is_label[i]) continue;             /* emitted with its branch */
 
         a_insn in;
         a_decode(fetch(an, a), a, &in);
 
         if (c->is_label[i]) fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a);
-        last_terminal = in.is_return || in.is_indirect ||
+        /* `jalr` is indirect but it is a *call*: the callee returns and
+         * execution continues after the delay slot. Treating it as terminal
+         * dropped the continuation whenever the code after a jalr belonged to
+         * another body -- observed at 0x089F0C20, a virtual call in the game's
+         * main loop, after which the whole main thread returned and ended. */
+        last_terminal = in.is_return || (in.is_indirect && !in.is_call) ||
                         (in.is_jump && !in.is_call);
         comment(c, &in);
 
@@ -673,12 +882,20 @@ static void emit_function(ectx *c, const a_func *fn) {
                 /* A "likely" branch nullifies its delay slot when NOT taken,
                  * so the slot belongs inside the taken path. The condition is
                  * naturally evaluated before it. */
+                /* The link register is written whether or not the branch is
+                 * taken, and before the delay slot (see the jal case below). */
+                if (in.is_call) fprintf(f, "    %s = 0x%08Xu;\n", RN[31], a + 8);
                 fprintf(f, "    if (%s) {\n", cond);
                 if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "        "); }
-                if (in.is_call) fprintf(f, "        %s = 0x%08Xu;\n", RN[31], a + 8);
-                if (owned_by(an, in.target, owner))
+                if (owned_by(an, in.target, owner) && !in.is_call)
                     { if (in.target <= a) fprintf(f, "        PSP_LOOP(0x%08Xu);\n", in.target);
                       fprintf(f, "        goto L_%08X;\n", in.target); }
+                else if (in.is_call) {
+                    /* bltzall / bgezall: a conditional *call*. The callee
+                     * returns here and execution continues after the slot. */
+                    emit_static_call(c, in.target);
+                    emit_return_check(c, "        ", a + 8);
+                }
                 else
                     { emit_static_call(c, in.target); fprintf(f, "        return;\n"); }
                 fprintf(f, "    }\n");
@@ -695,9 +912,9 @@ static void emit_function(ectx *c, const a_func *fn) {
                  * away when there is no dependency) and removes an entire
                  * class of silent, once-in-a-thousand-iterations bugs. */
                 fprintf(f, "    { int _c = (%s);\n", cond);
-                if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "      "); }
                 if (in.is_call) fprintf(f, "      %s = 0x%08Xu;\n", RN[31], a + 8);
-                if (owned_by(an, in.target, owner))
+                if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "      "); }
+                if (owned_by(an, in.target, owner) && !in.is_call)
                     { if (in.target <= a) fprintf(f, "      if (_c) PSP_LOOP(0x%08Xu);\n", in.target);
                       fprintf(f, "      if (_c) goto L_%08X; }\n", in.target); }
                 else {
@@ -705,7 +922,16 @@ static void emit_function(ectx *c, const a_func *fn) {
                     if (is_import(an, in.target))      fprintf(f, "psp_import_%08X();", in.target);
                     else if (is_function(an, in.target)) fprintf(f, "psp_func_%08X();", in.target);
                     else                                fprintf(f, "psp_dispatch(0x%08Xu);", in.target);
-                    fprintf(f, " return; } }\n");
+                    /* bltzal / bgezal (and bal) are conditional *calls*: the
+                     * callee returns to the instruction after the delay slot,
+                     * so execution continues here. Returning instead abandoned
+                     * the rest of the caller -- observed in the decompressor at
+                     * 0x08DE0E54, which then parsed garbage. A plain branch out
+                     * of the function is a tail transfer and does return. */
+                    if (in.is_call)
+                        fprintf(f, " if (r_ra != 0x%08Xu) return; } }\n", a + 8);
+                    else
+                        fprintf(f, " return; } }\n");
                 }
             }
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
@@ -714,6 +940,17 @@ static void emit_function(ectx *c, const a_func *fn) {
         }
 
         if (in.is_call) {                        /* jal / jalr */
+            /* Order matters: the jump target is read and the link register
+             * written by the jal/jalr itself, *then* the delay slot runs. A
+             * slot that reloads $ra (`jal f ; lw $ra, 0($sp)`, a hand-made tail
+             * call) leaves the caller's return address in $ra, so f returns
+             * past this function. Emitting the slot first and the link second
+             * lost that load: observed at 0x08D7689C, where the wrong $ra then
+             * made every caller's return check unwind, all the way out of
+             * user_main (New Game -> black screen). */
+            const unsigned link_reg = (in.op == A_JALR) ? in.rd : 31u;
+            if (in.is_indirect) fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
+            if (link_reg) fprintf(f, "    %s = 0x%08Xu;\n", RN[link_reg], a + 8);
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             /* Set $ra.
              *
@@ -729,10 +966,15 @@ static void emit_function(ectx *c, const a_func *fn) {
              * $ra held a stack address at the stall. The branch-and-link forms
              * a few lines above already did this correctly; jal and jalr --
              * every ordinary call in the program -- did not. */
-            fprintf(f, "    %s = 0x%08Xu;\n", RN[31], a + 8);
-            if (in.is_indirect) fprintf(f, "    psp_dispatch(%s);\n", RN[in.rs]);
+            if (in.is_indirect) fprintf(f, "    psp_dispatch(_t); }\n");
             else                emit_static_call(c, in.target);
-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
+            if (link_reg == 31u) {
+                if (!in.is_indirect && callee_can_reenter(an, in.target))
+                    emit_direct_return_check(c, "    ", a + 8, in.target);
+                else
+                    emit_return_check(c, "    ", a + 8);
+            }
+            if (have_slot && c->is_label[widx(an, a + 4)] && !slot.is_branch) emit_slot_alias(c, a, &slot, 1);
             a += 4;
             continue;
         }
@@ -746,7 +988,7 @@ static void emit_function(ectx *c, const a_func *fn) {
              * as a leak. */
             fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n", a);
             fprintf(f, "    return;\n");
-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
+            if (have_slot && c->is_label[widx(an, a + 4)] && !slot.is_branch) emit_slot_alias(c, a, &slot, 0);
             a += 4;
             continue;
         }
@@ -754,7 +996,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (in.is_indirect) {                    /* jr $rN — computed jump */
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             fprintf(f, "    psp_dispatch(%s);\n    return;\n", RN[in.rs]);
-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
+            if (have_slot && c->is_label[widx(an, a + 4)] && !slot.is_branch) emit_slot_alias(c, a, &slot, 0);
             a += 4;
             continue;
         }
@@ -767,7 +1009,7 @@ static void emit_function(ectx *c, const a_func *fn) {
                 emit_static_call(c, in.target);  /* tail call */
                 fprintf(f, "    return;\n");
             }
-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
+            if (have_slot && c->is_label[widx(an, a + 4)] && !slot.is_branch) emit_slot_alias(c, a, &slot, 0);
             a += 4;
             continue;
         }
@@ -795,6 +1037,15 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (is_function(an, next)) {
             fprintf(f, "    /* falls through into the next function */\n");
             fprintf(f, "    psp_func_%08X();\n", next);
+        } else if (a_in_range(an, next) && an->owner[widx(an, next)] != A_NO_OWNER) {
+            /* ...or into the middle of one. Discovery split a routine and this
+             * body is the piece before `next`: the rest of the routine, its
+             * epilogue included, lives in another body under a label. Ending
+             * here would return to the caller with the frame still open and
+             * the callee-saved registers never restored. */
+            fprintf(f, "    /* continues at 0x%08X, inside psp_func_%08X */\n",
+                    next, an->owner[widx(an, next)]);
+            fprintf(f, "    psp_dispatch(0x%08Xu);\n", next);
         }
     }
     fprintf(f, "}\n");
@@ -879,6 +1130,9 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
     fprintf(f, "\n");
     for (int i = 0; i < an->nimports; i++)
         fprintf(f, "void psp_import_%08X(void);\n", an->imports[i]);
+    for (int i = 0; i < o->nimports; i++)
+        if (!import_called(an, o->imports[i].addr))
+            fprintf(f, "void psp_import_%08X(void);\n", o->imports[i].addr);
 
     fprintf(f, "\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n");
 }
@@ -927,6 +1181,16 @@ static void emit_imports(FILE *f, const a_analysis *an, const emit_opts *o) {
                 addr, addr);
         }
     }
+
+    /* Imports no direct call reaches: still real entry points, reachable
+     * through function pointers, so they get thunks and dispatch entries. */
+    for (int i = 0; i < o->nimports; i++) {
+        const psp_import_entry *e = &o->imports[i];
+        if (import_called(an, e->addr)) continue;
+        fprintf(f, "/* %s :: NID 0x%08X (not called directly) */\n", e->lib, e->nid);
+        fprintf(f, "void psp_import_%08X(void) { PSP_ENTER(0x%08Xu); psp_hle_call(0x%08Xu); }\n\n",
+                e->addr, e->addr, e->nid);
+    }
 }
 
 int a_emit(const a_analysis *an, const emit_opts *o) {
@@ -972,6 +1236,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
         return -1;
     }
 
+    mark_continuations(&c);
     for (int i = 0; i < an->nfuncs; i++) {
         c.func = &an->funcs[i];
         emit_function(&c, &an->funcs[i]);
@@ -987,6 +1252,15 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "    psp_register(0x%08Xu, psp_func_%08X);\n",
                 an->funcs[i].addr, an->funcs[i].addr);
+    /* Import thunks too: a game can take the address of a firmware function
+     * and call it through a pointer (observed: jalr to 0x08DFCE84). */
+    for (int i = 0; i < an->nimports; i++)
+        fprintf(f, "    psp_register(0x%08Xu, psp_import_%08X);\n",
+                an->imports[i], an->imports[i]);
+    for (int i = 0; i < o->nimports; i++)
+        if (!import_called(an, o->imports[i].addr))
+            fprintf(f, "    psp_register(0x%08Xu, psp_import_%08X);\n",
+                    o->imports[i].addr, o->imports[i].addr);
     /* Interior labels last, so a real function entry always wins a collision. */
     for (int i = 0; i < c.nentries; i++)
         fprintf(f, "    psp_register_label(0x%08Xu, psp_at_%08X);\n",

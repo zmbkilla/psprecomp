@@ -15,6 +15,7 @@
 #include "psprecomp/hle.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Placement policies, as passed in the `type` argument. */
@@ -53,6 +54,14 @@ void psp_sysmem_reset(void) {
 }
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
+
+/* The host knows where the module it loaded ends; the default range above
+ * is only a guess at that. A module whose .data/.bss extends past the
+ * default low bound would otherwise be handed out to the allocator. */
+void psp_sysmem_set_heap(uint32_t lo, uint32_t hi) {
+    g_heap_lo = (lo + 0xFF) & ~0xFFu;
+    g_heap_hi = hi & ~0xFFu;
+}
 
 static mem_block *find_uid(uint32_t uid) {
     for (int i = 0; i < MAX_BLOCKS; i++)
@@ -255,6 +264,73 @@ static void hle_Printf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- memory blocks (FW 6.xx) ----------------------------------------------
+ *
+ * Three SysMemUserForUser entry points that no name hashes to, so they are
+ * registered unnamed. Their behaviour is established from this game's own
+ * call sites rather than assumed (PSP2i, 0x08D5CCA8..0x08D5CFA0):
+ *
+ *     0xFE707FDF(name, type = 0, size, params = NULL) -> uid; blez = failure
+ *     0xDB83A952(uid, &addr)   -> addr is then the destination of a memcpy
+ *     0x50F61D8A(uid)          -> called when the block is retired
+ *
+ * which is an allocate / get-address / free triple over the same block
+ * table the partition allocator uses. `type` follows the partition
+ * allocator's placement codes (0 = low, 1 = high). */
+static void hle_AllocMemoryBlock(void) {
+    uint32_t type = psp_arg(1), size = psp_arg(2);
+    uint32_t rounded = (size + 0xFF) & ~0xFFu;
+    if (!size || type > 1) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    uint32_t addr = type ? place_high(rounded, 0x100) : place_low(rounded, 0x100);
+    mem_block *b = addr ? alloc_slot() : NULL;
+    if (!b) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    b->uid = g_next_uid++;
+    b->addr = addr;
+    b->size = rounded;
+    b->used = 1;
+    psp_str(psp_arg(0), b->name, sizeof b->name);
+    psp_ret(b->uid);
+}
+
+static void hle_GetMemoryBlockAddr(void) {
+    mem_block *b = find_uid(psp_arg(0));
+    if (!b) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (psp_arg(1)) psp_write32(psp_arg(1), b->addr);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_FreeMemoryBlock(void) {
+    mem_block *b = find_uid(psp_arg(0));
+    if (!b) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    b->used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_TotalFreeMemSize(void) { psp_ret(psp_sysmem_free()); }
+
+/* Largest single block that could be allocated right now: the widest gap
+ * between allocated blocks inside the heap. */
+static int cmp_addr(const void *x, const void *y) {
+    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
+    return (a > b) - (a < b);
+}
+
+static void hle_MaxFreeMemSize(void) {
+    static uint32_t span[MAX_BLOCKS][2];
+    int n = 0;
+    for (int i = 0; i < MAX_BLOCKS; i++)
+        if (g_block[i].used) { span[n][0] = g_block[i].addr; span[n][1] = g_block[i].addr + g_block[i].size; n++; }
+    qsort(span, (size_t)n, sizeof span[0], cmp_addr);
+    uint32_t best = 0, at = g_heap_lo;
+    for (int i = 0; i < n; i++) {
+        if (span[i][1] <= at) continue;
+        if (span[i][0] > at && span[i][0] - at > best) best = span[i][0] - at;
+        if (span[i][1] > at) at = span[i][1];
+    }
+    if (g_heap_hi > at && g_heap_hi - at > best) best = g_heap_hi - at;
+    psp_ret(best);
+}
+
 void psp_sysmem_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below, so a mistyped NID cannot survive. */
@@ -264,4 +340,15 @@ void psp_sysmem_register(void) {
     psp_hle_register(0x7591C7DB, "SysMemUserForUser", "sceKernelSetCompiledSdkVersion",hle_SetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
+    psp_hle_register(0xF919F628, "SysMemUserForUser", "sceKernelTotalFreeMemSize",     hle_TotalFreeMemSize);
+    psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
+
+    /* Unnamed: see the memory-block note above for the evidence. */
+    psp_hle_register_unnamed(0xFE707FDF, "SysMemUserForUser", hle_AllocMemoryBlock);
+    psp_hle_register_unnamed(0xDB83A952, "SysMemUserForUser", hle_GetMemoryBlockAddr);
+    psp_hle_register_unnamed(0x50F61D8A, "SysMemUserForUser", hle_FreeMemoryBlock);
+    /* Unnamed: crt0 calls it first thing with the literal 0x06030010 -- an SDK
+     * version, 6.03 -- exactly as it calls sceKernelSetCompiledSdkVersion on
+     * older SDKs. Recording the version is all the firmware does with it. */
+    psp_hle_register_unnamed(0x1B4217BC, "SysMemUserForUser", hle_SetCompiledSdkVersion);
 }
