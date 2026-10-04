@@ -241,6 +241,8 @@ uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1);
 /* Queue a call into guest code from a firmware library (up to five arguments,
  * the fifth in $t0), delivered at the next vblank on the interrupt stack. */
 int      psp_sched_post_call(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4);
+/* The same with a sixth argument, in $t1. */
+int      psp_sched_post_call6(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5);
 
 /* Interrupt mask state (sceKernelCpuSuspendIntr/ResumeIntr). */
 int  psp_intr_enabled(void);
