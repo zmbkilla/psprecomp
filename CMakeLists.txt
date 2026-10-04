@@ -54,6 +54,7 @@ add_library(psprecomp STATIC
     src/hle/utility.c
     src/hle/font.c
     src/hle/net.c
+    src/hle/net_sock.c
     src/hle/http.c
     src/hle/np.c
     src/hle/np2.c

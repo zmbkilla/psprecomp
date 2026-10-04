@@ -59,6 +59,8 @@ enum { APCTL_EV_CONNECT_REQUEST = 0, APCTL_EV_ESTABLISHED = 3, APCTL_EV_GET_IP =
        APCTL_EV_DISCONNECT_REQUEST = 5, APCTL_EV_ERROR = 6 };
 
 static void net_log(const char *fmt, ...);
+void psp_net_sock_register(void);          /* net_sock.c */
+void psp_net_sock_close_all(void);
 
 /* ---- the host connection ---------------------------------------------------- */
 
@@ -167,6 +169,16 @@ static const char *(*g_redirect)(const char *host);
 void psp_net_set_resolve_redirect(const char *(*fn)(const char *host)) { g_redirect = fn; }
 void psp_net_set_log(void (*fn)(const char *line)) { g_net_log = fn; }
 
+void psp_net_log_line(const char *fmt, ...) {       /* for net_sock.c */
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "net: %s\n", line);
+    if (g_net_log) g_net_log(line);
+}
+
 static void net_log(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -238,7 +250,7 @@ static void hle_InetInit(void) {
     g_inet_inited = 1;
     psp_ret(0);
 }
-static void hle_InetTerm(void) { g_inet_inited = 0; psp_ret(0); }
+static void hle_InetTerm(void) { g_inet_inited = 0; psp_net_sock_close_all(); psp_ret(0); }
 
 /* inet_addr: network byte order, as stored in memory (little-endian word of
  * the big-endian address); INADDR_NONE (0xFFFFFFFF) for a bad string. */
@@ -266,18 +278,7 @@ static void hle_InetInetNtop(void) {
     psp_ret(dst);
 }
 
-static uint32_t g_inet_errno;
-static void hle_InetGetPspError(void) { psp_ret(g_inet_errno); }
-
-/* Sockets are not bridged yet: nothing in the online flow up to the game's
- * own server has needed them. They fail honestly (ENETDOWN, 50) and are
- * logged, so the first game that needs them names itself. */
-static void hle_InetSocketUnsupported(void) {
-    static int logged;
-    if (logged++ < 8) net_log("a sceNetInet socket call (see the firmware-call counts) -- sockets are not bridged yet, failing with ENETDOWN");
-    g_inet_errno = 50;
-    psp_ret(0xFFFFFFFFu);
-}
+/* The socket calls themselves (and the errno accessors): net_sock.c. */
 
 /* ---- sceNetApctl ---------------------------------------------------------------------- */
 
@@ -496,16 +497,7 @@ void psp_net_register(void) {
     psp_hle_register(0xA9ED66B9, "sceNetInet", "sceNetInetTerm",        hle_InetTerm);
     psp_hle_register(0xB75D5B0A, "sceNetInet", "sceNetInetInetAddr",    hle_InetInetAddr);
     psp_hle_register(0xD0792666, "sceNetInet", "sceNetInetInetNtop",    hle_InetInetNtop);
-    psp_hle_register(0x8CA3A97E, "sceNetInet", "sceNetInetGetPspError", hle_InetGetPspError);
-    static const uint32_t SOCKET_NIDS[] = { 0x8B7B220F, 0x410B34AA, 0x1A33F9AE, 0xD10A1A7A, 0xDB094E1B, 0x7AA671BC,
-                                            0xCDA85C99, 0x05038FC7, 0xC91142E4, 0x8D7284EA, 0x2FE71FE7, 0x4A114C7C,
-                                            0x4CFE4E56, 0x5BE8D595, 0x80A21ABD };
-    static const char *const SOCKET_NAMES[] = { "sceNetInetSocket", "sceNetInetConnect", "sceNetInetBind",
-        "sceNetInetListen", "sceNetInetAccept", "sceNetInetSend", "sceNetInetRecv", "sceNetInetSendto",
-        "sceNetInetRecvfrom", "sceNetInetClose", "sceNetInetSetsockopt", "sceNetInetGetsockopt",
-        "sceNetInetShutdown", "sceNetInetSelect", "sceNetInetSocketAbort" };
-    for (size_t i = 0; i < sizeof SOCKET_NIDS / sizeof SOCKET_NIDS[0]; i++)
-        psp_hle_register(SOCKET_NIDS[i], "sceNetInet", SOCKET_NAMES[i], hle_InetSocketUnsupported);
+    psp_net_sock_register();
 
     psp_hle_register(0xE2F91F9B, "sceNetApctl", "sceNetApctlInit",       hle_ApctlInit);
     psp_hle_register(0xB3EDD0EC, "sceNetApctl", "sceNetApctlTerm",       hle_ApctlTerm);
