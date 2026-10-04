@@ -192,6 +192,22 @@ void psp_utility_init(void);
 void psp_utility_register(void);
 void psp_utility_reset(void);
 
+/* PSP savedata encryption, supplied by the host (the toolkit carries none).
+ * With it, saves are read and written as on hardware -- encrypted with the
+ * game's key, hashes in PARAM.SFO -- so they are interchangeable with a PSP
+ * or PPSSPP; without it, data files are stored as given. Modes: 1 (no key),
+ * 3, 5 (with the game's 16-byte key). All return 0 on success; *out is
+ * malloc'd. */
+typedef struct {
+    int (*decrypt)(int mode, const uint8_t *file, uint32_t file_len, const uint8_t *key,
+                   const uint8_t *expected_hash, uint8_t **out, uint32_t *out_len);
+    int (*encrypt)(int mode, const uint8_t *plain, uint32_t len, const uint8_t *key,
+                   uint8_t **out, uint32_t *out_len, uint8_t hash[16]);
+    /* SAVEDATA_PARAMS (128 bytes at params_off) of a zero-padded PARAM.SFO */
+    int (*sfo_hash)(uint8_t *sfo, uint32_t sfo_size, uint32_t params_off, int mode);
+} psp_savedata_crypto;
+void psp_savedata_set_crypto(const psp_savedata_crypto *c);
+
 void psp_atrac_init(void);
 void psp_atrac_register(void);
 void psp_atrac_reset(void);

@@ -7,8 +7,12 @@
  * Save data lives under ms0:/PSP/SAVEDATA/<gameName><saveName>/<fileName>,
  * with PARAM.SFO and any icon/picture/sound files the game supplies. A
  * saveName of "<>" means no particular save: the directory is <gameName>.
- * On hardware the data file is encrypted with a per-game key; here it is
- * stored as given, so saves are compatible with this runtime only.
+ * On hardware the data file is encrypted with a per-game key and PARAM.SFO
+ * carries its hashes (SAVEDATA_FILE_LIST, SAVEDATA_PARAMS). With a host
+ * crypto provider (psp_savedata_set_crypto) saves are read and written that
+ * way, interchangeable with a PSP or PPSSPP; encrypted saves are recognised
+ * by SAVEDATA_PARAMS, so plain saves written earlier still load. Without a
+ * provider the data file is stored as given.
  *
  * Implemented modes: AUTOLOAD/LOAD (0/2), AUTOSAVE/SAVE (1/3), and GETSIZE
  * (22) for the no-save case. Any other
@@ -42,12 +46,17 @@ enum { ST_NONE = 0, ST_INIT = 1, ST_RUNNING = 2, ST_FINISHED = 3, ST_SHUTDOWN = 
 #define SD_DATABUF   0x74
 #define SD_BUFSIZE   0x78
 #define SD_DATASIZE  0x7C
+#define SD_KEY       0x5DC     /* u8[16]: the game's save key (0 = none) */
+#define SD_SECUREVER 0x5EC     /* secureVersion */
 #define SD_SIZEINFO  0x5FC     /* SceUtilitySavedataSizeInfo *, used by GETSIZE */
 
 #define SAVEDATA_LOAD_NO_DATA     0x80110307u
 #define SAVEDATA_LOAD_ACCESS_ERR  0x80110305u
 #define SAVEDATA_SAVE_ACCESS_ERR  0x80110385u
 #define UTILITY_INVALID_PARAM     0x80110001u   /* used for modes not implemented */
+
+static const psp_savedata_crypto *g_crypto;
+void psp_savedata_set_crypto(const psp_savedata_crypto *c) { g_crypto = c; }
 
 static int      g_status;
 static uint32_t g_param;
@@ -104,18 +113,121 @@ static void trace_param(uint32_t p) {
             psp_read32(p + SD_PIC1 + 8), psp_read32(p + SD_SND0 + 8));
 }
 
+/* A whole host file, malloc'd. */
+static uint8_t *read_file(const char *host, uint32_t *len) {
+    FILE *f = fopen(host, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    uint8_t *b = (uint8_t *)malloc(n > 0 ? (size_t)n : 1);
+    *len = b ? (uint32_t)fread(b, 1, n > 0 ? (size_t)n : 0, f) : 0;
+    fclose(f);
+    return b;
+}
+
+/* A PARAM.SFO value: pointer into sfo and its length, or NULL. */
+static const uint8_t *sfo_value(const uint8_t *sfo, uint32_t n, const char *key, uint32_t *len) {
+    if (n < 20 || memcmp(sfo, "\0PSF", 4)) return NULL;
+    uint32_t keys, data, count;
+    memcpy(&keys, sfo + 8, 4); memcpy(&data, sfo + 12, 4); memcpy(&count, sfo + 16, 4);
+    for (uint32_t i = 0; i < count && 20 + 16 * i + 16 <= n; i++) {
+        const uint8_t *ix = sfo + 20 + 16 * i;
+        uint16_t ko; uint32_t l, off;
+        memcpy(&ko, ix, 2); memcpy(&l, ix + 4, 4); memcpy(&off, ix + 12, 4);
+        if (keys + ko >= n || data + off + l > n) continue;
+        if (strncmp((const char *)sfo + keys + ko, key, n - keys - ko)) continue;
+        *len = l;
+        return sfo + data + off;
+    }
+    return NULL;
+}
+
+static int has_key(uint32_t p) {
+    if (psp_read32(p) < 1536) return 0;
+    for (uint32_t i = 0; i < 16; i++) if (psp_read8(p + SD_KEY + i)) return 1;
+    return 0;
+}
+
+/* The crypt mode the firmware uses for this request (PPSSPP's
+ * DetermineCryptMode; games built with SDK 4+ -- PSP2i is 6.03 -- get the
+ * new hash): 1 without the full-size request, else by secureVersion. */
+static int crypt_mode_for(uint32_t p) {
+    if (psp_read32(p) < 1536) return 1;
+    switch (psp_read32(p + SD_SECUREVER)) {
+    case 0: return 5;
+    case 2: return 3;
+    case 3: return 5;
+    default: return 1;
+    }
+}
+
 static uint32_t do_load(uint32_t p) {
     char dir[64], file[14], guest[96], host[1024];
     savedir(p, dir, sizeof dir);
     psp_str(p + SD_FILENAME, file, sizeof file);
     snprintf(guest, sizeof guest, "%s/%s", dir, file);
     psp_io_host_path(guest, host, sizeof host);
-    FILE *f = fopen(host, "rb");
-    if (!f) return SAVEDATA_LOAD_NO_DATA;
-    uint32_t buf = psp_read32(p + SD_DATABUF), cap = psp_read32(p + SD_BUFSIZE), n = 0;
-    int c;
-    while (n < cap && (c = fgetc(f)) != EOF) psp_write8(buf + n++, (uint8_t)c);
-    fclose(f);
+    uint32_t flen = 0;
+    uint8_t *fdata = read_file(host, &flen);
+    if (!fdata) return SAVEDATA_LOAD_NO_DATA;
+    uint8_t *data = fdata;
+    uint32_t len = flen;
+
+    /* Encrypted? SAVEDATA_PARAMS' first byte says how (0 = written plain). */
+    snprintf(guest, sizeof guest, "%s/PARAM.SFO", dir);
+    char shost[1024];
+    psp_io_host_path(guest, shost, sizeof shost);
+    uint32_t slen = 0, vl = 0;
+    uint8_t *sfo = read_file(shost, &slen);
+    int file_mode = 0;
+    const uint8_t *v = sfo ? sfo_value(sfo, slen, "SAVEDATA_PARAMS", &vl) : NULL;
+    if (v && vl) file_mode = v[0] == 0 ? 0 : v[0] == 0x01 ? 1 : v[0] == 0x21 ? 3 : v[0] == 0x41 ? 5 : 1;
+    if (file_mode) {
+        uint8_t hash[16], key[16];
+        int have_hash = 0;
+        const uint8_t *fl = sfo_value(sfo, slen, "SAVEDATA_FILE_LIST", &vl);
+        for (uint32_t o = 0; fl && o + 32 <= vl; o += 32) {
+            if (!strncmp((const char *)fl + o, file, 13)) {
+                memcpy(hash, fl + o + 13, 16);
+                for (int i = 0; i < 16; i++) have_hash |= hash[i] != 0;
+                break;
+            }
+        }
+        for (uint32_t i = 0; i < 16; i++) key[i] = psp_read8(p + SD_KEY + i);
+        const int keyed = has_key(p), want = crypt_mode_for(p);
+        uint8_t *plain = NULL;
+        uint32_t plen = 0;
+        int rc = -1, used = file_mode;
+        if (!g_crypto) {
+            fprintf(stderr, "psprecomp: savedata %s is encrypted (mode %d) and no crypto provider is set\n", guest, file_mode);
+        } else if (file_mode > 1 && !keyed) {
+            fprintf(stderr, "psprecomp: savedata %s needs the game's key (mode %d), the request has none\n", guest, file_mode);
+        } else {
+            /* the file's mode first, then the request's, then without the hash check */
+            rc = g_crypto->decrypt(file_mode, fdata, flen, keyed ? key : NULL, have_hash ? hash : NULL, &plain, &plen);
+            if (rc && want != file_mode) { used = want; rc = g_crypto->decrypt(want, fdata, flen, keyed ? key : NULL, have_hash ? hash : NULL, &plain, &plen); }
+            if (rc && have_hash) {
+                used = file_mode;
+                rc = g_crypto->decrypt(file_mode, fdata, flen, keyed ? key : NULL, NULL, &plain, &plen);
+                if (!rc) fprintf(stderr, "psprecomp: savedata %s: hash mismatch (loaded anyway, as PPSSPP does)\n", guest);
+            }
+        }
+        if (!rc) {
+            fprintf(stderr, "psprecomp: savedata %s/%s decrypted (mode %d, %u -> %u bytes)\n", dir, file, used, flen, plen);
+            data = plain;
+            len = plen;
+        } else {
+            fprintf(stderr, "psprecomp: savedata %s/%s could not be decrypted (mode %d): passing it on as stored\n", dir, file, file_mode);
+        }
+    }
+    free(sfo);
+
+    uint32_t buf = psp_read32(p + SD_DATABUF), cap = psp_read32(p + SD_BUFSIZE);
+    const uint32_t n = len < cap ? len : cap;
+    for (uint32_t i = 0; i < n; i++) psp_write8(buf + i, data[i]);
+    if (data != fdata) free(data);
+    free(fdata);
     psp_write32(p + SD_DATASIZE, n);
     return 0;
 }
@@ -137,37 +249,44 @@ static int write_guest(const char *host, uint32_t addr, uint32_t size) {
 /* PARAM.SFO for the save, in the standard PSF layout: a 20-byte header, one
  * 16-byte index entry per key (keys sorted), the key table, then the data
  * table (each value padded to its maximum length, 4-byte aligned). */
-typedef struct { const char *key; int is_int; const char *s; uint32_t v; uint32_t max; } sfo_entry;
+typedef struct { const char *key; int is_int; const char *s; uint32_t v; uint32_t max; const uint8_t *bin; } sfo_entry;
 
-static int psp_write_sfo(const char *host, const sfo_entry *e, int n) {
-    uint8_t buf[4096];
-    memset(buf, 0, sizeof buf);
+/* is_int 2 = binary (bin, max bytes). Builds into buf (zero-filled, at least
+ * 16-byte padded past the end); returns the size, or 0. *params_off gets the
+ * data offset of SAVEDATA_PARAMS if present. */
+static uint32_t build_sfo(uint8_t *buf, uint32_t cap, const sfo_entry *e, int n, uint32_t *params_off) {
+    memset(buf, 0, cap);
     uint32_t keys = 20 + 16u * (uint32_t)n, klen = 0, dlen = 0;
     for (int i = 0; i < n; i++) klen += (uint32_t)strlen(e[i].key) + 1;
     uint32_t data = (keys + klen + 3) & ~3u;
     for (int i = 0; i < n; i++) dlen += (e[i].max + 3) & ~3u;
-    if (data + dlen > sizeof buf) return -1;
+    if (data + dlen + 16 > cap) return 0;
     memcpy(buf, "\0PSF", 4);
     const uint32_t hdr[4] = { 0x00000101u, keys, data, (uint32_t)n };
     memcpy(buf + 4, hdr, 16);
     uint32_t ko = 0, dof = 0;
     for (int i = 0; i < n; i++) {
         uint8_t *ix = buf + 20 + 16 * i;
-        uint16_t kofs = (uint16_t)ko, fmt = e[i].is_int ? 0x0404 : 0x0204;
-        uint32_t len = e[i].is_int ? 4u : (uint32_t)strlen(e[i].s) + 1;
+        uint16_t kofs = (uint16_t)ko, fmt = e[i].is_int == 1 ? 0x0404 : e[i].is_int == 2 ? 0x0004 : 0x0204;
+        uint32_t len = e[i].is_int == 1 ? 4u : e[i].is_int == 2 ? e[i].max : (uint32_t)strlen(e[i].s) + 1;
         if (len > e[i].max) len = e[i].max;
         memcpy(ix, &kofs, 2); memcpy(ix + 2, &fmt, 2); memcpy(ix + 4, &len, 4);
         memcpy(ix + 8, &e[i].max, 4); memcpy(ix + 12, &dof, 4);
         memcpy(buf + keys + ko, e[i].key, strlen(e[i].key) + 1);
-        if (e[i].is_int) memcpy(buf + data + dof, &e[i].v, 4);
+        if (e[i].is_int == 1) memcpy(buf + data + dof, &e[i].v, 4);
+        else if (e[i].is_int == 2) { if (e[i].bin) memcpy(buf + data + dof, e[i].bin, len); }
         else memcpy(buf + data + dof, e[i].s, len);
+        if (params_off && !strcmp(e[i].key, "SAVEDATA_PARAMS")) *params_off = data + dof;
         ko += (uint32_t)strlen(e[i].key) + 1;
         dof += (e[i].max + 3) & ~3u;
     }
+    return data + dlen;
+}
+
+static int write_host(const char *host, const uint8_t *b, size_t n) {
     FILE *f = fopen(host, "wb");
     if (!f) return -1;
-    size_t total = data + dlen;
-    int ok = fwrite(buf, 1, total, f) == total;
+    int ok = fwrite(b, 1, n, f) == n;
     return fclose(f) == 0 && ok ? 0 : -1;
 }
 
@@ -193,7 +312,28 @@ static uint32_t do_save(uint32_t p) {
 
     snprintf(guest, sizeof guest, "%s/%s", dir, file);
     psp_io_host_path(guest, host, sizeof host);
-    if (write_guest(host, psp_read32(p + SD_DATABUF), psp_read32(p + SD_DATASIZE)) != 0)
+    /* Encrypted as the firmware does when a provider is set (the mode the
+     * request calls for; a keyed mode needs the game's key). */
+    const uint32_t dbuf = psp_read32(p + SD_DATABUF), dsize = psp_read32(p + SD_DATASIZE);
+    int mode = g_crypto ? crypt_mode_for(p) : 0;
+    if (mode > 1 && !has_key(p)) mode = 0;
+    uint8_t hash[16] = { 0 };
+    if (mode && dsize) {
+        uint8_t *plain = (uint8_t *)malloc(dsize), *enc = NULL, key[16];
+        uint32_t elen = 0;
+        for (uint32_t i = 0; i < 16; i++) key[i] = psp_read8(p + SD_KEY + i);
+        if (plain) psp_mem_read_block(plain, dbuf, dsize);
+        if (!plain || g_crypto->encrypt(mode, plain, dsize, mode > 1 ? key : NULL, &enc, &elen, hash) != 0) {
+            fprintf(stderr, "psprecomp: savedata %s: encryption failed -- writing it plain\n", guest);
+            mode = 0;
+        } else {
+            if (write_host(host, enc, elen) != 0) { free(plain); free(enc); return SAVEDATA_SAVE_ACCESS_ERR; }
+            fprintf(stderr, "psprecomp: savedata %s written encrypted (mode %d, %u bytes)\n", guest, mode, elen);
+        }
+        free(plain);
+        free(enc);
+    }
+    if (!mode && write_guest(host, dbuf, dsize) != 0)
         return SAVEDATA_SAVE_ACCESS_ERR;
 
     static const struct { uint32_t off; const char *name; } EXTRA[4] = {
@@ -213,17 +353,30 @@ static uint32_t do_save(uint32_t p) {
     psp_str(p + SD_SFO + SFO_TITLE, title, sizeof title);
     psp_str(p + SD_SFO + SFO_SDTITLE, sdtitle, sizeof sdtitle);
     psp_str(p + SD_SFO + SFO_DETAIL, detail, sizeof detail);
-    const sfo_entry sfo[6] = {
-        { "CATEGORY",           0, "MS",    0, 4 },
-        { "PARENTAL_LEVEL",     1, NULL,    psp_read8(p + SD_SFO + SFO_PARENTAL), 4 },
-        { "SAVEDATA_DETAIL",    0, detail,  0, 1024 },
-        { "SAVEDATA_DIRECTORY", 0, dirname, 0, 64 },
-        { "SAVEDATA_TITLE",     0, sdtitle, 0, 128 },
-        { "TITLE",              0, title,   0, 128 },
+    /* SAVEDATA_FILE_LIST: 99 entries of name[13], hash[16], pad[3];
+     * SAVEDATA_PARAMS: 128 bytes, filled by the hash below (zero = plain). */
+    static uint8_t file_list[99 * 32];
+    memset(file_list, 0, sizeof file_list);
+    snprintf((char *)file_list, 13, "%s", file);
+    memcpy(file_list + 13, hash, 16);
+    const sfo_entry sfo[8] = {
+        { "CATEGORY",           0, "MS",    0, 4, NULL },
+        { "PARENTAL_LEVEL",     1, NULL,    psp_read8(p + SD_SFO + SFO_PARENTAL), 4, NULL },
+        { "SAVEDATA_DETAIL",    0, detail,  0, 1024, NULL },
+        { "SAVEDATA_DIRECTORY", 0, dirname, 0, 64, NULL },
+        { "SAVEDATA_FILE_LIST", 2, NULL,    0, sizeof file_list, file_list },
+        { "SAVEDATA_PARAMS",    2, NULL,    0, 128, NULL },
+        { "SAVEDATA_TITLE",     0, sdtitle, 0, 128, NULL },
+        { "TITLE",              0, title,   0, 128, NULL },
     };
+    static uint8_t sbuf[8192];
+    uint32_t params_off = 0;
+    const uint32_t ssize = build_sfo(sbuf, sizeof sbuf, sfo, 8, &params_off);
+    if (!ssize) return SAVEDATA_SAVE_ACCESS_ERR;
+    if (mode && params_off) g_crypto->sfo_hash(sbuf, ssize, params_off, mode);
     snprintf(guest, sizeof guest, "%s/PARAM.SFO", dir);
     psp_io_host_path(guest, host, sizeof host);
-    if (psp_write_sfo(host, sfo, 6) != 0) return SAVEDATA_SAVE_ACCESS_ERR;
+    if (write_host(host, sbuf, ssize) != 0) return SAVEDATA_SAVE_ACCESS_ERR;
     return 0;
 }
 
