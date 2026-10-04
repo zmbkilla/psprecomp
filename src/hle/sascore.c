@@ -14,7 +14,16 @@
 #include "psprecomp/hle.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* PSP2I_SAS_TRACE=1: voice setup, key on/off, envelopes and why voices end
+ * (first 4000 events), for diagnosing sound effects from a real session. */
+static int sas_trace(void) {
+    static int on = -1, n;
+    if (on < 0) on = getenv("PSP2I_SAS_TRACE") != NULL;
+    return on && n++ < 4000;
+}
 
 #define SAS_VOICES     32
 #define SAS_MAX_GRAIN  1024
@@ -27,10 +36,16 @@ static const int VAG_F1[5] = { 0,  0, -52, -55, -60 };
 
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
+/* ADSR curve modes (__sceSasSetADSRmode / the simple envelope's bits). */
+enum { CURVE_LINEAR_INC = 0, CURVE_LINEAR_DEC = 1, CURVE_LINEAR_BENT = 2,
+       CURVE_EXP_DEC = 3, CURVE_EXP_INC = 4, CURVE_DIRECT = 5 };
+
 typedef struct {
     uint32_t vag_addr;      /* guest address of the sample data */
     uint32_t vag_size;
-    int      loop;
+    int      loop;          /* SetVoice loop mode: honour the data's loop-end flag */
+    uint32_t loop_start;    /* byte offset of the block flagged 6 (loop start) */
+    int      loop_next;     /* the block just decoded was flagged 3: jump back next */
     uint32_t pos;           /* byte offset of the current 16-byte block */
     int      sample_idx;    /* 0..27 within the block */
     int      hist1, hist2;  /* ADPCM history */
@@ -43,7 +58,9 @@ typedef struct {
     int32_t  vol_l, vol_r;  /* 0x1000 == unity */
     int      env_state;
     int32_t  env;           /* 0 .. 0x40000000 */
-    int32_t  attack_rate, decay_rate, sustain_level, release_rate;
+    int32_t  attack_rate, decay_rate, sustain_rate, release_rate;
+    int32_t  sustain_level;
+    int      attack_type, decay_type, sustain_type, release_type;   /* CURVE_* */
 
     int      playing;
     int      ended;
@@ -64,6 +81,10 @@ void psp_sas_reset(void) {
         g_voice[i].pitch = 0x1000;
         g_voice[i].vol_l = 0x1000;
         g_voice[i].vol_r = 0x1000;
+        g_voice[i].attack_type  = CURVE_LINEAR_INC;
+        g_voice[i].decay_type   = CURVE_LINEAR_DEC;
+        g_voice[i].sustain_type = CURVE_LINEAR_DEC;
+        g_voice[i].release_type = CURVE_LINEAR_DEC;
     }
     g_grain = 256;
     g_max_voices = SAS_VOICES;
@@ -85,13 +106,22 @@ static int clamp16(int v) {
 }
 
 /* Decode the 16-byte ADPCM block at the voice's current position into its
- * 28-sample buffer. Returns 0 when the voice has run off the end. */
+ * 28-sample buffer. Returns 0 when the voice has run off the end.
+ *
+ * Looping is driven by the block flags in the data, as on the hardware
+ * (and PPSSPP's VagDecoder): flag 6 marks the loop-start block, flag 3 ends
+ * the loop -- the next block is the loop start again, but only if the voice
+ * was set up with looping -- and flag 7 ends the sample whatever the loop
+ * mode. Running past the size also ends it. An earlier version ignored 6
+ * and 3 and restarted from block 0 at flag 7 when looping was on, so a
+ * one-shot sound on a voice set up as looping (PSP2i's menu "select" ping)
+ * repeated forever. */
 static int decode_block(sas_voice *v) {
-    if (v->pos + 16 > v->vag_size) {
-        if (!v->loop) return 0;
-        v->pos = 0;
-        v->hist1 = v->hist2 = 0;
+    if (v->loop_next) {                  /* the previous block ended the loop */
+        v->loop_next = 0;
+        v->pos = v->loop_start;
     }
+    if (v->pos + 16 > v->vag_size) return 0;
 
     uint32_t at = v->vag_addr + v->pos;
     uint8_t hdr   = psp_read8(at);
@@ -101,12 +131,9 @@ static int decode_block(sas_voice *v) {
     int filter = (hdr >> 4) & 0x0F;
     if (filter > 4) filter = 0;          /* out of range: treat as no prediction */
 
-    /* Flag 7 marks the end of the sample. */
-    if (flags == 7) {
-        if (!v->loop) return 0;
-        v->pos = 0;
-        return decode_block(v);
-    }
+    if (flags == 7) return 0;            /* end of sample */
+    if (flags == 6) v->loop_start = v->pos;
+    else if (flags == 3 && v->loop) v->loop_next = 1;
 
     for (int i = 0; i < 28; i++) {
         uint8_t byte = psp_read8(at + 2 + (uint32_t)(i / 2));
@@ -128,25 +155,51 @@ static int decode_block(sas_voice *v) {
     return 1;
 }
 
-/* Advance the envelope by one sample and return its current level, 0..0x40000000. */
+#define ENV_MAX 0x40000000
+
+/* One step of a curve at `rate`. The linear and bent forms are exact; the
+ * exponential ones move by `rate` as a fraction (of 2^31) of the remaining
+ * distance -- the documented shape, not a bit-exact table. */
+static int64_t walk(int64_t h, int type, int32_t rate) {
+    switch (type) {
+    case CURVE_LINEAR_INC:  return h + rate;
+    case CURVE_LINEAR_DEC:  return h - rate;
+    case CURVE_LINEAR_BENT: return h + (h < (int64_t)ENV_MAX * 3 / 4 ? rate : rate / 4);
+    case CURVE_EXP_DEC:     return h - ((h * (int64_t)(uint32_t)rate) >> 31) - 1;
+    case CURVE_EXP_INC:     return h + (((ENV_MAX - h) * (int64_t)(uint32_t)rate) >> 31) + 1;
+    case CURVE_DIRECT:      return rate;
+    default:                return h;
+    }
+}
+
+/* Advance the envelope by one sample and return its current level,
+ * 0..ENV_MAX. Attack rises to the top, decay falls to the sustain level,
+ * sustain follows its own rate and curve (a sustain that reaches 0 moves on
+ * to release), and the voice ends when release reaches 0. */
 static int32_t step_envelope(sas_voice *v) {
+    int64_t h = v->env;
     switch (v->env_state) {
     case ENV_ATTACK:
-        v->env += v->attack_rate;
-        if (v->env >= 0x40000000) { v->env = 0x40000000; v->env_state = ENV_DECAY; }
+        h = walk(h, v->attack_type, v->attack_rate);
+        if (h >= ENV_MAX || h < 0) { h = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
-        v->env -= v->decay_rate;
-        if (v->env <= v->sustain_level) { v->env = v->sustain_level; v->env_state = ENV_SUSTAIN; }
-        break;
-    case ENV_RELEASE:
-        v->env -= v->release_rate;
-        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
+        h = walk(h, v->decay_type, v->decay_rate);
+        if (h < v->sustain_level) { h = v->sustain_level; v->env_state = ENV_SUSTAIN; }
         break;
     case ENV_SUSTAIN:
+        h = walk(h, v->sustain_type, v->sustain_rate);
+        if (h > ENV_MAX) h = ENV_MAX;
+        if (h <= 0) { h = 0; v->env_state = ENV_RELEASE; }
+        break;
+    case ENV_RELEASE:
+        h = walk(h, v->release_type, v->release_rate);
+        if (h <= 0) { h = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
+        break;
     default:
         break;
     }
+    v->env = (int32_t)(h < 0 ? 0 : h > ENV_MAX ? ENV_MAX : h);
     return v->env;
 }
 
@@ -162,7 +215,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
         for (uint32_t i = 0; i < samples; i++) {
             if (!v->decoded_valid || v->sample_idx >= 28) {
                 v->sample_idx = 0;
-                if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                if (!decode_block(v)) { if (sas_trace()) fprintf(stderr, "sas: voice %u ended at data offset %u/%u\n", vi, v->pos, v->vag_size); v->playing = 0; v->ended = 1; break; }
             }
 
             int32_t s = v->decoded[v->sample_idx];
@@ -182,7 +235,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
                 v->sample_idx++;
                 if (v->sample_idx >= 28) {
                     v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                    if (!decode_block(v)) { if (sas_trace()) fprintf(stderr, "sas: voice %u ended at data offset %u/%u\n", vi, v->pos, v->vag_size); v->playing = 0; v->ended = 1; break; }
                 }
             }
             if (!v->playing) break;
@@ -215,6 +268,10 @@ static void hle_SetVoice(void) {
     v->vag_addr = psp_arg(2);
     v->vag_size = psp_arg(3);
     v->loop     = (int)psp_arg(4);
+    if (sas_trace()) fprintf(stderr, "sas: voice %u set vag 0x%08X size %u loop %d\n",
+                             psp_arg(1), v->vag_addr, v->vag_size, v->loop);
+    v->loop_start = 0;
+    v->loop_next = 0;
     v->pos = 0;
     v->sample_idx = 0;
     v->hist1 = v->hist2 = 0;
@@ -243,23 +300,85 @@ static void hle_SetADSR(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     uint32_t flags = psp_arg(2);
+    if (sas_trace()) fprintf(stderr, "sas: voice %u ADSR flags %X a 0x%X d 0x%X s 0x%X r 0x%X\n",
+                             psp_arg(1), flags, psp_arg(3), psp_arg(4), psp_arg(5), psp_arg(6));
     if (flags & 1) v->attack_rate  = (int32_t)psp_arg(3);
     if (flags & 2) v->decay_rate   = (int32_t)psp_arg(4);
-    if (flags & 4) v->sustain_level= (int32_t)psp_arg(5);
+    if (flags & 4) v->sustain_rate = (int32_t)psp_arg(5);   /* a rate; the level is SetSL */
     if (flags & 8) v->release_rate = (int32_t)psp_arg(6);
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* The packed envelope of __sceSasSetSimpleADSR(core, voice, env1, env2),
+ * field layout as in PPSSPP's sceSas (ADSREnvelope::SetSimpleEnvelope):
+ *   env1: bit 15 attack curve (linear / bent), bits 8-14 attack rate,
+ *         bits 4-7 decay rate (exponential), bits 0-3 sustain level;
+ *   env2: bits 13-15 sustain curve, bits 6-12 sustain rate,
+ *         bit 5 release curve (linear / exponential), bits 0-4 release rate.
+ * An earlier version ignored both words and used one fixed envelope for
+ * every sound, so short percussive sounds (footsteps) came out wrong. */
+static int32_t simple_rate(uint32_t n) {
+    n &= 0x7F;
+    if (n == 0x7F) return 0;
+    int32_t r = (int32_t)(((7u - (n & 3)) << 26) >> (n >> 2));
+    return r ? r : 1;
+}
+static int32_t exp_rate(uint32_t n) {
+    n &= 0x7F;
+    if (n == 0x7F) return 0;
+    int32_t r = (int32_t)(((7u - (n & 3)) << 24) >> (n >> 2));
+    return r ? r : 1;
 }
 
 static void hle_SetSimpleADSR(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
-    /* The packed form encodes rates in two 16-bit words. Without the exact
-     * curve tables this is an approximation: fast attack, slow release. Audio
-     * plays at the right pitch and duration; envelope shape is not exact. */
-    v->attack_rate   = 0x40000000 / 64;
-    v->decay_rate    = 0x40000000 / 512;
-    v->sustain_level = 0x30000000;
-    v->release_rate  = 0x40000000 / 256;
+    const uint32_t e1 = psp_arg(2), e2 = psp_arg(3);
+    if (sas_trace()) fprintf(stderr, "sas: voice %u simple ADSR 0x%04X 0x%04X\n", psp_arg(1), e1 & 0xFFFF, e2 & 0xFFFF);
+    v->attack_type = (e1 & 0x8000) ? CURVE_LINEAR_BENT : CURVE_LINEAR_INC;
+    v->attack_rate = simple_rate(e1 >> 8);
+    {
+        const uint32_t n = (e1 >> 4) & 0xF;
+        v->decay_type = CURVE_EXP_DEC;
+        v->decay_rate = n ? (int32_t)(0x80000000u >> (n + 2)) : 0x7FFFFFFF;
+    }
+    v->sustain_level = (int32_t)(((e1 & 0xF) + 1) << 26);
+    switch (e2 >> 13) {
+    case 0:  v->sustain_type = CURVE_LINEAR_INC;  break;
+    case 2:  v->sustain_type = CURVE_LINEAR_DEC;  break;
+    case 4:  v->sustain_type = CURVE_LINEAR_BENT; break;
+    default: v->sustain_type = CURVE_EXP_DEC;     break;   /* 6 */
+    }
+    v->sustain_rate = v->sustain_type == CURVE_EXP_DEC ? exp_rate(e2 >> 6) : simple_rate(e2 >> 6);
+    {
+        const uint32_t n = e2 & 0x1F;
+        v->release_type = (e2 & 0x20) ? CURVE_EXP_DEC : CURVE_LINEAR_DEC;
+        if (n == 31) v->release_rate = 0;
+        else if (v->release_type == CURVE_LINEAR_DEC)
+            v->release_rate = n == 30 ? 0x40000000 : n == 29 ? 1 : (int32_t)(0x10000000u >> n);
+        else
+            v->release_rate = n ? (int32_t)(0x80000000u >> (n + 2)) : 0x7FFFFFFF;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (core, voice, flags, attackType, decayType, sustainType, releaseType) */
+static void hle_SetADSRmode(void) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    const uint32_t flags = psp_arg(2);
+    if (flags & 1) v->attack_type  = (int)psp_arg(3);
+    if (flags & 2) v->decay_type   = (int)psp_arg(4);
+    if (flags & 4) v->sustain_type = (int)psp_arg(5);
+    if (flags & 8) v->release_type = (int)psp_arg(6);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (core, voice, sustainLevel) */
+static void hle_SetSL(void) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    v->sustain_level = (int32_t)psp_arg(2);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -270,6 +389,8 @@ static void hle_SetKeyOn(void) {
     v->ended = 0;
     v->paused = 0;
     v->pos = 0;
+    v->loop_start = 0;
+    v->loop_next = 0;
     v->sample_idx = 0;
     v->frac = 0;
     v->hist1 = v->hist2 = 0;
@@ -277,12 +398,15 @@ static void hle_SetKeyOn(void) {
     v->env = 0;
     v->env_state = ENV_ATTACK;
     if (!v->attack_rate) v->attack_rate = 0x40000000 / 64;
+    if (sas_trace()) fprintf(stderr, "sas: voice %u key on (pitch 0x%X vol %d/%d)\n",
+                             psp_arg(1), v->pitch, v->vol_l, v->vol_r);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (sas_trace()) fprintf(stderr, "sas: voice %u key off (envelope 0x%X)\n", psp_arg(1), v->env);
     v->env_state = ENV_RELEASE;
     if (!v->release_rate) v->release_rate = 0x40000000 / 256;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -367,9 +491,9 @@ void psp_sas_register(void) {
     psp_hle_register(0xAD84D37F, "sceSasCore", "__sceSasSetPitch",          hle_SetPitch);
     psp_hle_register(0x440CA7D8, "sceSasCore", "__sceSasSetVolume",         hle_SetVolume);
     psp_hle_register(0x019B25EB, "sceSasCore", "__sceSasSetADSR",           hle_SetADSR);
-    psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_accept);
+    psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_SetADSRmode);
     psp_hle_register(0xCBCD4F79, "sceSasCore", "__sceSasSetSimpleADSR",     hle_SetSimpleADSR);
-    psp_hle_register(0x5F9529F6, "sceSasCore", "__sceSasSetSL",             hle_accept);
+    psp_hle_register(0x5F9529F6, "sceSasCore", "__sceSasSetSL",             hle_SetSL);
     psp_hle_register(0x76F01ACA, "sceSasCore", "__sceSasSetKeyOn",          hle_SetKeyOn);
     psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
     psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);

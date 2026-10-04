@@ -42,6 +42,10 @@ static uint32_t call(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
 /* Stack arguments live at $sp+16 onward. */
 static uint32_t call5(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
                       uint32_t a3, uint32_t a4) {
+    /* The fifth argument travels in $t0 (the PSP passes eight in registers;
+     * see psp_arg). This used to write it to the stack only, so it never
+     * arrived -- harmless while every test passed 0 there. */
+    psp_cpu.r[PSP_REG_T0] = a4;
     psp_write32(psp_cpu.r[PSP_REG_SP] + 16, a4);
     return call(nid, a0, a1, a2, a3);
 }
@@ -391,6 +395,43 @@ static void test_sas_adpcm(void) {
     CHECK((ended & ~1u) != 0, "unused voices report ended, got 0x%08X", ended);
 }
 
+/* VAG loop markers drive looping (flag 6 loop start, flag 3 loop end, flag 7
+ * end), and SetVoice's loop mode only enables the flag-3 jump. A voice set
+ * up as looping used to restart a one-shot sample at its end flag forever --
+ * PSP2i's menu "select" ping looped endlessly. */
+static int sas_voice0_ended_after(uint32_t vag, uint32_t size, int loop, int frames) {
+    psp_sas_reset();
+    call5(psp_nid("__sceSasInit"), 0, 64, 32, 0, 44100);
+    call5(psp_nid("__sceSasSetVoice"), 0, 0, vag, size, (uint32_t)loop);
+    call(psp_nid("__sceSasSetVolume"), 0, 0, 0x1000, 0x1000);
+    call(psp_nid("__sceSasSetPitch"), 0, 0, 0x1000, 0);
+    call(psp_nid("__sceSasSetKeyOn"), 0, 0, 0, 0);
+    const uint32_t OUT = 0x08850000u;
+    for (int f = 0; f < frames; f++) call(psp_nid("__sceSasCore"), 0, OUT, 0, 0);
+    return (int)(call(psp_nid("__sceSasGetEndFlag"), 0, 0, 0, 0) & 1u);
+}
+
+static void test_sas_loop_markers(void) {
+    const uint32_t VAG = 0x08840000u;
+    /* block 0: audio, flags 0; block 1: flags 7 (end) */
+    for (uint32_t b = 0; b < 2; b++) {
+        psp_write8(VAG + b * 16, 0x08);
+        psp_write8(VAG + b * 16 + 1, b == 1 ? 7 : 0);
+        for (uint32_t i = 0; i < 14; i++) psp_write8(VAG + b * 16 + 2 + i, 0x7Fu);
+    }
+    CHECK(sas_voice0_ended_after(VAG, 32, 1, 8), "a one-shot sample ends even on a looping voice");
+
+    /* block 0: flags 6 (loop start); block 1: flags 3 (loop end) */
+    const uint32_t VAG2 = 0x08841000u;
+    for (uint32_t b = 0; b < 2; b++) {
+        psp_write8(VAG2 + b * 16, 0x08);
+        psp_write8(VAG2 + b * 16 + 1, b == 0 ? 6 : 3);
+        for (uint32_t i = 0; i < 14; i++) psp_write8(VAG2 + b * 16 + 2 + i, 0x7Fu);
+    }
+    CHECK(!sas_voice0_ended_after(VAG2, 32, 1, 64), "a sample with loop markers keeps playing when looping");
+    CHECK(sas_voice0_ended_after(VAG2, 32, 0, 8), "the same sample ends when the voice does not loop");
+}
+
 static void test_display(void) {
     psp_display_reset();
 
@@ -496,6 +537,7 @@ int main(void) {
     test_ge_display_list();
     test_ge_infinite_list();
     test_sas_adpcm();
+    test_sas_loop_markers();
     test_display();
     test_savedata_roundtrip();
 
