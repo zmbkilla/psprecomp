@@ -66,7 +66,36 @@ static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
 
 /* ---- register addressing ------------------------------------------------- */
 
+/* The mapping below is pure arithmetic on (vreg, size), but it runs for
+ * every operand of every VFPU instruction -- about a third of the busy time
+ * in PSP2i's lobby. Both functions are tabulated once, from the same code,
+ * for all 128 registers and the four sizes, so the results are identical. */
+static int  regs_compute(uint32_t vreg, int size, int out[4]);
+static void quad_compute(uint32_t vreg, int size, int out[4]);
+static int8_t g_regs_tab[4][128][4], g_quad_tab[4][128][4], g_regs_len[4][128];
+static int    g_tabs_ready;
+
+static void build_tabs(void) {
+    for (int sz = 1; sz <= 4; sz++)
+        for (uint32_t v = 0; v < 128; v++) {
+            int r[4] = { 0, 0, 0, 0 }, q[4];
+            g_regs_len[sz - 1][v] = (int8_t)regs_compute(v, sz, r);
+            quad_compute(v, sz, q);
+            for (int i = 0; i < 4; i++) { g_regs_tab[sz - 1][v][i] = (int8_t)r[i]; g_quad_tab[sz - 1][v][i] = (int8_t)q[i]; }
+        }
+    g_tabs_ready = 1;
+}
+
 int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
+    if (!g_tabs_ready) build_tabs();
+    const int sz = (size < 1 || size > 4) ? 4 : size;
+    const int8_t *t = g_regs_tab[sz - 1][vreg & 127];
+    const int len = g_regs_len[sz - 1][vreg & 127];
+    for (int i = 0; i < len; i++) out[i] = t[i];
+    return len;
+}
+
+static int regs_compute(uint32_t vreg, int size, int out[4]) {
     const int mtx       = (vreg >> 2) & 7;
     const int col       = vreg & 3;
     int transpose       = (vreg >> 5) & 1;
@@ -92,6 +121,13 @@ int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
 
 /* The full quad an operand starts in: what a prefix swizzle indexes. */
 static void quad_regs(uint32_t vreg, int size, int out[4]) {
+    if (!g_tabs_ready) build_tabs();
+    const int sz = (size < 1 || size > 4) ? 4 : size;
+    const int8_t *t = g_quad_tab[sz - 1][vreg & 127];
+    out[0] = t[0]; out[1] = t[1]; out[2] = t[2]; out[3] = t[3];
+}
+
+static void quad_compute(uint32_t vreg, int size, int out[4]) {
     const int mtx = (vreg >> 2) & 7;
     const int col = vreg & 3;
     int transpose = (vreg >> 5) & 1;

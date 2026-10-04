@@ -250,6 +250,10 @@ typedef struct {
 } psp_fpl;
 
 static psp_thread   g_thread[MAX_THREADS];
+/* One past the highest slot ever used. The scheduler scans threads after
+ * every firmware call and on every switch; a game uses a handful of the 128
+ * slots, so the scans stop here instead of at MAX_THREADS. Never lowered. */
+static int          g_thread_hi;
 static psp_sema     g_sema[MAX_SEMAS];
 static psp_evflag   g_flag[MAX_FLAGS];
 static psp_callback g_cb[MAX_CBS];
@@ -286,6 +290,7 @@ static subintr g_subintr[MAX_INTR][MAX_SUBINTR];
 
 void psp_threadman_reset(void) {
     memset(g_thread, 0, sizeof g_thread);
+    g_thread_hi = 0;
     memset(g_sema, 0, sizeof g_sema);
     memset(g_flag, 0, sizeof g_flag);
     memset(g_cb, 0, sizeof g_cb);
@@ -345,7 +350,7 @@ static void host_sleep_us(uint64_t us) {
  * which is exactly the kind of subtlety not worth inviting to save twelve
  * lines. */
 static psp_thread *find_thread(uint32_t id) {
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < g_thread_hi; i++)
         if (g_thread[i].used && g_thread[i].uid == id) return &g_thread[i];
     return NULL;
 }
@@ -435,7 +440,7 @@ static void wake(psp_thread *t, uint32_t result) {
 /* Waiters on one object, in the order the object's attribute asks for. */
 static int collect_waiters(int type, uint32_t id, uint32_t attr, psp_thread **out) {
     int n = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (t->used && t->state == TH_WAITING && t->wait == type && t->wait_id == id)
             out[n++] = t;
@@ -611,7 +616,7 @@ static void process_events(uint64_t now) {
     while (now >= g_next_vblank) {
         g_vblank_count++;
         g_next_vblank += VBLANK_US;
-        for (int i = 0; i < MAX_THREADS; i++) {
+        for (int i = 0; i < g_thread_hi; i++) {
             psp_thread *t = &g_thread[i];
             if (t->used && t->state == TH_WAITING && t->wait == W_VBLANK) wake(t, 0);
         }
@@ -622,7 +627,7 @@ static void process_events(uint64_t now) {
         if (now > g_next_vblank + 10 * VBLANK_US) g_next_vblank = now + VBLANK_US;
     }
 
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (!t->used || t->state != TH_WAITING || !t->wait_until) continue;
         if (now < t->wait_until) continue;
@@ -632,7 +637,7 @@ static void process_events(uint64_t now) {
 
 static uint64_t next_event(void) {
     uint64_t e = g_next_vblank;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (t->used && t->state == TH_WAITING && t->wait_until && t->wait_until < e)
             e = t->wait_until;
@@ -642,7 +647,7 @@ static uint64_t next_event(void) {
 
 static psp_thread *pick_ready(void) {
     psp_thread *best = NULL;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (!t->used || t->state != TH_READY || t->suspended) continue;
         if (!best || t->priority < best->priority ||
@@ -660,7 +665,7 @@ void psp_sched_after_hle(void) {
     if (now >= g_next_vblank) process_events(now);
     else {
         /* Timeouts are cheap to check only when one could be due. */
-        for (int i = 0; i < MAX_THREADS; i++) {
+        for (int i = 0; i < g_thread_hi; i++) {
             psp_thread *t = &g_thread[i];
             if (t->used && t->state == TH_WAITING && t->wait_until && now >= t->wait_until) {
                 process_events(now);
@@ -690,7 +695,7 @@ void psp_sched_after_hle(void) {
 /* ---- thread bodies ------------------------------------------------------- */
 
 static void wake_end_waiters(psp_thread *t) {
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *w = &g_thread[i];
         if (w->used && w->state == TH_WAITING && w->wait == W_THREADEND && w->wait_id == t->uid)
             wake(w, t->exit_status);
@@ -800,7 +805,7 @@ static void run_thread(psp_thread *t) {
 void psp_sched_dump(FILE *out) {
     fprintf(out, "  threads (vblank %llu, t=%.3fs):\n",
             (unsigned long long)g_vblank_count, psp_sched_now_us() / 1e6);
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (!t->used) continue;
         static const char *const ST[] = { "dormant", "ready", "running", "waiting" };
@@ -852,7 +857,8 @@ static void prepare_start(psp_thread *t, uint32_t arglen, uint32_t argp, uint32_
 static psp_thread *new_thread(const char *name, uint32_t entry, uint32_t prio,
                               uint32_t stack_size, uint32_t attr) {
     psp_thread *t = NULL;
-    for (int i = 0; i < MAX_THREADS; i++) if (!g_thread[i].used) { t = &g_thread[i]; break; }
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (!g_thread[i].used) { t = &g_thread[i]; if (i + 1 > g_thread_hi) g_thread_hi = i + 1; break; }
     if (!t) return NULL;
     memset(t, 0, sizeof *t);
     snprintf(t->name, sizeof t->name, "%s", name);
@@ -902,14 +908,14 @@ int psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
         if (t) { run_thread(t); continue; }
 
         int alive = 0;
-        for (int i = 0; i < MAX_THREADS; i++)
+        for (int i = 0; i < g_thread_hi; i++)
             if (g_thread[i].used && g_thread[i].state != TH_DORMANT) alive++;
         if (!alive) break;
 
         /* Nothing can run. If nothing has woken in a long while and no wait
          * can time out, the game is deadlocked; say so instead of idling. */
         int timed = 0;
-        for (int i = 0; i < MAX_THREADS; i++) {
+        for (int i = 0; i < g_thread_hi; i++) {
             psp_thread *w = &g_thread[i];
             if (w->used && w->state == TH_WAITING && (w->wait_until || w->wait == W_VBLANK)) timed = 1;
         }
@@ -1190,7 +1196,7 @@ static void hle_CreateSema(void) {
 }
 
 static void wake_all(int type, uint32_t id, uint32_t result) {
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (t->used && t->state == TH_WAITING && t->wait == type && t->wait_id == id)
             wake(t, result);

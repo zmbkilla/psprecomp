@@ -120,6 +120,8 @@ static void hle_SetMode(void) {
 }
 
 static uint64_t g_spacing[4];
+static uint64_t g_busy[6];
+void psp_display_frame_busy(uint64_t out[6]) { for (int i = 0; i < 6; i++) out[i] = g_busy[i]; }
 void psp_display_flip_spacing(uint64_t out[4]) { for (int i = 0; i < 4; i++) out[i] = g_spacing[i]; }
 
 static void hle_SetFrameBuf(void) {
@@ -134,6 +136,18 @@ static void hle_SetFrameBuf(void) {
         uint64_t now = psp_sched_active() ? psp_sched_vblank_count() : 0, d = now - last;
         last = now;
         g_spacing[d >= 4 ? 3 : d ? d - 1 : 0]++;
+    }
+    {   /* host time the frame was busy (not idle): <8, <16.7, <25, <33.3, <50, 50+ ms */
+        static uint64_t lt, li;
+        uint64_t t = psp_sched_now_us(), i = psp_sched_idle_us();
+        if (lt) {
+            uint64_t busy = (t - lt) - (i - li);
+            static const uint64_t edge[5] = { 8000, 16667, 25000, 33333, 50000 };
+            int b = 5;
+            for (int k = 0; k < 5; k++) if (busy < edge[k]) { b = k; break; }
+            g_busy[b]++;
+        }
+        lt = t; li = i;
     }
     {
         /* PSPRECOMP_DISPLAY_TRACE: report every change of what is displayed. */
