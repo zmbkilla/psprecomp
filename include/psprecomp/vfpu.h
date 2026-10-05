@@ -134,6 +134,8 @@ int  psp_vfpu_prefix_pending(void);
  * that takes none (vtfm, vhtfm) does. */
 extern int psp_vfpu_pfx_any;
 void psp_vfpu_consume(void);
+/* Nonzero: generated code always uses the runtime VFPU calls (A/B testing). */
+void psp_vfpu_force_runtime(int on);
 void psp_vfpu_reset(void);
 
 /* Reports an instruction the VFPU cannot yet execute, by address and name. */

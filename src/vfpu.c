@@ -35,6 +35,11 @@ static int      g_prefix_set[3];
 /* Nonzero while any prefix is pending: generated code tests this one word
  * and inlines the operation when it is clear (see emit.c, "inline VFPU"). */
 int psp_vfpu_pfx_any;
+/* PSP2I_VFPU_NOINLINE=1 (or psp_vfpu_force_runtime(1)): keep psp_vfpu_pfx_any
+ * set so generated code always takes the runtime path -- an A/B switch for
+ * the inlined operations. */
+static int g_force_runtime;
+void psp_vfpu_force_runtime(int on) { g_force_runtime = on != 0; psp_vfpu_pfx_any = g_force_runtime; }
 static uint64_t g_traps;
 
 static void build_tabs(void);
@@ -45,7 +50,7 @@ void psp_vfpu_reset(void) {
     if (!g_tabs_ready) build_tabs();
     memset(g_prefix, 0, sizeof g_prefix);
     memset(g_prefix_set, 0, sizeof g_prefix_set);
-    psp_vfpu_pfx_any = 0;
+    psp_vfpu_pfx_any = g_force_runtime;
     g_traps = 0;
 }
 
@@ -90,7 +95,7 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
     g_traps++;
 }
 
-static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); psp_vfpu_pfx_any = 0; }
+static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); psp_vfpu_pfx_any = g_force_runtime; }
 void psp_vfpu_consume(void) { consume(); }
 
 /* ---- register addressing ------------------------------------------------- */
