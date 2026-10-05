@@ -200,6 +200,132 @@ static void emit_direct_return_check(ectx *c, const char *ind, uint32_t link, ui
 /* `ind` is the indentation, so a delay slot emitted inside an `if` body lines
  * up. Returns nothing: unhandled opcodes emit a trap rather than nothing, so
  * a gap is loud at run time instead of silently doing the wrong thing. */
+/* ---- inline VFPU ----------------------------------------------------------
+ * The common vector operations are emitted as straight-line C with their
+ * register lanes resolved here, at recompile time, instead of a runtime call
+ * that maps registers and checks prefixes on every execution (about a quarter
+ * of PSP2i's frame in VFPU-heavy scenes). The arithmetic is exactly the
+ * runtime's no-prefix path (src/vfpu.c), so results are identical; while a
+ * prefix is pending (psp_vfpu_pfx_any) the runtime call is used instead. */
+
+/* Lanes of vector register `vreg` at `size` (1..4): src/vfpu.c regs_compute. */
+static int vfpu_lanes(unsigned vreg, int size, int out[4]) {
+    const int mtx = (vreg >> 2) & 7, col = vreg & 3;
+    int transpose = (vreg >> 5) & 1, row = 0, len = 1;
+    switch (size) {
+    case 1: row = (vreg >> 5) & 3; transpose = 0; len = 1; break;
+    case 2: row = (vreg >> 5) & 2;                len = 2; break;
+    case 3: row = (vreg >> 6) & 1;                len = 3; break;
+    default:row = (vreg >> 5) & 2;                len = 4; break;
+    }
+    for (int i = 0; i < len; i++) {
+        const int step = (row + i) & 3;
+        out[i] = transpose ? mtx * 4 + step * 32 + col : mtx * 4 + col * 32 + step;
+    }
+    return len;
+}
+
+/* Columns of matrix register `v` of order `size`: src/vfpu.c matrix_cols. */
+static void vfpu_mcols(unsigned v, int size, int cols[4][4]) {
+    const unsigned mtx = (v >> 2) & 7, transpose = (v >> 5) & 1;
+    for (int c = 0; c < size; c++) vfpu_lanes((mtx << 2) | (unsigned)c | (transpose << 5), size, cols[c]);
+}
+
+enum { VB_ADD, VB_SUB, VB_MUL, VB_DIV, VB_MIN, VB_MAX, VB_SGE, VB_SLT, VB_DOT, VB_SCL };
+
+/* vadd .. vslt, vdot, vscl. Returns 0 if not inlined (odd size). */
+static int emit_vfpu_bin(FILE *f, const char *ind, const a_insn *in, int kind, const char *call) {
+    const int n = in->vsize;
+    if (n < 1 || n > 4) return 0;
+    int S[4], T[4], D[4];
+    vfpu_lanes(in->vs, n, S);
+    vfpu_lanes(in->vt, kind == VB_SCL ? 1 : n, T);
+    vfpu_lanes(in->vd, kind == VB_DOT ? 1 : n, D);
+    fprintf(f, "%sif (!psp_vfpu_pfx_any) {", ind);
+    if (kind == VB_DOT) {
+        fprintf(f, " psp_cpu.v[%d] = 0.0f", D[0]);
+        for (int i = 0; i < n; i++) fprintf(f, " + psp_cpu.v[%d] * psp_cpu.v[%d]", S[i], T[i]);
+        fprintf(f, ";");
+    } else {
+        /* All sources are read before any destination is written: vd may alias. */
+        for (int i = 0; i < n; i++) {
+            fprintf(f, " const float _a%d = psp_cpu.v[%d], _b%d = psp_cpu.v[%d];",
+                    i, S[i], i, kind == VB_SCL ? T[0] : T[i]);
+        }
+        for (int i = 0; i < n; i++) {
+            fprintf(f, " psp_cpu.v[%d] = ", D[i]);
+            switch (kind) {
+            case VB_ADD: fprintf(f, "_a%d + _b%d", i, i); break;
+            case VB_SUB: fprintf(f, "_a%d - _b%d", i, i); break;
+            case VB_MUL: case VB_SCL: fprintf(f, "_a%d * _b%d", i, i); break;
+            case VB_DIV: fprintf(f, "_a%d / _b%d", i, i); break;
+            case VB_MIN: fprintf(f, "_a%d < _b%d ? _a%d : _b%d", i, i, i, i); break;
+            case VB_MAX: fprintf(f, "_a%d > _b%d ? _a%d : _b%d", i, i, i, i); break;
+            case VB_SGE: fprintf(f, "_a%d >= _b%d ? 1.0f : 0.0f", i, i); break;
+            default:     fprintf(f, "_a%d < _b%d ? 1.0f : 0.0f", i, i); break;
+            }
+            fprintf(f, ";");
+        }
+    }
+    fprintf(f, " } else %s(%u, %u, %u, %u);\n", call, in->vd, in->vs, in->vt, in->vsize);
+    return 1;
+}
+
+/* vmov / vabs / vneg / vzero / vone. */
+static int emit_vfpu_unary(FILE *f, const char *ind, const a_insn *in, const char *sel) {
+    const int n = in->vsize;
+    if (n < 1 || n > 4) return 0;
+    int S[4], D[4];
+    vfpu_lanes(in->vs, n, S);
+    vfpu_lanes(in->vd, n, D);
+    fprintf(f, "%sif (!psp_vfpu_pfx_any) {", ind);
+    if (!strcmp(sel, "PSP_VU_ZERO") || !strcmp(sel, "PSP_VU_ONE")) {
+        for (int i = 0; i < n; i++) fprintf(f, " psp_cpu.v[%d] = %s;", D[i], sel[7] == 'Z' ? "0.0f" : "1.0f");
+    } else {
+        for (int i = 0; i < n; i++) fprintf(f, " const float _a%d = psp_cpu.v[%d];", i, S[i]);
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(sel, "PSP_VU_MOV"))      fprintf(f, " psp_cpu.v[%d] = _a%d;", D[i], i);
+            else if (!strcmp(sel, "PSP_VU_ABS")) /* fabsf, bit for bit (gen does not include math.h) */
+                fprintf(f, " psp_cpu.v[%d] = psp_bits_to_f32(psp_f32_to_bits(_a%d) & 0x7FFFFFFFu);", D[i], i);
+            else                                 fprintf(f, " psp_cpu.v[%d] = -_a%d;", D[i], i);
+        }
+    }
+    fprintf(f, " } else psp_vunary(%s, %u, %u, %u);\n", sel, in->vd, in->vs, in->vsize);
+    return 1;
+}
+
+/* vtfm / vhtfm (order 2..4). They take no prefixes: always inline, then drop
+ * any pending prefix as the runtime does. src/vfpu.c transform. */
+static void emit_vfpu_tfm(FILE *f, const char *ind, const a_insn *in, int order, int homogeneous) {
+    int cols[4][4], T[4], D[4];
+    vfpu_mcols(in->vs, order, cols);
+    const int vn = homogeneous ? order - 1 : order;
+    vfpu_lanes(in->vt, vn, T);
+    vfpu_lanes(in->vd, order, D);
+    fprintf(f, "%s{", ind);
+    for (int k = 0; k < vn; k++) fprintf(f, " const float _i%d = psp_cpu.v[%d];", k, T[k]);
+    if (homogeneous) fprintf(f, " const float _i%d = 1.0f;", order - 1);
+    for (int i = 0; i < order; i++) {
+        fprintf(f, " const float _o%d = 0.0f", i);
+        for (int k = 0; k < order; k++) fprintf(f, " + psp_cpu.v[%d] * _i%d", cols[i][k], k);
+        fprintf(f, ";");
+    }
+    for (int i = 0; i < order; i++) fprintf(f, " psp_cpu.v[%d] = _o%d;", D[i], i);
+    fprintf(f, " if (psp_vfpu_pfx_any) psp_vfpu_consume(); }\n");
+}
+
+/* lv.s / lv.q / sv.s / sv.q: no prefixes involved. src/vfpu.c psp_lv_q etc. */
+static void emit_vfpu_mem(FILE *f, const char *ind, const a_insn *in, const char *rs, int quad, int store) {
+    int R[4];
+    vfpu_lanes(in->vt, quad ? 4 : 1, R);
+    fprintf(f, "%s{ const uint32_t _ad = (uint32_t)(%s + %d) & %s;", ind, rs, in->imm & ~3, quad ? "~15u" : "~3u");
+    for (int i = 0; i < (quad ? 4 : 1); i++) {
+        if (store) fprintf(f, " psp_write_f32(_ad + %du, psp_cpu.v[%d]);", i * 4, R[i]);
+        else       fprintf(f, " psp_cpu.v[%d] = psp_read_f32(_ad + %du);", R[i], i * 4);
+    }
+    fprintf(f, " }\n");
+}
+
 static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     FILE *f = c->out;
     const char *rd = RN[in->rd], *rs = RN[in->rs], *rt = RN[in->rt];
@@ -447,36 +573,42 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     /* --- VFPU: the subset with a real implementation. Everything else in the
        vector unit still falls through to a trap below, which is deliberate --
        see include/psprecomp/vfpu.h. --- */
-    case A_LV_S:
-        fprintf(f, "%spsp_lv_s(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
-    case A_LV_Q:
-        fprintf(f, "%spsp_lv_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
-    case A_SV_S:
-        fprintf(f, "%spsp_sv_s(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
-    case A_SV_Q:
-        fprintf(f, "%spsp_sv_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_LV_S: emit_vfpu_mem(f, ind, in, rs, 0, 0); return;
+    case A_LV_Q: emit_vfpu_mem(f, ind, in, rs, 1, 0); return;
+    case A_SV_S: emit_vfpu_mem(f, ind, in, rs, 0, 1); return;
+    case A_SV_Q: emit_vfpu_mem(f, ind, in, rs, 1, 1); return;
 
     case A_VADD:
+        if (emit_vfpu_bin(f, ind, in, VB_ADD, "psp_vadd")) return;
         fprintf(f, "%spsp_vadd(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VSUB:
+        if (emit_vfpu_bin(f, ind, in, VB_SUB, "psp_vsub")) return;
         fprintf(f, "%spsp_vsub(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VMUL:
+        if (emit_vfpu_bin(f, ind, in, VB_MUL, "psp_vmul")) return;
         fprintf(f, "%spsp_vmul(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VDIV:
+        if (emit_vfpu_bin(f, ind, in, VB_DIV, "psp_vdiv")) return;
         fprintf(f, "%spsp_vdiv(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VMIN:
+        if (emit_vfpu_bin(f, ind, in, VB_MIN, "psp_vmin")) return;
         fprintf(f, "%spsp_vmin(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VMAX:
+        if (emit_vfpu_bin(f, ind, in, VB_MAX, "psp_vmax")) return;
         fprintf(f, "%spsp_vmax(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VDOT:
+        if (emit_vfpu_bin(f, ind, in, VB_DOT, "psp_vdot")) return;
         fprintf(f, "%spsp_vdot(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VSCL:
+        if (emit_vfpu_bin(f, ind, in, VB_SCL, "psp_vscl")) return;
         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VCMP:
         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
     case A_VSGE:
+        if (emit_vfpu_bin(f, ind, in, VB_SGE, "psp_vsge")) return;
         fprintf(f, "%spsp_vsge(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VSLT:
+        if (emit_vfpu_bin(f, ind, in, VB_SLT, "psp_vslt")) return;
         fprintf(f, "%spsp_vslt(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VCRS:
         fprintf(f, "%spsp_vcrs(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
@@ -538,6 +670,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         };
         for (size_t k = 0; k < sizeof U / sizeof U[0]; k++) {
             if (U[k].op != in->op) continue;
+            if (in->op >= A_VMOV && in->op <= A_VONE && emit_vfpu_unary(f, ind, in, U[k].sel)) return;
             fprintf(f, "%spsp_vunary(%s, %u, %u, %u);\n",
                     ind, U[k].sel, in->vd, in->vs, in->vsize);
             return;
@@ -581,9 +714,9 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VTFM2: case A_VTFM3: case A_VTFM4: {
         const unsigned order = 2u + (unsigned)(in->op - A_VTFM2);
         if (in->vsize == order)
-            fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, order);
+            emit_vfpu_tfm(f, ind, in, (int)order, 0);
         else if (in->vsize + 1 == order)
-            fprintf(f, "%spsp_vhtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, order);
+            emit_vfpu_tfm(f, ind, in, (int)order, 1);
         else
             break;
         return;

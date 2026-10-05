@@ -32,6 +32,9 @@
 
 static uint32_t g_prefix[3];      /* vpfxs, vpfxt, vpfxd */
 static int      g_prefix_set[3];
+/* Nonzero while any prefix is pending: generated code tests this one word
+ * and inlines the operation when it is clear (see emit.c, "inline VFPU"). */
+int psp_vfpu_pfx_any;
 static uint64_t g_traps;
 
 static void build_tabs(void);
@@ -42,6 +45,7 @@ void psp_vfpu_reset(void) {
     if (!g_tabs_ready) build_tabs();
     memset(g_prefix, 0, sizeof g_prefix);
     memset(g_prefix_set, 0, sizeof g_prefix_set);
+    psp_vfpu_pfx_any = 0;
     g_traps = 0;
 }
 
@@ -55,6 +59,7 @@ void psp_vfpu_set_prefix(int which, uint32_t value) {
     if (which < 0 || which > 2) return;
     g_prefix[which] = value & 0xFFFFFu;
     g_prefix_set[which] = 1;
+    psp_vfpu_pfx_any = 1;
     if (which < 2) {
         const uint32_t p = g_prefix[which];
         src_pfx *d = &g_spfx[which];
@@ -85,7 +90,8 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
     g_traps++;
 }
 
-static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
+static void consume(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); psp_vfpu_pfx_any = 0; }
+void psp_vfpu_consume(void) { consume(); }
 
 /* ---- register addressing ------------------------------------------------- */
 
