@@ -19,7 +19,7 @@
  *     applied to the emulated blocking. PSP2i's socket crypto options
  *     (0x1000 / 0x2000, and the MSG_CRYPT send flags) are accepted and
  *     ignored: both ends are this runtime, and the traffic is plain.
- *   - connect() to 0.0.0.0 goes to the local host, as on the PSP's BSD
+ *   - connect() to 0.0.0.0 goes to this host's own address, as on the PSP's BSD
  *     stack (Windows refuses it): a room owner connecting to its own room.
  *   - The PSP's player-to-player socket types -- 6 (connection-oriented
  *     datagram), 7 (DCCP, the P2P "master") and 10 (packet: a TCP-like
@@ -324,6 +324,16 @@ static void hle_Accept(void) {
     }
 }
 
+/* The PSP's BSD stack sends a connection to 0.0.0.0 to this host's own
+ * address -- the IP the game was given (sceNetApctlGetInfo), not loopback.
+ * It matters: a game server running on this PSP sees its own player arrive
+ * from the PSP's address (PSP2i hosted sessions). Loopback if unknown. */
+static uint32_t this_host_addr(void) {
+    psp_net_host h;
+    if (psp_net_host_info(&h) && h.ipv4) return htonl(h.ipv4);
+    return htonl(INADDR_LOOPBACK);
+}
+
 static void hle_Connect(void) {
     const uint32_t fd = psp_arg(0), a = psp_arg(1), len = psp_arg(2);
     if (!fd_ok(fd)) { psp_ret(bad_fd(fd, __func__)); return; }
@@ -331,7 +341,7 @@ static void hle_Connect(void) {
     if (read_addr(a, len, &sa)) { psp_ret(fail(P_EINVAL)); return; }
     char t[32];
     const int any = sa.sin_addr.s_addr == htonl(INADDR_ANY);
-    if (any) sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);          /* BSD: 0.0.0.0 is this host */
+    if (any) sa.sin_addr.s_addr = this_host_addr();                /* BSD: 0.0.0.0 is this host */
     if (connect(g_fd[fd].s, (struct sockaddr *)&sa, sizeof sa) == 0) {
         psp_net_log_line("socket %u: connected to %s%s", fd, addr_text(&sa, t, sizeof t), any ? " (0.0.0.0 = this host)" : "");
         psp_ret(ok(0));
@@ -462,7 +472,7 @@ static void hle_Sendto(void) {
     const uint32_t fd = psp_arg(0), buf = psp_arg(1), len = psp_arg(2), flags = psp_arg(3), to = psp_arg(4), tolen = psp_arg(5);
     struct sockaddr_in sa;
     if (to && read_addr(to, tolen, &sa)) { psp_ret(fail(P_EINVAL)); return; }
-    if (to && sa.sin_addr.s_addr == htonl(INADDR_ANY)) sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (to && sa.sin_addr.s_addr == htonl(INADDR_ANY)) sa.sin_addr.s_addr = this_host_addr();
     psp_ret(do_send(fd, buf, len, flags, to ? &sa : NULL));
 }
 
