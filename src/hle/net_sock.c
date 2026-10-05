@@ -397,6 +397,20 @@ static void log_data(uint32_t fd, const char *dir, const uint8_t *p, int n) {
     for (int i = 0; i < k; i++) snprintf(hex + 3 * i, 4, "%02x ", p[i]);
     hex[3 * k] = '\0';
     psp_net_log_line("socket %u: %s %d bytes: %s%s", fd, dir, n, hex, n > k ? "..." : "");
+    /* PSP2I_NET_DUMP=1: every sent message in full (both ends are usually this
+     * runtime, so sends alone cover the traffic), 64 bytes a line, up to 8 MB. */
+    static int dump = -1;
+    static size_t dumped;
+    if (dump < 0) { const char *e = getenv("PSP2I_NET_DUMP"); dump = e && *e == '1'; }
+    if (!dump || dir[0] != 's' || n <= k || dumped > (8u << 20)) return;
+    dumped += (size_t)n;
+    for (int o = 0; o < n; o += 64) {
+        char line[3 * 64 + 1];
+        const int m = n - o < 64 ? n - o : 64;
+        for (int i = 0; i < m; i++) snprintf(line + 3 * i, 4, "%02x ", p[o + i]);
+        line[3 * m] = '\0';
+        psp_net_log_line("socket %u:   +%04X %s", fd, o, line);
+    }
 }
 
 /* send / sendto */
