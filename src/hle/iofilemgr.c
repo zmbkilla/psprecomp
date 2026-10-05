@@ -123,6 +123,11 @@ static void load_lba_map(void) {
     fclose(f);
 }
 
+/* Optional separate folder for the memory stick (ms0:), e.g. a test copy of
+ * the saves; empty = <root>/ms. */
+static char g_ms_root[512];
+void psp_io_set_ms_root(const char *dir) { snprintf(g_ms_root, sizeof g_ms_root, "%s", dir ? dir : ""); }
+
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
     load_lba_map();
@@ -200,6 +205,7 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "host0:", 6))  { p += 6; sub = "host"; }
 
     while (*p == '/' || *p == '\\') p++;
+    if (g_ms_root[0] && !strcmp(sub, "ms")) { snprintf(out, cap, "%s/%s", g_ms_root, p); return; }
     snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
 }
 

@@ -129,6 +129,11 @@ uint32_t psp_mfv(uint32_t reg);
  * arithmetic instruction. */
 void psp_vfpu_set_prefix(int which, uint32_t value);
 int  psp_vfpu_prefix_pending(void);
+/* For generated code: nonzero while a prefix is pending (then the runtime
+ * call is used); psp_vfpu_consume() drops pending prefixes, as an operation
+ * that takes none (vtfm, vhtfm) does. */
+extern int psp_vfpu_pfx_any;
+void psp_vfpu_consume(void);
 void psp_vfpu_reset(void);
 
 /* Reports an instruction the VFPU cannot yet execute, by address and name. */
