@@ -302,7 +302,7 @@ static void emit_vfpu_tfm(FILE *f, const char *ind, const a_insn *in, int order,
     const int vn = homogeneous ? order - 1 : order;
     vfpu_lanes(in->vt, vn, T);
     vfpu_lanes(in->vd, order, D);
-    fprintf(f, "%s{", ind);
+    fprintf(f, "%sif (!psp_vfpu_pfx_any) {", ind);
     for (int k = 0; k < vn; k++) fprintf(f, " const float _i%d = psp_cpu.v[%d];", k, T[k]);
     if (homogeneous) fprintf(f, " const float _i%d = 1.0f;", order - 1);
     for (int i = 0; i < order; i++) {
@@ -311,7 +311,8 @@ static void emit_vfpu_tfm(FILE *f, const char *ind, const a_insn *in, int order,
         fprintf(f, ";");
     }
     for (int i = 0; i < order; i++) fprintf(f, " psp_cpu.v[%d] = _o%d;", D[i], i);
-    fprintf(f, " if (psp_vfpu_pfx_any) psp_vfpu_consume(); }\n");
+    /* With a prefix pending (which vtfm ignores and drops) the runtime call does the same. */
+    fprintf(f, " } else psp_%s(%u, %u, %u, %d);\n", homogeneous ? "vhtfm" : "vtfm", in->vd, in->vs, in->vt, order);
 }
 
 /* lv.s / lv.q / sv.s / sv.q: no prefixes involved. src/vfpu.c psp_lv_q etc. */
