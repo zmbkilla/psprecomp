@@ -44,6 +44,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/net.h"
+#include "p2p.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -223,6 +224,7 @@ void psp_np2_poll(void) {
     g_polls++;
     const psp_np_backend *be = psp_np_backend_get();
     if (g_inited && be && be->m2_poll) be->m2_poll();
+    p2p_pump();
     int k = 0;
     for (int i = 0; i < g_npending; i++) {
         if ((int)(g_polls - g_pending[i].due) >= 0 && now_ms() >= g_pending[i].due_ms)
@@ -453,16 +455,57 @@ static void hle_RegisterSignalingCallback(void) {
     psp_ret(M2_OK);
 }
 
-/* (ctx, self?, roomId lo, roomId hi, memberId, int *connStatus, inaddr *, u16 *port)
- * No peer connections are made yet: every peer reports inactive (0). */
+/* The game's signaling callback, as np_matching2.prx calls it (PSP2i 0x08CB35FC):
+ * cb(ctxId, ctx pointer, roomId lo, roomId hi, peerMemberId, event, errorCode, cbArg).
+ * Events from p2p.c: Dead 0x5101, Established 0x5102, PeerActivated 0x5104,
+ * PeerDeactivated 0x5105, MutualActivated 0x5106. */
+void psp_np2_signaling_event(uint64_t room, uint16_t member, uint16_t event, uint32_t error) {
+    int c = 0;
+    for (int i = 1; i <= MAX_CTX; i++) if (g_ctx[i].used && g_ctx[i].sig_cb) { c = i; break; }
+    m2_log("-> signaling event 0x%04X (room 0x%016llX, member %u, error 0x%08X) to callback 0x%08X",
+           event, (unsigned long long)room, member, error, c ? g_ctx[c].sig_cb : 0);
+    if (!c) return;
+    const uint32_t a[8] = { (uint32_t)c, 0, (uint32_t)room, (uint32_t)(room >> 32), member, event, error, g_ctx[c].sig_arg };
+    queue_call(g_ctx[c].sig_cb, a);
+}
+
+#define M2_SIGNALING_ERROR_PEER_NOT_FOUND 0x80550E19u   /* SCE_NP_MATCHING2_SIGNALING_ERROR_MATCHING2_PEER_NOT_FOUND */
+#define SIGNALING_ERROR_CONN_NOT_FOUND    0x8002A80Eu   /* SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND */
+
+/* (ctx, self, roomId lo, roomId hi, peerMemberId, int *connStatus, inaddr *, u16 *port)
+ * connStatus 0 inactive, 1 pending, 2 active (then the peer's address and
+ * port, network order) -- p2p.c's signaling, answered as the reference does. */
 static void hle_SignalingGetConnectionStatus(void) {
     const uint32_t ctx = psp_arg(0), status = psp_arg(5), ip = psp_arg(6), port = psp_arg(7);
-    m2_log("SignalingGetConnectionStatus(ctx %u, room %08X%08X, member %u) -> inactive", ctx, psp_arg(3), psp_arg(2), psp_arg(4));
+    const uint64_t room = (uint64_t)psp_arg(2) | (uint64_t)psp_arg(3) << 32;
+    const uint16_t member = (uint16_t)psp_arg(4);
     if (!g_inited) { psp_ret(M2_ERROR_NOT_INITIALIZED); return; }
     if (!ctx_ok(ctx)) { psp_ret(M2_ERROR_CONTEXT_NOT_FOUND); return; }
-    if (status) psp_write32(status, 0);
-    if (ip) psp_write32(ip, 0);
-    if (port) psp_write16(port, 0);
+    if (!status || !ip || !port) { psp_ret(M2_ERROR_INVALID_ARGUMENT); return; }
+    psp_write32(status, 0);
+    uint32_t ip_n = 0;
+    uint16_t port_h = 0;
+    const int st = p2p_conn_status(room, member, &ip_n, &port_h);
+    if (st == -1) {
+        m2_log("SignalingGetConnectionStatus(room 0x%016llX, member %u): no such member", (unsigned long long)room, member);
+        psp_ret(M2_SIGNALING_ERROR_PEER_NOT_FOUND);
+        return;
+    }
+    if (st == -2) {
+        m2_log("SignalingGetConnectionStatus(room 0x%016llX, member %u): no connection", (unsigned long long)room, member);
+        psp_ret(SIGNALING_ERROR_CONN_NOT_FOUND);
+        return;
+    }
+    psp_write32(status, (uint32_t)st);
+    if (st == 2) {
+        psp_mem_write_block(ip, &ip_n, 4);
+        psp_write8(port, (uint8_t)(port_h >> 8));       /* network order */
+        psp_write8(port + 1, (uint8_t)port_h);
+    }
+    const uint8_t *b = (const uint8_t *)&ip_n;
+    if (st == 2) m2_log("SignalingGetConnectionStatus(room 0x%016llX, member %u) -> active at %u.%u.%u.%u:%u",
+                        (unsigned long long)room, member, b[0], b[1], b[2], b[3], port_h);
+    else m2_log("SignalingGetConnectionStatus(room 0x%016llX, member %u) -> pending", (unsigned long long)room, member);
     psp_ret(M2_OK);
 }
 

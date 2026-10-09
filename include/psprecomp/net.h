@@ -106,6 +106,25 @@ uint32_t psp_np2_alloc(uint32_t size);   /* zeroed guest memory for event data (
 /* Deliver backend results (ticket callbacks) to the game: call once per vblank. */
 void psp_np_poll(void);
 
+/* ---- player-to-player (src/hle/p2p.c) ----------------------------------------------
+ * Other players are reached through UDP port 3658 after NP signaling, as on a
+ * PSP; the matching backend supplies what the matching server says (game
+ * thread only; IPv4 addresses in host byte order, ports host order). */
+/* After sign-in: the matching server's UDP address check (RPCN: its address,
+ * port 3657), the account's user ID and online ID. Opens UDP port 3658. */
+void psp_p2p_start(uint32_t server_ipv4, uint16_t server_udp_port, int64_t user_id, const char *npid);
+void psp_p2p_stop(void);
+/* A room member's online ID (from room data and join notifications). */
+void psp_p2p_room_member(uint64_t room, uint16_t member, const char *npid);
+/* Connect to a member at the address the matching server gave (JoinRoom's
+ * signaling data, a member-joined notification). */
+void psp_p2p_connect(uint64_t room, uint16_t member, uint32_t ipv4, uint16_t port);
+/* The server asks us to open the path to a user (RPCN SignalingHelper). */
+void psp_p2p_info(const char *npid, uint32_t ipv4, uint16_t port);
+void psp_p2p_member_left(uint64_t room, uint16_t member);
+/* We left the room, or it was destroyed: end its connections. */
+void psp_p2p_room_closed(uint64_t room);
+
 void psp_net_register(void);
 void psp_http_register(void);
 void psp_np_register(void);
