@@ -28,6 +28,7 @@ typedef struct {
     const uint32_t *hooks; /* functions with a run-time hook (emit_opts) */
     int nhooks;
     int *scc;              /* per function index: tail-call cycle id, 0 = none (see compute_tail_cycles) */
+    int has_entry_switch;  /* the current body re-enters its entry switch on a computed jump */
 } ectx;
 
 static void entry_push(ectx *c, uint32_t a) {
@@ -1063,14 +1064,29 @@ static void emit_function(ectx *c, const a_func *fn) {
     for (uint32_t a = fn->start; a < fn->end; a += 4)
         if (owned_by(an, a, owner) && c->is_label[widx(an, a)]) nlabels++;
 
-    if (nlabels > 1 || fn->start != fn->addr) {
+    int computed_jumps = 0;                          /* `jr $rN` other than $ra */
+    for (uint32_t a = fn->start; a < fn->end; a += 4) {
+        if (!owned_by(an, a, owner)) continue;
+        a_insn ji;
+        a_decode(fetch(an, a), a, &ji);
+        if (ji.is_indirect && !ji.is_call && !ji.is_return) computed_jumps++;
+    }
+    const int has_switch = nlabels > 1 || fn->start != fn->addr;
+    c->has_entry_switch = has_switch && computed_jumps;
+    if (has_switch) {
+        /* A computed jump (`jr $rN`) into this function comes back here (see
+         * the jr case): a jump table in a loop would otherwise nest a call per
+         * pass and overflow the host stack. _jump marks such a re-entry, so an
+         * address that is not one of these labels still goes to dispatch. */
+        if (c->has_entry_switch) fprintf(f, "    int _jump = 0;\nL_entry_switch:\n");
         fprintf(f, "    switch (_entry) {\n");
         for (uint32_t a = fn->start; a < fn->end; a += 4) {
             if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
             if (c->is_slot[widx(an, a)]) continue;   /* only the inline copy is real */
             fprintf(f, "    case 0x%08Xu: goto L_%08X;\n", a, a);
         }
-        fprintf(f, "    default: break;\n");
+        if (c->has_entry_switch) fprintf(f, "    default: if (_jump) { psp_dispatch(_entry); return; } break;\n");
+        else fprintf(f, "    default: break;\n");
         fprintf(f, "    }\n");
     }
 
@@ -1252,8 +1268,16 @@ static void emit_function(ectx *c, const a_func *fn) {
         }
 
         if (in.is_indirect) {                    /* jr $rN — computed jump */
+            /* The jump reads rs before its delay slot runs. */
+            fprintf(f, "    { uint32_t _jt = %s;\n", RN[in.rs]);
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
-            fprintf(f, "    psp_dispatch(%s);\n    return;\n", RN[in.rs]);
+            /* Into this function (a jump table): back through the entry switch --
+             * a jump, not a nested call, so a switch in a loop keeps the host
+             * stack flat. Elsewhere: dispatch. */
+            if (c->has_entry_switch)
+                fprintf(f, "    if (_jt - 0x%08Xu < 0x%Xu) { _entry = _jt; _jump = 1; PSP_LOOP(_jt); goto L_entry_switch; }\n",
+                        fn->start, fn->end - fn->start);
+            fprintf(f, "    psp_dispatch(_jt);\n    return; }\n");
             if (have_slot && c->is_label[widx(an, a + 4)] && !slot.is_branch) emit_slot_alias(c, a, &slot, 0);
             a += 4;
             continue;
