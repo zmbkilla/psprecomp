@@ -28,6 +28,11 @@ add_executable(test_emit test_emit.c)
 target_link_libraries(test_emit PRIVATE allegrex_core)
 add_test(NAME emit COMMAND test_emit)
 
+add_executable(test_p2p test_p2p.c)
+target_link_libraries(test_p2p PRIVATE psprecomp allegrex_core)
+target_include_directories(test_p2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/hle)
+add_test(NAME p2p COMMAND test_p2p)
+
 add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
