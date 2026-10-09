@@ -206,6 +206,7 @@ static int      g_meta_up;                      /* TCP connected, login queued *
 static buf_t    g_meta_in, g_meta_out;
 static uint64_t g_last_ping, g_meta_retry, g_meta_rx;
 static int      g_in_group;                     /* a CONNECT {group} stands: re-sent after a reconnect */
+static int      g_srv_group;                    /* the server has us in a group (this connection) */
 static int      g_rejoining;                    /* reconnected; the next CONNECT_BSSID is not a new event */
 static uint64_t g_meta_lost_at;                 /* the connection dropped (0 = fine) */
 
@@ -298,6 +299,7 @@ static void meta_open(void) {
     /* login: opcode, MAC, nickname[128], product code[9] */
     uint8_t p[1 + 6 + 128 + 9];
     memset(p, 0, sizeof p);
+    g_srv_group = 0;                                    /* a fresh login is in no group */
     p[0] = OP_LOGIN;
     adhoc_local_mac(p + 1);
     memcpy(p + 7, g_nick, strlen(g_nick) < 127 ? strlen(g_nick) : 127);
@@ -310,9 +312,32 @@ static void meta_open(void) {
         c[0] = OP_CONNECT;
         memcpy(c + 1, g_group, 8);
         meta_send(c, sizeof c);
+        g_srv_group = 1;
         if (g_meta_lost_at) { g_rejoining = 1; adhoc_log("rejoining group %.8s after the reconnect", (const char *)g_group); }
     }
     META_UNLOCK();
+}
+
+/* Group packets, sent the way the server accepts them. PPSSPP's server logs a
+ * player out for DISCONNECT outside a group and for SCAN inside one; and
+ * meta_open empties the send queue, so it must come before what is queued. */
+static void srv_disconnect(void) {
+    if (g_srv_group && g_meta != BAD_SOCK) { const uint8_t op = OP_DISCONNECT; meta_send(&op, 1); }
+    g_srv_group = 0;
+}
+static void srv_connect(const uint8_t name[8]) {
+    if (g_meta == BAD_SOCK) { meta_open(); return; }    /* sends the CONNECT after the login (g_in_group) */
+    uint8_t p[9];
+    p[0] = OP_CONNECT;
+    memcpy(p + 1, name, 8);
+    meta_send(p, sizeof p);
+    g_srv_group = 1;
+}
+static void srv_scan(void) {
+    if (g_meta == BAD_SOCK) meta_open();
+    else srv_disconnect();
+    const uint8_t op = OP_SCAN;
+    meta_send(&op, 1);
 }
 
 static int friend_find(const uint8_t mac[6]) {
@@ -545,12 +570,17 @@ typedef struct {
     /* modern (adhoc_mesh.c) */
     int mesh, sid;
     uint64_t tx, rx;                     /* game bytes, for the log */
+    /* relay: a connect the game gave up on, kept for its retry (see hle_PtpClose) */
+    int parked;
+    uint64_t parked_at;
+    /* relay / modern: a connection to ourselves, paired in-process (see local_connect) */
+    int local, lpeer, lwant;
 } asock;
 
 static asock g_s[MAX_SOCK];
 
 static asock *sock_get(uint32_t id, int type) {
-    if (id < 1 || id > MAX_SOCK || !g_s[id - 1].used) return NULL;
+    if (id < 1 || id > MAX_SOCK || !g_s[id - 1].used || g_s[id - 1].parked) return NULL;
     if (type && g_s[id - 1].type != type) return NULL;
     return &g_s[id - 1];
 }
@@ -602,12 +632,16 @@ static int relay_io(asock *a) {
     if (!a->relay || a->s == BAD_SOCK) return 0;       /* not opened yet */
     if (a->rdead) return -1;
     if (a->rconnecting) {
+        /* The relay can be slow to accept: socom.cc's 27313 took 2-15 s per TCP
+         * connect from the user's network (its 27312 ~0.2 s, ping 200 ms). */
         if (!sock_ready(a->s, 1)) {
-            if (adhoc_real_us() - a->rstart > 8000000u) { a->rdead = 1; return -1; }
+            if (adhoc_real_us() - a->rstart > 20000000u) { adhoc_log("relay: no TCP connection after 20 s"); a->rdead = 1; return -1; }
             return 0;
         }
         if (sock_error(a->s)) { a->rdead = 1; return -1; }
         a->rconnecting = 0;
+        const double took = (double)(adhoc_real_us() - a->rstart) / 1e6;
+        if (took > 1.0) adhoc_log("relay: socket %d took %.1f s to reach the relay (a slow relay; a nearer server helps)", (int)(a - g_s) + 1, took);
     }
     while (a->rout.len) {
         const int n = send(a->s, (const char *)a->rout.p, (int)a->rout.len, 0);
@@ -650,7 +684,75 @@ static int relay_io(asock *a) {
 }
 
 static void sockets_pump(void) {
-    for (int i = 0; i < MAX_SOCK; i++) if (g_s[i].used && g_s[i].relay) relay_io(&g_s[i]);
+    const uint64_t now = adhoc_real_us();
+    for (int i = 0; i < MAX_SOCK; i++) {
+        asock *a = &g_s[i];
+        if (!a->used || !a->relay) continue;
+        relay_io(a);
+        /* a kept connect nobody came back for */
+        if (a->parked && (a->rdead || now - a->parked_at > (a->state == PTP_ESTABLISHED ? 10000000u : 30000000u))) {
+            adhoc_log("ptp %d: dropping the kept relay connect (%s)", i + 1, a->rdead ? "the relay closed it" : "not retried");
+            if (a->s != BAD_SOCK) close_sock(a->s);
+            buf_free(&a->rin); buf_free(&a->rout); buf_free(&a->stream);
+            memset(a, 0, sizeof *a);
+            a->s = BAD_SOCK;
+        }
+    }
+}
+
+/* ---- connections to ourselves ------------------------------------------------------------------
+ * PSP2i's host connects to its own listening ports (13009, 12000). Through the
+ * relay that is a round trip to the server per connection -- observed taking up
+ * to 13 s before the room was ready. In relay and modern modes a connection to
+ * our own MAC is paired in-process instead: data goes straight into the other
+ * socket's stream. (Direct mode uses a real TCP connection to our address.) */
+
+static asock *local_peer(asock *a) {
+    if (!a->local || a->lpeer < 1 || a->lpeer > MAX_SOCK) return NULL;
+    asock *p = &g_s[a->lpeer - 1];
+    return p->used && !p->parked && p->local && p->lpeer == (int)(a - g_s) + 1 ? p : NULL;
+}
+
+/* 0 = connected, 1 = waiting for an accept, else an error. */
+static uint32_t local_connect(asock *a) {
+    if (a->local) return local_peer(a) ? 0 : ADHOC_CONNECTION_REFUSED;
+    for (int i = 0; i < MAX_SOCK; i++) {
+        const asock *l = &g_s[i];
+        if (l->used && !l->parked && l->type == SOCK_PTP && l->state == PTP_LISTEN && l->lport == a->pport) {
+            a->lwant = i + 1;                      /* the listener's accept completes it */
+            a->state = PTP_SYN_SENT;
+            return 1;
+        }
+    }
+    a->lwant = 0;
+    return 1;                                       /* nobody listens there yet: the game retries */
+}
+
+/* A waiting connect to listener l: the accepted socket's id, or 0. */
+static int local_accept(asock *l, uint8_t mac[6], uint16_t *port) {
+    const int lid = (int)(l - g_s) + 1;
+    for (int i = 0; i < MAX_SOCK; i++) {
+        asock *c = &g_s[i];
+        if (!c->used || c->parked || c->lwant != lid || c->local) continue;
+        const int id = sock_new();
+        if (!id) return (int)NET_NO_SPACE;
+        asock *a = &g_s[id - 1];
+        a->used = 1; a->type = SOCK_PTP; a->nonblock = l->nonblock; a->bufsize = l->bufsize;
+        a->retry_int = l->retry_int; a->retry_cnt = l->retry_cnt;
+        memcpy(a->laddr, l->laddr, 6);
+        a->lport = l->lport;
+        memcpy(a->paddr, c->laddr, 6);
+        a->pport = c->lport;
+        a->state = PTP_ESTABLISHED;
+        a->local = 1; a->lpeer = i + 1;
+        c->local = 1; c->lpeer = id; c->lwant = 0;
+        c->state = PTP_ESTABLISHED;
+        memcpy(mac, a->paddr, 6);
+        *port = a->pport;
+        adhoc_log("ptp %d: accepted our own connection from port %u as %d (in-process)", lid, a->pport, id);
+        return id;
+    }
+    return 0;
 }
 
 /* ---- the pump --------------------------------------------------------------------------------- */
@@ -741,11 +843,8 @@ static void hle_CtlInit(void) {
 static void ctl_disconnect(void) {
     g_in_group = 0;
     g_rejoining = 0;
-    if (g_state != ST_DISCONNECTED) {
-        const uint8_t op = OP_DISCONNECT;
-        meta_send(&op, 1);
-        memset(g_group, 0, sizeof g_group);
-    }
+    srv_disconnect();
+    memset(g_group, 0, sizeof g_group);
     for (int i = 0; i < MAX_FRIENDS; i++) g_friends[i].last_recv = 0;
     g_cur_mode = -1;
     notify(EV_DISCONNECT, 0);
@@ -799,13 +898,7 @@ static uint32_t ctl_create(const uint8_t name[8], int type) {
     g_ctl_start = adhoc_real_us();
     memcpy(g_group, name, 8);
     g_in_group = 1;
-    if (g_meta == BAD_SOCK) meta_open();               /* sends the CONNECT after the login */
-    else {
-        uint8_t p[9];
-        p[0] = OP_CONNECT;
-        memcpy(p + 1, name, 8);
-        meta_send(p, sizeof p);
-    }
+    srv_connect(name);
     adhoc_log("%s group %.8s", type == CONN_JOIN ? "joining" : type == CONN_CREATE ? "creating" : "connecting to", (const char *)name);
     meta_pump();
     return 0;
@@ -836,9 +929,7 @@ static void hle_CtlScan(void) {
     g_state = ST_SCANNING;
     g_cur_mode = 0;
     g_nnew_groups = 0;
-    const uint8_t op = OP_SCAN;
-    meta_send(&op, 1);
-    if (g_meta == BAD_SOCK) meta_open();
+    srv_scan();
     psp_ret(0);
 }
 
@@ -1217,6 +1308,7 @@ static void hle_PdpDelete(void) {
 }
 
 static uint32_t avail_to_recv(asock *a) {
+    if (a->local) return a->stream.len;
     if (a->mesh) {
         if (a->type == SOCK_PDP) return mesh_pdp_avail(a->lport);
         return a->sid ? mesh_stream_avail(a->sid) : 0;
@@ -1279,7 +1371,7 @@ static void hle_SetSocketAlert(void) {
 static int ptp_port_in_use(uint16_t port, int listen, const uint8_t *dmac, uint16_t dport) {
     for (int i = 0; i < MAX_SOCK; i++) {
         const asock *a = &g_s[i];
-        if (!a->used || a->type != SOCK_PTP || a->lport != port) continue;
+        if (!a->used || a->parked || a->type != SOCK_PTP || a->lport != port) continue;
         if (listen && a->state == PTP_LISTEN) return 1;
         if (!listen && a->state != PTP_LISTEN && dmac && !memcmp(a->paddr, dmac, 6) && a->pport == dport) return 1;
     }
@@ -1289,6 +1381,7 @@ static int ptp_port_in_use(uint16_t port, int listen, const uint8_t *dmac, uint1
 /* A non-blocking connect attempt. 0 = established, 1 = in progress, else an error. */
 static uint32_t ptp_connect_try(asock *a) {
     if (a->state == PTP_ESTABLISHED) return 0;
+    if ((g_relay || g_mesh) && adhoc_is_local_mac(a->paddr)) return local_connect(a);
     if (a->mesh) {
         if (!a->sid) {
             a->sid = mesh_stream_open(a->paddr, a->lport, a->pport);
@@ -1400,6 +1493,22 @@ static void hle_PtpOpen(void) {
     if (g_cur_mode < 0 || !srcmac || !dstmac || is_broadcast(dst) || is_zero(dst)) { psp_ret(ADHOC_INVALID_ADDR); return; }
     if (ptp_port_in_use((uint16_t)sport, 0, dst, (uint16_t)dport)) { psp_ret(ADHOC_PORT_IN_USE); return; }
     if (bufsize <= 0 || rexmt_int <= 0 || rexmt_cnt <= 0) { psp_ret(ADHOC_INVALID_ARG); return; }
+    if (g_relay) {                                      /* the retry of a connect kept by hle_PtpClose */
+        for (int i = 0; i < MAX_SOCK; i++) {
+            asock *k = &g_s[i];
+            if (!k->used || !k->parked || memcmp(k->paddr, dst, 6) || k->pport != (uint16_t)dport) continue;
+            if (sport && k->lport != (uint16_t)sport) continue;
+            k->parked = 0;
+            k->nonblock = flag; k->bufsize = (uint32_t)bufsize; k->retry_int = rexmt_int; k->retry_cnt = rexmt_cnt;
+            k->tx = k->rx = 0;
+            char m[18];
+            adhoc_log("ptp %d: open port %u -> %s:%u (relay), continuing the kept connect (%.1f s so far%s)", i + 1, k->lport,
+                      mac_text(dst, m), k->pport, (double)(adhoc_real_us() - k->rstart) / 1e6,
+                      k->state == PTP_ESTABLISHED ? ", already connected" : "");
+            psp_ret((uint32_t)(i + 1));
+            return;
+        }
+    }
     const int id = sock_new();
     if (!id) { psp_ret(NET_NO_SPACE); return; }
     asock *a = &g_s[id - 1];
@@ -1507,6 +1616,10 @@ static void hle_PtpListen(void) {
 /* One accepted connection, or 0 (none yet), or an error. */
 static int ptp_accept_try(asock *l, uint8_t mac[6], uint16_t *port) {
     const int lid = (int)(l - g_s) + 1;
+    {
+        const int r = local_accept(l, mac, port);
+        if (r) return r;
+    }
     if (l->mesh) {
         mesh_pump();
         uint8_t cmac[6];
@@ -1552,7 +1665,7 @@ static int ptp_accept_try(asock *l, uint8_t mac[6], uint16_t *port) {
         memcpy(a->laddr, l->laddr, 6);
         a->lport = l->lport;
         memcpy(a->paddr, cmac, 6);
-        a->pport = cport;
+        a->pport = (uint16_t)(cport - g_offset);
         a->state = PTP_ESTABLISHED;
         if (relay_open(a, RELAY_PTP_ACCEPT, l->laddr, l->rport, cmac, cport) != 0) { sock_free(a); return 0; }
         a->await_ack = 1;
@@ -1633,7 +1746,21 @@ static void hle_PtpSend(void) {
         if (!data || !lenp || (int)psp_read32(lenp) <= 0) { psp_ret(ADHOC_INVALID_ARG); return; }
         if (a->flags & F_ALERTSEND) { a->alerted |= F_ALERTSEND; psp_ret(ADHOC_SOCKET_ALERTED); return; }
         uint32_t len = psp_read32(lenp);
-        if (a->state == PTP_ESTABLISHED) {
+        if (a->state == PTP_ESTABLISHED && a->local) {
+            asock *p = local_peer(a);
+            if (!p) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
+            if (p->stream.len < 1024 * 1024) {
+                uint8_t *tmp = (uint8_t *)malloc(len);
+                if (!tmp) { psp_ret(NET_NO_SPACE); return; }
+                psp_mem_read_block(tmp, data, len);
+                buf_add(&p->stream, tmp, len);
+                free(tmp);
+                a->tx += len;
+                psp_write32(lenp, len);
+                psp_ret(0);
+                return;
+            }
+        } else if (a->state == PTP_ESTABLISHED) {
             if (a->mesh) {
                 uint8_t *tmp = (uint8_t *)malloc(len);
                 if (!tmp) { psp_ret(NET_NO_SPACE); return; }
@@ -1687,7 +1814,18 @@ static void hle_PtpRecv(void) {
         if (a->state == PTP_SYN_SENT) ptp_connect_try(a);
         if (a->state != PTP_ESTABLISHED && a->state != PTP_SYN_SENT) { psp_ret(ADHOC_NOT_CONNECTED); return; }
         if (a->flags & F_ALERTRECV) { a->alerted |= F_ALERTRECV; psp_ret(ADHOC_SOCKET_ALERTED); return; }
-        if (a->state == PTP_ESTABLISHED) {
+        if (a->state == PTP_ESTABLISHED && a->local) {
+            if (a->stream.len) {
+                const uint32_t n = a->stream.len < cap ? a->stream.len : cap;
+                psp_mem_write_block(buf, a->stream.p, n);
+                buf_drop(&a->stream, n);
+                a->rx += n;
+                psp_write32(lenp, n);
+                psp_ret(0);
+                return;
+            }
+            if (!local_peer(a)) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
+        } else if (a->state == PTP_ESTABLISHED) {
             if (a->mesh) {
                 mesh_pump();
                 uint8_t *tmp = (uint8_t *)malloc(cap);
@@ -1740,6 +1878,19 @@ static void hle_PtpClose(void) {
     if (!g_adhoc_inited) { psp_ret(ADHOC_NOT_INITIALIZED); return; }
     asock *a = sock_get(psp_arg(0), SOCK_PTP);
     if (!a) { psp_ret(ADHOC_INVALID_SOCKET_ID); return; }
+    if (a->relay && a->state == PTP_SYN_SENT && a->await_ack && a->s != BAD_SOCK && !a->rdead) {
+        /* The game's connect timeout (~2 s, made for a LAN) ran out while the
+         * relay was still setting the connection up. Keep it: the game opens a
+         * new socket to the same port right away, and hle_PtpOpen hands it this
+         * one, so the wait carries on instead of starting over. */
+        a->parked = 1;
+        a->parked_at = adhoc_real_us();
+        char m[18];
+        adhoc_log("ptp %u: closed while the relay was still connecting it to %s:%u (%.1f s); kept for the retry",
+                  psp_arg(0), mac_text(a->paddr, m), a->pport, (double)(a->parked_at - a->rstart) / 1e6);
+        psp_ret(0);
+        return;
+    }
     if (a->relay && a->rout.len) relay_io(a);           /* last data out */
     adhoc_log("ptp %u: closed (port %u -> %u; sent %llu, received %llu bytes)", psp_arg(0), a->lport, a->pport, (unsigned long long)a->tx, (unsigned long long)a->rx);
     sock_free(a);
@@ -1753,13 +1904,13 @@ static void hle_GetPtpStat(void) {
     if (!g_adhoc_inited) { psp_ret(ADHOC_NOT_INITIALIZED); return; }
     if (!lenp) { psp_ret(ADHOC_INVALID_ARG); return; }
     int count = 0;
-    for (int i = 0; i < MAX_SOCK; i++) if (g_s[i].used && g_s[i].type == SOCK_PTP) count++;
+    for (int i = 0; i < MAX_SOCK; i++) if (g_s[i].used && !g_s[i].parked && g_s[i].type == SOCK_PTP) count++;
     if (!buf) { psp_write32(lenp, 36u * (uint32_t)count); psp_ret(0); return; }
     const int req = (int)(psp_read32(lenp) / 36u);
     int n = 0;
     for (int i = 0; i < MAX_SOCK && n < req; i++) {
         asock *a = &g_s[i];
-        if (!a->used || a->type != SOCK_PTP) continue;
+        if (!a->used || a->parked || a->type != SOCK_PTP) continue;
         if (a->state == PTP_SYN_SENT) ptp_connect_try(a);
         const uint32_t e = buf + 36u * (uint32_t)n;
         psp_write32(e, 0);
@@ -1769,7 +1920,7 @@ static void hle_GetPtpStat(void) {
         psp_mem_write_block(e + 14, a->paddr, 6);
         psp_write16(e + 20, a->lport);
         psp_write16(e + 22, a->pport);
-        psp_write32(e + 24, a->mesh && a->sid ? mesh_stream_unsent(a->sid) : a->relay ? a->rout.len : 0);
+        psp_write32(e + 24, a->local ? 0 : a->mesh && a->sid ? mesh_stream_unsent(a->sid) : a->relay ? a->rout.len : 0);
         psp_write32(e + 28, a->state == PTP_LISTEN ? 0 : avail_to_recv(a));
         psp_write32(e + 32, (uint32_t)a->state);
         n++;
@@ -1823,8 +1974,7 @@ static void netconf_pump(void) {
     if (g_nc_action == 5) {                             /* join: scan until the group is there */
         if (g_nc_step == 0) {
             g_busy = 1; g_state = ST_SCANNING; g_cur_mode = 0; g_nnew_groups = 0;
-            const uint8_t op = OP_SCAN;
-            meta_send(&op, 1);
+            srv_scan();
             g_nc_step = 1;
             return;
         }

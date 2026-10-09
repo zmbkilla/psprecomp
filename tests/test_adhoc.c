@@ -301,7 +301,43 @@ static void test_relay(hsock ls, hsock rl) {
     pump_ms(100);
     psp_write32(G + 0x3A0, 16);
     CHECK(call("sceNetAdhocPtpRecv", ptp, G + 0x3B0, G + 0x3A0, 0, 1, 0, 0, 0) == 0 && psp_read32(G + 0x3A0) == 2, "relay: ptp recv");
+
+    /* a connection to ourselves is paired in-process, not through the relay */
+    const uint32_t lid = call("sceNetAdhocPtpListen", G + 0x3C0, 7000, 8192, 200000, 5, 2, 0, 0);
+    CHECK((int)lid > 0, "relay: ptp listen 7000");
+    hsock r3 = accept_one(rl);                         /* its listen registration */
+    psp_mem_write_block(G + 0x400, mac, 6);
+    const uint32_t self = call("sceNetAdhocPtpOpen", G + 0x410, 0, G + 0x400, 7000, 8192, 200000, 5, 0);
+    CHECK((int)self > 0, "relay: ptp open to ourselves");
+    CHECK(call("sceNetAdhocPtpConnect", self, 0, 1, 0, 0, 0, 0, 0) == 0x80410709u, "relay: self connect waits for the accept");
+    const uint32_t sacc = call("sceNetAdhocPtpAccept", lid, G + 0x420, G + 0x430, 0, 1, 0, 0, 0);
+    CHECK((int)sacc > 0, "relay: our own connection accepted (0x%08X)", sacc);
+    CHECK(call("sceNetAdhocPtpConnect", self, 0, 1, 0, 0, 0, 0, 0) == 0, "relay: self connect done");
+    psp_mem_write_block(G + 0x440, "me", 2);
+    psp_write32(G + 0x444, 2);
+    CHECK(call("sceNetAdhocPtpSend", self, G + 0x440, G + 0x444, 0, 1, 0, 0, 0) == 0, "relay: send to ourselves");
+    psp_write32(G + 0x448, 16);
+    CHECK(call("sceNetAdhocPtpRecv", sacc, G + 0x450, G + 0x448, 0, 1, 0, 0, 0) == 0 && psp_read32(G + 0x448) == 2 &&
+          psp_read8(G + 0x450) == 'm', "relay: ... arrives at the accepted socket");
+    pump_ms(50);
+    CHECK(!readable(rl, 0), "relay: no relay session for it");
+
+    /* the game gives up on a slow relay connect and retries: the retry continues it */
+    psp_mem_write_block(G + 0x370, BOB, 6);
+    const uint32_t p1 = call("sceNetAdhocPtpOpen", G + 0x380, 0, G + 0x370, 8000, 8192, 200000, 5, 0);
+    hsock r4 = accept_one(rl);
+    CHECK(r4 != (hsock)-1 && read_n(r4, init, 24) == 24 && init[0] == 2, "relay: connect init for port 8000");
+    CHECK(call("sceNetAdhocPtpClose", p1, 0, 0, 0, 0, 0, 0, 0) == 0, "relay: the game closes it before the ack");
+    const uint32_t p2 = call("sceNetAdhocPtpOpen", G + 0x380, 0, G + 0x370, 8000, 8192, 200000, 5, 0);
+    CHECK(p2 == p1, "relay: the retry gets the kept connect (%u, %u)", p1, p2);
+    pump_ms(50);
+    CHECK(!readable(rl, 0), "relay: no second relay session");
+    ack[8] = 18000 & 255; ack[9] = 18000 >> 8;
+    send(r4, (const char *)ack, 10, 0);
+    for (int i = 0; i < 50 && (cr = call("sceNetAdhocPtpConnect", p2, 0, 1, 0, 0, 0, 0, 0)) != 0; i++) pump_ms(10);
+    CHECK(cr == 0, "relay: the retry connects when the ack arrives (0x%08X)", cr);
     C0("sceNetAdhocTerm");
+    close_sock(r3); close_sock(r4);
     close_sock(srv); close_sock(r1); close_sock(r2);
 }
 
@@ -324,6 +360,14 @@ static void test_reconnect(hsock ls) {
     psp_write32(G + 0x130, 9);
     call("sceNetAdhocctlGetState", G + 0x130, 0, 0, 0, 0, 0, 0, 0);
     CHECK(psp_read32(G + 0x130) == 1, "reconnect: still connected to the group");
+    /* PPSSPP's server logs out a player whose DISCONNECT finds it in no group */
+    C0("sceNetAdhocctlDisconnect");
+    C0("sceNetAdhocctlDisconnect");
+    pump_ms(100);
+    uint8_t d[8];
+    int nd = 0;
+    while (readable(s2, 50)) { const int k = recv(s2, (char *)d, sizeof d, 0); if (k <= 0) break; for (int i = 0; i < k; i++) if (d[i] == 3) nd++; }
+    CHECK(nd == 1, "reconnect: two Disconnect calls send one DISCONNECT (%d)", nd);
     C0("sceNetAdhocTerm");
     close_sock(s2);
 }
