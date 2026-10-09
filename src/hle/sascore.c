@@ -450,10 +450,23 @@ static void hle_GetAllEnvelopeHeights(void) {
 
 static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
 
+/* The host's sound-effect volume (psp_sas_set_gain), Q16: 65536 = as the game mixed it. */
+static int32_t g_gain_q16 = 65536;
+void psp_sas_set_gain(float g) {
+    if (g < 0.0f) g = 0.0f;
+    if (g > 1.0f) g = 1.0f;
+    g_gain_q16 = (int32_t)(g * 65536.0f + 0.5f);
+}
+
 static void mix_to_guest(uint32_t out_addr, int add) {
     int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
     uint32_t n = g_grain;
     render(l, r, n);
+    if (g_gain_q16 != 65536)                            /* only this mix: what it is added to keeps its level */
+        for (uint32_t i = 0; i < n; i++) {
+            l[i] = (int32_t)(((int64_t)l[i] * g_gain_q16) >> 16);
+            r[i] = (int32_t)(((int64_t)r[i] * g_gain_q16) >> 16);
+        }
 
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
