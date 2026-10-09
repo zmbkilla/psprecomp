@@ -25,7 +25,7 @@ target_link_libraries(test_kirk PRIVATE allegrex_core)
 add_test(NAME kirk COMMAND test_kirk)
 
 add_executable(test_emit test_emit.c)
-target_link_libraries(test_emit PRIVATE allegrex_core)
+target_link_libraries(test_emit PRIVATE allegrex_core psprecomp)
 add_test(NAME emit COMMAND test_emit)
 
 add_executable(test_p2p test_p2p.c)

@@ -14,6 +14,8 @@
 
 #include "analyze.h"
 #include "emit.h"
+#include "psprecomp/cpu.h"
+#include "psprecomp/vfpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +73,112 @@ static void expect_contains(const char *hay, const char *needle, const char *why
     }
 }
 
+/* ---- prefixes resolved at recompile time ------------------------------------------
+ * The emitter resolves a vpfxs/vpfxt/vpfxd that precedes an operation into a
+ * lane plan (a_vpfx_plan_src/_dst) and prints C from it. Here every plan is
+ * run against the runtime itself -- psp_vfpu_set_prefix + psp_vadd etc. -- for
+ * thousands of random prefixes, registers, sizes and operations, comparing all
+ * 128 vector registers bit for bit. */
+static uint32_t g_rng = 12345u;
+static uint32_t rnd(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng >> 8; }
+
+static float plan_src(const a_vpfx_src *l) {
+    static const float K[8] = { 0.0f, 1.0f, 2.0f, 0.5f, 3.0f, 1.0f / 3.0f, 0.25f, 1.0f / 6.0f };
+    float x;
+    if (l->cst >= 0) x = K[l->cst];
+    else {
+        x = psp_cpu.v[l->reg];
+        if (l->abs) { uint32_t b; memcpy(&b, &x, 4); b &= 0x7FFFFFFFu; memcpy(&x, &b, 4); }
+    }
+    return l->neg ? -x : x;
+}
+
+enum { K_ADD, K_SUB, K_MUL, K_DIV, K_MIN, K_MAX, K_SGE, K_SLT, K_DOT, K_SCL, K_MOV, K_ABS, K_NEG, K_ZERO, K_ONE, K_N };
+
+static void test_prefix_plans(void) {
+    int bad_cases = 0;
+    for (int iter = 0; iter < 20000; iter++) {
+        const int kind = (int)(rnd() % K_N), n = 1 + (int)(rnd() % 4);
+        const unsigned vd = rnd() & 127, vs = rnd() & 127, vt = rnd() & 127;
+        long pf[3];
+        for (int w = 0; w < 3; w++) pf[w] = (rnd() & 1) ? (long)(rnd() & 0xFFFFF) : -1;
+        float start[128];
+        for (int i = 0; i < 128; i++) {
+            const uint32_t r = rnd();
+            start[i] = (r & 7) == 0 ? -0.0f : (float)((int)(r % 2001) - 1000) / 250.0f;
+        }
+        /* the runtime */
+        memcpy(psp_cpu.v, start, sizeof start);
+        psp_vfpu_consume();
+        for (int w = 0; w < 3; w++) if (pf[w] >= 0) psp_vfpu_set_prefix(w, (uint32_t)pf[w]);
+        switch (kind) {
+        case K_ADD: psp_vadd(vd, vs, vt, n); break;
+        case K_SUB: psp_vsub(vd, vs, vt, n); break;
+        case K_MUL: psp_vmul(vd, vs, vt, n); break;
+        case K_DIV: psp_vdiv(vd, vs, vt, n); break;
+        case K_MIN: psp_vmin(vd, vs, vt, n); break;
+        case K_MAX: psp_vmax(vd, vs, vt, n); break;
+        case K_SGE: psp_vsge(vd, vs, vt, n); break;
+        case K_SLT: psp_vslt(vd, vs, vt, n); break;
+        case K_DOT: psp_vdot(vd, vs, vt, n); break;
+        case K_SCL: psp_vscl(vd, vs, vt, n); break;
+        default:    psp_vunary(PSP_VU_MOV + (kind - K_MOV), vd, vs, n); break;
+        }
+        psp_vfpu_consume();
+        float want[128];
+        memcpy(want, psp_cpu.v, sizeof want);
+        /* the plan (what the emitted C computes) */
+        memcpy(psp_cpu.v, start, sizeof start);
+        a_vpfx_src S[4], T[4];
+        a_vpfx_dst D[4];
+        const int unary = kind >= K_MOV, nosrc = kind == K_ZERO || kind == K_ONE;
+        if (!nosrc) a_vpfx_plan_src(vs, n, pf[0], S);
+        if (!unary) a_vpfx_plan_src(vt, kind == K_SCL ? 1 : n, pf[1], T);
+        const int dn = kind == K_DOT ? 1 : n;
+        a_vpfx_plan_dst(vd, dn, pf[2], D);
+        float a[4] = { 0 }, b[4] = { 0 }, r[4] = { 0 };
+        if (!nosrc) for (int i = 0; i < n; i++) a[i] = plan_src(&S[i]);
+        if (!unary) for (int i = 0; i < (kind == K_SCL ? 1 : n); i++) b[i] = plan_src(&T[i]);
+        for (int i = 0; i < dn; i++) {
+            switch (kind) {
+            case K_ADD: r[i] = a[i] + b[i]; break;
+            case K_SUB: r[i] = a[i] - b[i]; break;
+            case K_MUL: r[i] = a[i] * b[i]; break;
+            case K_DIV: r[i] = a[i] / b[i]; break;
+            case K_MIN: r[i] = a[i] < b[i] ? a[i] : b[i]; break;
+            case K_MAX: r[i] = a[i] > b[i] ? a[i] : b[i]; break;
+            case K_SGE: r[i] = a[i] >= b[i] ? 1.0f : 0.0f; break;
+            case K_SLT: r[i] = a[i] < b[i] ? 1.0f : 0.0f; break;
+            case K_DOT: { float sum = 0.0f; for (int k = 0; k < n; k++) sum += a[k] * b[k]; r[i] = sum; break; }
+            case K_SCL: r[i] = a[i] * b[0]; break;
+            case K_MOV: r[i] = a[i]; break;
+            case K_ABS: { uint32_t x; memcpy(&x, &a[i], 4); x &= 0x7FFFFFFFu; memcpy(&r[i], &x, 4); break; }
+            case K_NEG: r[i] = -a[i]; break;
+            case K_ZERO: r[i] = 0.0f; break;
+            default:    r[i] = 1.0f; break;
+            }
+        }
+        for (int i = 0; i < dn; i++) {
+            if (D[i].masked) continue;
+            float x = r[i];
+            if (D[i].sat == 1) x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+            else if (D[i].sat == 3) x = x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
+            psp_cpu.v[D[i].reg] = x;
+        }
+        if (memcmp(want, psp_cpu.v, sizeof want) != 0) {
+            if (bad_cases++ < 5) {
+                int reg = 0;
+                while (reg < 128 && !memcmp(&want[reg], &psp_cpu.v[reg], 4)) reg++;
+                printf("FAIL prefix plan: op %d size %d vd %u vs %u vt %u pfx %lX %lX %lX: v[%d] runtime %g plan %g\n",
+                       kind, n, vd, vs, vt, pf[0], pf[1], pf[2], reg, (double)want[reg], (double)psp_cpu.v[reg]);
+            }
+        }
+    }
+    CHECK(bad_cases == 0, "%d of 20000 prefixed operations differ from the runtime", bad_cases);
+}
+
 int main(void) {
+    test_prefix_plans();
     setvbuf(stdout, NULL, _IONBF, 0);   /* progress survives a crash */
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {

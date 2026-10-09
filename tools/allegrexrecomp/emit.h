@@ -43,6 +43,16 @@ typedef struct {
  * Returns 0 on success. */
 int a_emit(const a_analysis *an, const emit_opts *o);
 
+/* VFPU prefixes resolved at recompile time (a vpfxs/vpfxt/vpfxd right before
+ * an operation): which register or constant each source lane reads, and how
+ * each destination lane is written -- exactly src/vfpu.c read_src/write_dst.
+ * prefix < 0 = none. Exposed for tests (test_emit checks them against the
+ * runtime). */
+typedef struct { int reg; int cst; int abs, neg; } a_vpfx_src;   /* cst: -1, or 0..7 (PFX_CONST index) */
+typedef struct { int reg; int masked; int sat; } a_vpfx_dst;     /* sat: 0 none, 1 [0,1], 3 [-1,1] */
+int a_vpfx_plan_src(unsigned vreg, int size, long prefix, a_vpfx_src out[4]);
+int a_vpfx_plan_dst(unsigned vreg, int size, long prefix, a_vpfx_dst out[4]);
+
 #ifdef __cplusplus
 }
 #endif
