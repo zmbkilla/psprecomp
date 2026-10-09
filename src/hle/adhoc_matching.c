@@ -265,7 +265,7 @@ static void on_hello(mctx *c, const uint8_t mac[6], int len) {
     if (!((c->mode == MODE_CHILD && !find_state(c, P_PARENT)) || (c->mode == MODE_P2P && !find_state(c, P_P2P)))) return;
     if (len < 5) return;
     const int optlen = get_s32(c->rxbuf + 1);
-    if (optlen < 0 || len < 5 + optlen) return;
+    if (optlen < 0 || optlen > len - 5) return;            /* not 5 + optlen: it could overflow */
     mpeer *p = find_peer(c, mac);
     if (!p) p = add_peer(c, mac, P_OFFER);
     if (p && p->state != P_OUTGOING && p->state != P_INCOMING) event(c, EV_HELLO, mac, optlen, c->rxbuf + 5);
@@ -276,7 +276,7 @@ static void on_join(mctx *c, const uint8_t mac[6], int len) {
     if ((c->mode == MODE_PARENT && count_children(c) < c->maxpeers - 1) || (c->mode == MODE_P2P && !find_state(c, P_P2P))) {
         if (len >= 5) {
             const int optlen = get_s32(c->rxbuf + 1);
-            if (optlen >= 0 && len >= 5 + optlen) {
+            if (optlen >= 0 && optlen <= len - 5) {
                 mpeer *p = find_peer(c, mac);
                 if (p && p->lastping && c->mode == MODE_PARENT) return;      /* a repeated request */
                 if (!p) p = add_peer(c, mac, P_INCOMING);
@@ -321,7 +321,7 @@ static void on_cancel(mctx *c, const uint8_t mac[6], int len) {
     mpeer *peer = find_peer(c, mac);
     if (!peer || len < 5) return;
     const int optlen = get_s32(c->rxbuf + 1);
-    if (optlen < 0 || len < 5 + optlen) return;
+    if (optlen < 0 || optlen > len - 5) return;            /* not 5 + optlen: it could overflow */
     const uint8_t *opt = c->rxbuf + 5;
     mpeer *req = find_state(c, P_OUTGOING);
     if (c->mode == MODE_CHILD) {
@@ -350,7 +350,7 @@ static void on_bulk(mctx *c, const uint8_t mac[6], int len) {
           (c->mode == MODE_P2P && p->state == P_P2P))) return;
     if (len <= 5) return;
     const int n = get_s32(c->rxbuf + 1);
-    if (n > 0 && len >= 5 + n) event(c, EV_DATA, mac, n, c->rxbuf + 5);
+    if (n > 0 && n <= len - 5) event(c, EV_DATA, mac, n, c->rxbuf + 5);   /* not 5 + n: it could overflow */
 }
 
 static void on_birth(mctx *c, const uint8_t mac[6], int len) {
