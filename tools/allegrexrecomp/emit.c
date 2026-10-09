@@ -189,11 +189,27 @@ static void compute_tail_cycles(ectx *c) {
     for (int i = 0; i < n; i++) {
         const a_func *fn = &an->funcs[i];
         if (is_hooked(c, fn->addr)) continue;
-        for (uint32_t a = fn->start; a < fn->end; a += 4) {
-            if (!owned_by(an, a, fn->addr)) continue;
-            a_insn in;
-            a_decode(fetch(an, a), a, &in);
-            const int t = tail_edge(c, fn->addr, &in);
+        /* Running into another function (an interior gap owned by another
+         * body, or the end of this one) is a tail transfer too; the emitter
+         * writes it as a call. Missing those edges hid long loops split across
+         * bodies -- the decompressor at 0x08D5DF38..0x08D5E1xx crashed a boss
+         * fight that way. `terminal` mirrors the emitter's last_terminal. */
+        int terminal = 0;
+        for (uint32_t a = fn->start; a <= fn->end; a += 4) {
+            int t = -1;
+            if (a == fn->end || !owned_by(an, a, fn->addr)) {
+                if (!terminal && is_function(an, a)) {
+                    const a_func *tf = func_at(an, a);
+                    if (tf && !is_hooked(c, tf->addr)) t = (int)(tf - an->funcs);
+                }
+                terminal = 1;
+            } else {
+                a_insn in;
+                a_decode(fetch(an, a), a, &in);
+                terminal = in.is_return || (in.is_indirect && !in.is_call) || (in.is_jump && !in.is_call);
+                t = tail_edge(c, fn->addr, &in);
+                if (in.has_delay_slot && owned_by(an, a + 4, fn->addr)) a += 4;   /* emitted with its branch */
+            }
             if (t < 0 || t == i) continue;
             if (ne == cap) {
                 cap *= 2;
@@ -1114,8 +1130,12 @@ static void emit_function(ectx *c, const a_func *fn) {
              * after the gap is reachable through its own entry. */
             if (!last_terminal) {
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
-                emit_static_call(c, a);
-                fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
+                if (is_function(an, a) && scc_transfer(c, a))
+                    fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n    return;\n", a);
+                else {
+                    emit_static_call(c, a);
+                    fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
+                }
                 last_terminal = 1;
             }
             continue;
@@ -1329,7 +1349,8 @@ static void emit_function(ectx *c, const a_func *fn) {
         uint32_t next = fn->end;
         if (is_function(an, next)) {
             fprintf(f, "    /* falls through into the next function */\n");
-            fprintf(f, "    psp_func_%08X();\n", next);
+            if (scc_transfer(c, next)) fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n", next);
+            else fprintf(f, "    psp_func_%08X();\n", next);
         } else if (a_in_range(an, next) && an->owner[widx(an, next)] != A_NO_OWNER) {
             /* ...or into the middle of one. Discovery split a routine and this
              * body is the piece before `next`: the rest of the routine, its
