@@ -305,6 +305,29 @@ static void test_relay(hsock ls, hsock rl) {
     close_sock(srv); close_sock(r1); close_sock(r2);
 }
 
+/* The server drops the connection mid-game: the library logs in again, rejoins
+ * the group, and keeps the players meanwhile (no event; the game never notices). */
+static void test_reconnect(hsock ls) {
+    hsock srv = start_session(ls, "reconnect");
+    close_sock(srv);                                   /* the server goes away */
+    pump_ms(100);
+    psp_write32(G + 0x140, 152 * 4);
+    call("sceNetAdhocctlGetPeerList", G + 0x140, G + 0x200, 0, 0, 0, 0, 0, 0);
+    CHECK(psp_read32(G + 0x140) == 152, "reconnect: bob stays in the peer list during the outage");
+    hsock s2 = accept_one(ls);
+    CHECK(s2 != (hsock)-1, "reconnect: the library connects again");
+    uint8_t login[144], conn[9];
+    CHECK(read_n(s2, login, 144) == 144 && login[0] == 1, "reconnect: LOGIN again");
+    CHECK(read_n(s2, conn, 9) == 9 && conn[0] == 2 && !memcmp(conn + 1, "PSP2i001", 8), "reconnect: CONNECT the same group");
+    server_join(s2);
+    pump_ms(100);
+    psp_write32(G + 0x130, 9);
+    call("sceNetAdhocctlGetState", G + 0x130, 0, 0, 0, 0, 0, 0, 0);
+    CHECK(psp_read32(G + 0x130) == 1, "reconnect: still connected to the group");
+    C0("sceNetAdhocTerm");
+    close_sock(s2);
+}
+
 /* ---- modern: bob speaks the mesh protocol by hand (adhoc_mesh.c) ---- */
 
 #define BOB_MESH_PORT 47321
@@ -512,6 +535,7 @@ int main(void) {
     c.mode = PSP_ADHOC_MODE_PPSSPP_DIRECT; c.port_offset = 10000; c.nickname = "alice";
     psp_adhoc_configure(&c);
     test_direct(ls);
+    test_reconnect(ls);
     c.mode = PSP_ADHOC_MODE_PPSSPP_RELAY;
     psp_adhoc_configure(&c);
     test_relay(ls, rl);

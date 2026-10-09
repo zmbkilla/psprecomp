@@ -204,7 +204,32 @@ static int      g_ctl_inited, g_adhoc_inited, g_relay, g_mesh;
 static hsock    g_meta = BAD_SOCK;
 static int      g_meta_up;                      /* TCP connected, login queued */
 static buf_t    g_meta_in, g_meta_out;
-static uint64_t g_last_ping, g_meta_retry;
+static uint64_t g_last_ping, g_meta_retry, g_meta_rx;
+static int      g_in_group;                     /* a CONNECT {group} stands: re-sent after a reconnect */
+static int      g_rejoining;                    /* reconnected; the next CONNECT_BSSID is not a new event */
+static uint64_t g_meta_lost_at;                 /* the connection dropped (0 = fine) */
+
+/* The server drops a client it has not heard from for 15 s (PPSSPP's and aemu's
+ * servers). Pings normally go out from adhoc_pump on the game thread, which can
+ * stall for longer during loading; a small host thread sends them meanwhile.
+ * g_meta_mx guards the connection between the two. */
+#ifdef _WIN32
+static CRITICAL_SECTION g_meta_mx;
+static void mx_init(void) { InitializeCriticalSection(&g_meta_mx); }
+#  define META_LOCK()   EnterCriticalSection(&g_meta_mx)
+#  define META_UNLOCK() LeaveCriticalSection(&g_meta_mx)
+#else
+#  include <pthread.h>
+static pthread_mutex_t g_meta_mx;
+static void mx_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_meta_mx, &a);
+}
+#  define META_LOCK()   pthread_mutex_lock(&g_meta_mx)
+#  define META_UNLOCK() pthread_mutex_unlock(&g_meta_mx)
+#endif
 static uint8_t  g_product[16];                  /* SceNetAdhocctlAdhocId {s32 type, char data[9], pad[3]} */
 static int      g_state = ST_DISCONNECTED, g_busy, g_cur_mode = -1, g_conn_type;
 static uint8_t  g_group[8], g_bssid[6];
@@ -221,22 +246,55 @@ static void notify(uint32_t flag, uint32_t error) {
     if (g_nevents < 32) { g_events[g_nevents].flag = flag; g_events[g_nevents].error = error; g_nevents++; }
 }
 
-static void meta_send(const void *p, uint32_t n) { buf_add(&g_meta_out, p, n); }
+static void meta_send(const void *p, uint32_t n) { META_LOCK(); buf_add(&g_meta_out, p, n); META_UNLOCK(); }
 
 static void meta_close(void) {
+    META_LOCK();
     if (g_meta != BAD_SOCK) close_sock(g_meta);
     g_meta = BAD_SOCK;
     g_meta_up = 0;
     buf_free(&g_meta_in);
     buf_free(&g_meta_out);
+    META_UNLOCK();
+}
+
+static void keepalive_tick(void) {
+    META_LOCK();
+    const uint64_t now = adhoc_real_us();
+    if (g_ctl_inited && g_meta != BAD_SOCK && g_meta_up && !g_meta_out.len && now - g_last_ping >= 2000000u) {
+        const uint8_t ping = OP_PING;
+        if (send(g_meta, (const char *)&ping, 1, 0) == 1) g_last_ping = now;
+    }
+    META_UNLOCK();
+}
+
+#ifdef _WIN32
+static DWORD WINAPI keepalive_main(LPVOID unused) { (void)unused; for (;;) { Sleep(500); keepalive_tick(); } }
+#else
+static void *keepalive_main(void *unused) { (void)unused; for (;;) { usleep(500000); keepalive_tick(); } return NULL; }
+#endif
+
+static void keepalive_start(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    mx_init();
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 64 * 1024, keepalive_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, keepalive_main, NULL) == 0) pthread_detach(t);
+#endif
 }
 
 static void meta_open(void) {
+    META_LOCK();
     meta_close();
     if (!g_server_ip) resolve_server();
     g_meta = tcp_connect_server(g_server_port);
     g_meta_retry = adhoc_real_us() + 5000000u;
-    if (g_meta == BAD_SOCK) { adhoc_log("cannot connect to the ad hoc server"); return; }
+    if (g_meta == BAD_SOCK) { adhoc_log("cannot connect to the ad hoc server"); META_UNLOCK(); return; }
     /* login: opcode, MAC, nickname[128], product code[9] */
     uint8_t p[1 + 6 + 128 + 9];
     memset(p, 0, sizeof p);
@@ -247,6 +305,14 @@ static void meta_open(void) {
     meta_send(p, sizeof p);
     char m[18];
     adhoc_log("connecting to %s:%u as %s (%s), game %.9s", g_server, g_server_port, g_nick, mac_text(p + 1, m), (const char *)g_product + 4);
+    if (g_in_group) {                                   /* (re)join the group we are in */
+        uint8_t c[9];
+        c[0] = OP_CONNECT;
+        memcpy(c + 1, g_group, 8);
+        meta_send(c, sizeof c);
+        if (g_meta_lost_at) { g_rejoining = 1; adhoc_log("rejoining group %.8s after the reconnect", (const char *)g_group); }
+    }
+    META_UNLOCK();
 }
 
 static int friend_find(const uint8_t mac[6]) {
@@ -313,6 +379,13 @@ static void meta_packets(void) {
         switch (p[0]) {
         case OP_CONNECT_BSSID:
             memcpy(g_bssid, p + 1, 6);
+            if (g_rejoining) {                          /* the game never left: no new event */
+                g_rejoining = 0;
+                g_meta_lost_at = 0;
+                adhoc_log("rejoined group %.8s (host %s)", (const char *)g_group, mac_text(g_bssid, m));
+                break;
+            }
+            g_meta_lost_at = 0;
             adhoc_log("joined group %.8s (host %s)", (const char *)g_group, mac_text(g_bssid, m));
             notify(EV_CONNECT, 0);
             break;
@@ -365,9 +438,34 @@ static void meta_packets(void) {
     }
 }
 
+/* The connection dropped: say why, reconnect soon, and keep the players for a
+ * while -- dropping them at once makes the game think everyone left (observed:
+ * stuck loading). The reconnect re-joins the group. */
+static void meta_lost(const char *why) {
+    const uint64_t now = adhoc_real_us();
+    adhoc_log("%s (last ping sent %.1f s ago, last server data %.1f s ago)", why,
+              (double)(now - g_last_ping) / 1e6, g_meta_rx ? (double)(now - g_meta_rx) / 1e6 : -1.0);
+    meta_close();
+    g_meta_retry = now + 1000000u;
+    if (!g_meta_lost_at) g_meta_lost_at = now;
+}
+
+static void meta_pump_locked(void);
 static void meta_pump(void) {
     if (!g_ctl_inited) return;
+    META_LOCK();
+    meta_pump_locked();
+    META_UNLOCK();
+}
+
+static void meta_pump_locked(void) {
     const uint64_t now = adhoc_real_us();
+    if (g_meta_lost_at && now - g_meta_lost_at > 20000000u) {
+        adhoc_log("no server for 20 s: the other players are gone");
+        for (int i = 0; i < MAX_FRIENDS; i++) g_friends[i].last_recv = 0;
+        g_meta_lost_at = 0;
+        g_rejoining = 0;
+    }
     if (g_meta == BAD_SOCK) {
         if (now >= g_meta_retry) meta_open();
         return;
@@ -376,7 +474,7 @@ static void meta_pump(void) {
         if (sock_ready(g_meta, 1)) {
             if (sock_error(g_meta)) { adhoc_log("the ad hoc server refused the connection"); meta_close(); return; }
             g_meta_up = 1;
-            g_last_ping = now;
+            g_last_ping = g_meta_rx = now;
             adhoc_log("connected to the ad hoc server");
         } else {
             if (now >= g_meta_retry) { adhoc_log("no answer from the ad hoc server"); meta_close(); }
@@ -388,19 +486,20 @@ static void meta_pump(void) {
         const int n = send(g_meta, (const char *)g_meta_out.p, (int)g_meta_out.len, 0);
         if (n > 0) { buf_drop(&g_meta_out, (uint32_t)n); continue; }
         if (n < 0 && WOULD_BLOCK(last_error())) break;
-        adhoc_log("lost the ad hoc server connection");
-        meta_close();
-        for (int i = 0; i < MAX_FRIENDS; i++) g_friends[i].last_recv = 0;
+        char why[80];
+        snprintf(why, sizeof why, "lost the ad hoc server connection (send error %d)", last_error());
+        meta_lost(why);
         return;
     }
     uint8_t tmp[2048];
     for (;;) {
         const int n = recv(g_meta, (char *)tmp, sizeof tmp, 0);
-        if (n > 0) { buf_add(&g_meta_in, tmp, (uint32_t)n); continue; }
+        if (n > 0) { buf_add(&g_meta_in, tmp, (uint32_t)n); g_meta_rx = now; continue; }
         if (n < 0 && WOULD_BLOCK(last_error())) break;
-        adhoc_log("the ad hoc server closed the connection");
-        meta_close();
-        for (int i = 0; i < MAX_FRIENDS; i++) g_friends[i].last_recv = 0;
+        char why[80];
+        if (n == 0) snprintf(why, sizeof why, "the ad hoc server closed the connection");
+        else snprintf(why, sizeof why, "the ad hoc server connection failed (error %d)", last_error());
+        meta_lost(why);
         return;
     }
     meta_packets();
@@ -445,6 +544,7 @@ typedef struct {
     uint64_t rstart;
     /* modern (adhoc_mesh.c) */
     int mesh, sid;
+    uint64_t tx, rx;                     /* game bytes, for the log */
 } asock;
 
 static asock g_s[MAX_SOCK];
@@ -586,6 +686,11 @@ uint32_t adhoc_guest_alloc(uint32_t size) {
 static void hle_AdhocInit(void) {
     if (g_adhoc_inited) { psp_ret(ADHOC_ALREADY_INITIALIZED); return; }
     g_adhoc_inited = 1;
+    {   /* random ports differ per run (an unseeded rand() repeated them run after run) */
+        uint8_t m[6];
+        adhoc_local_mac(m);
+        srand((unsigned)(adhoc_real_us() ^ ((uint32_t)m[3] << 16 | (uint32_t)m[4] << 8 | m[5])));
+    }
     g_relay = g_mode == PSP_ADHOC_MODE_PPSSPP_RELAY;
     g_mesh = g_mode == PSP_ADHOC_MODE_MODERN;
     adhoc_log("sceNetAdhocInit: %s, server %s:%u, port offset %u",
@@ -617,10 +722,14 @@ static void hle_CtlInit(void) {
     if (g_ctl_inited) { psp_ret(CTL_ALREADY_INITIALIZED); return; }
     memset(g_product, 0, sizeof g_product);
     if (product) psp_mem_read_block(g_product, product, 16);
+    keepalive_start();
     g_ctl_inited = 1;
     g_state = ST_DISCONNECTED;
     g_busy = 0;
     g_nevents = 0;
+    g_in_group = 0;
+    g_rejoining = 0;
+    g_meta_lost_at = 0;
     resolve_server();
     meta_open();
     /* wait (up to 3 s) for the server, as the reference does before returning */
@@ -630,6 +739,8 @@ static void hle_CtlInit(void) {
 }
 
 static void ctl_disconnect(void) {
+    g_in_group = 0;
+    g_rejoining = 0;
     if (g_state != ST_DISCONNECTED) {
         const uint8_t op = OP_DISCONNECT;
         meta_send(&op, 1);
@@ -687,11 +798,14 @@ static uint32_t ctl_create(const uint8_t name[8], int type) {
     g_conn_type = type;
     g_ctl_start = adhoc_real_us();
     memcpy(g_group, name, 8);
-    uint8_t p[9];
-    p[0] = OP_CONNECT;
-    memcpy(p + 1, name, 8);
-    meta_send(p, sizeof p);
-    if (g_meta == BAD_SOCK) meta_open();
+    g_in_group = 1;
+    if (g_meta == BAD_SOCK) meta_open();               /* sends the CONNECT after the login */
+    else {
+        uint8_t p[9];
+        p[0] = OP_CONNECT;
+        memcpy(p + 1, name, 8);
+        meta_send(p, sizeof p);
+    }
     adhoc_log("%s group %.8s", type == CONN_JOIN ? "joining" : type == CONN_CREATE ? "creating" : "connecting to", (const char *)name);
     meta_pump();
     return 0;
@@ -1195,6 +1309,9 @@ static uint32_t ptp_connect_try(asock *a) {
             a->state = PTP_SYN_SENT;
         }
         if (relay_io(a) != 0) {
+            char m[18];
+            adhoc_log("ptp %d: the relay closed the connect to %s:%u after %.1f s (nobody accepting there yet?)",
+                      (int)(a - g_s) + 1, mac_text(a->paddr, m), a->pport, (double)(adhoc_real_us() - a->rstart) / 1e6);
             close_sock(a->s); a->s = BAD_SOCK;
             buf_free(&a->rin); buf_free(&a->rout);
             a->state = PTP_CLOSED;
@@ -1523,7 +1640,7 @@ static void hle_PtpSend(void) {
                 psp_mem_read_block(tmp, data, len);
                 const int n = mesh_stream_send(a->sid, tmp, (int)len);
                 free(tmp);
-                if (n > 0) { psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
+                if (n > 0) { a->tx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
                 if (n < 0) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             } else if (a->relay) {
                 if (a->rdead) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
@@ -1536,7 +1653,7 @@ static void hle_PtpSend(void) {
                     buf_add(&a->rout, tmp, len);
                     free(tmp);
                     relay_io(a);
-                    psp_write32(lenp, len);
+                    a->tx += len; psp_write32(lenp, len);
                     psp_ret(0);
                     return;
                 }
@@ -1547,7 +1664,7 @@ static void hle_PtpSend(void) {
                 const int n = send(a->s, (const char *)tmp, (int)len, 0);
                 const int e = n < 0 ? last_error() : 0;
                 free(tmp);
-                if (n > 0) { psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
+                if (n > 0) { a->tx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
                 if (!WOULD_BLOCK(e)) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             }
         }
@@ -1578,7 +1695,7 @@ static void hle_PtpRecv(void) {
                 const int n = mesh_stream_recv(a->sid, tmp, (int)cap);
                 if (n > 0) psp_mem_write_block(buf, tmp, (uint32_t)n);
                 free(tmp);
-                if (n > 0) { psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
+                if (n > 0) { a->rx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
                 if (n < 0) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             } else if (a->relay) {
                 relay_io(a);
@@ -1586,7 +1703,7 @@ static void hle_PtpRecv(void) {
                     const uint32_t n = a->stream.len < cap ? a->stream.len : cap;
                     psp_mem_write_block(buf, a->stream.p, n);
                     buf_drop(&a->stream, n);
-                    psp_write32(lenp, n);
+                    a->rx += n; psp_write32(lenp, n);
                     adhoc_peer_seen(a->paddr);
                     psp_ret(0);
                     return;
@@ -1599,7 +1716,7 @@ static void hle_PtpRecv(void) {
                 const int e = n < 0 ? last_error() : 0;
                 if (n > 0) psp_mem_write_block(buf, tmp, (uint32_t)n);
                 free(tmp);
-                if (n > 0) { psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
+                if (n > 0) { a->rx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
                 if (n == 0 || !WOULD_BLOCK(e)) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             }
         }
@@ -1624,7 +1741,7 @@ static void hle_PtpClose(void) {
     asock *a = sock_get(psp_arg(0), SOCK_PTP);
     if (!a) { psp_ret(ADHOC_INVALID_SOCKET_ID); return; }
     if (a->relay && a->rout.len) relay_io(a);           /* last data out */
-    adhoc_log("ptp %u: closed", psp_arg(0));
+    adhoc_log("ptp %u: closed (port %u -> %u; sent %llu, received %llu bytes)", psp_arg(0), a->lport, a->pport, (unsigned long long)a->tx, (unsigned long long)a->rx);
     sock_free(a);
     psp_ret(0);
 }
