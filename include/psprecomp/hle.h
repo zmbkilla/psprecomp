@@ -141,6 +141,8 @@ void psp_sas_register(void);
 void psp_sas_reset(void);
 uint64_t psp_sas_frames(void);
 uint64_t psp_sas_nonzero(void);
+/* Host volume for the sound-effect mix (sceSasCore output), 0..1 (default 1). */
+void psp_sas_set_gain(float gain);
 
 void psp_io_init(void);
 void psp_io_register(void);
