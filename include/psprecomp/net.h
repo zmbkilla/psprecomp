@@ -130,6 +130,39 @@ void psp_http_register(void);
 void psp_np_register(void);
 void psp_np2_register(void);
 
+/* ---- ad hoc (src/hle/adhoc.c, adhoc_mesh.c, adhoc_matching.c) ----------------------------
+ * Ad hoc play over the internet through an ad hoc server (PPSSPP's protocol,
+ * which also finds the players of a group). Three connection options:
+ *   PSP_ADHOC_MODE_PPSSPP_DIRECT  PPSSPP style, direct: game data goes straight
+ *                                 between players, every port shifted by
+ *                                 port_offset; players' ports must be reachable;
+ *   PSP_ADHOC_MODE_PPSSPP_RELAY   PPSSPP style, relayed: game data goes through
+ *                                 the server ("aemu postoffice", relay_port) --
+ *                                 works behind any NAT; plays with PPSSPP users
+ *                                 on the relay too;
+ *   PSP_ADHOC_MODE_MODERN         direct hosting through NAT traversal (recomp
+ *                                 players only): one UDP socket (mesh_port) per
+ *                                 player; addresses learned locally (IPv4 and
+ *                                 IPv6), from a STUN server and from the ad hoc
+ *                                 server are swapped through the relay, then
+ *                                 both sides punch through their NATs (CGNAT
+ *                                 included, unless it is symmetric). PTP gets a
+ *                                 reliable stream over that UDP path. A pair that
+ *                                 cannot punch through stays reachable: its
+ *                                 packets are tunnelled through the relay. */
+enum { PSP_ADHOC_MODE_PPSSPP_DIRECT = 0, PSP_ADHOC_MODE_PPSSPP_RELAY = 1, PSP_ADHOC_MODE_MODERN = 2 };
+typedef struct {
+    const char *server;          /* host name or address */
+    uint16_t    server_port;     /* 0 = 27312 */
+    uint16_t    relay_port;      /* 0 = 27313 */
+    int         mode;            /* PSP_ADHOC_MODE_* */
+    int         port_offset;     /* PPSSPP-style: added to every game port (PPSSPP default 10000) */
+    const char *nickname;        /* shown to other players */
+    const char *stun_server;     /* modern: host[:port]; NULL = stun.l.google.com:19302, "" = none */
+    uint16_t    mesh_port;       /* modern: the UDP port; 0 = 27320 */
+} psp_adhoc_config;
+void psp_adhoc_configure(const psp_adhoc_config *c);
+
 #ifdef __cplusplus
 }
 #endif

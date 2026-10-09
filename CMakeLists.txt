@@ -59,6 +59,9 @@ add_library(psprecomp STATIC
     src/hle/np.c
     src/hle/np2.c
     src/hle/p2p.c
+    src/hle/adhoc.c
+    src/hle/adhoc_mesh.c
+    src/hle/adhoc_matching.c
 )
 
 target_include_directories(psprecomp PUBLIC
