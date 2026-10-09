@@ -417,6 +417,13 @@ static void meta_packets(void) {
         case OP_CONNECT: {
             uint32_t a;
             memcpy(&a, p + 135, 4);
+            if (adhoc_is_local_mac(p + 129)) {
+                /* Ourselves: after a reconnect the server still has our old
+                 * session in the group until it times out (observed 6 s), and
+                 * reports it as another player. Never a peer. */
+                adhoc_log("ignoring the server's stale entry for ourselves");
+                break;
+            }
             int f = friend_find(p + 129);
             if (f < 0) for (int i = 0; i < MAX_FRIENDS; i++) if (!g_friends[i].used) { f = i; break; }
             if (f >= 0) {

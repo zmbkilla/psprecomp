@@ -355,11 +355,22 @@ static void test_reconnect(hsock ls) {
     uint8_t login[144], conn[9];
     CHECK(read_n(s2, login, 144) == 144 && login[0] == 1, "reconnect: LOGIN again");
     CHECK(read_n(s2, conn, 9) == 9 && conn[0] == 2 && !memcmp(conn + 1, "PSP2i001", 8), "reconnect: CONNECT the same group");
+    {   /* the server's stale copy of our old session: not a peer */
+        uint8_t me[139];
+        memset(me, 0, sizeof me);
+        me[0] = 2;
+        memcpy(me + 1, "alice", 5);
+        memcpy(me + 129, login + 1, 6);
+        send(s2, (const char *)me, sizeof me, 0);
+    }
     server_join(s2);
     pump_ms(100);
     psp_write32(G + 0x130, 9);
     call("sceNetAdhocctlGetState", G + 0x130, 0, 0, 0, 0, 0, 0, 0);
     CHECK(psp_read32(G + 0x130) == 1, "reconnect: still connected to the group");
+    psp_write32(G + 0x140, 152 * 4);
+    call("sceNetAdhocctlGetPeerList", G + 0x140, G + 0x200, 0, 0, 0, 0, 0, 0);
+    CHECK(psp_read32(G + 0x140) == 152, "reconnect: our own stale entry is not a peer (%u)", psp_read32(G + 0x140) / 152);
     /* PPSSPP's server logs out a player whose DISCONNECT finds it in no group */
     C0("sceNetAdhocctlDisconnect");
     C0("sceNetAdhocctlDisconnect");
