@@ -21,6 +21,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/net.h"
+#include "adhoc.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -150,7 +151,7 @@ void psp_net_ether_addr(uint8_t mac[6]) {
         if (e) snprintf(name, sizeof name, "%s", e);
 #endif
         for (const char *p = name; *p; p++) h = (h ^ (uint8_t)*p) * 0x01000193u;
-        m[0] = 0x02;                          /* locally administered, unicast */
+        m[0] = 0x00;                          /* the two low bits clear: ad hoc games reject others */
         m[1] = 0x50;
         m[2] = (uint8_t)(h >> 24); m[3] = (uint8_t)(h >> 16); m[4] = (uint8_t)(h >> 8); m[5] = (uint8_t)h;
         ready = 1;
@@ -434,6 +435,13 @@ static void hle_NetconfInitStart(void) {
     g_nc_status = DLG_INIT;
     g_nc_polls = 0;
     net_log("network dialog: action %d", g_nc_action);
+    if (g_nc_action == 2 || g_nc_action == 4 || g_nc_action == 5) {
+        /* ad hoc: SceUtilityNetconfParam.adhocparam -> {char group[8], int timeout} */
+        char group[8] = { 0 };
+        const uint32_t data = psp_read32(g_nc_param + 0x34);
+        if (data) psp_mem_read_block(group, data, 8);
+        adhoc_netconf_start(g_nc_action, group);
+    }
     psp_ret(0);
 }
 
@@ -456,8 +464,11 @@ static void netconf_finish(void) {
             net_log("network dialog: no host network -- failed");
         }
     } else {
-        result = SCE_NET_APCTL_ERROR_NOT_IN_BSS;
-        net_log("network dialog: ad hoc action %d not supported -- failed", g_nc_action);
+        /* ad hoc: the dialog stays until adhocctl is connected to the group (adhoc.c) */
+        const int r = adhoc_netconf_poll();
+        if (r == 0) return;
+        result = r > 0 ? 0 : 1;                              /* 1: SCE_UTILITY_DIALOG_RESULT_ABORT */
+        net_log("network dialog: ad hoc group %s", r > 0 ? "connected" : "not reached -- gave up");
     }
     if (g_nc_param) psp_write32(g_nc_param + 0x1C, result);    /* common.result */
     g_nc_status = DLG_FINISHED;
@@ -476,6 +487,7 @@ static void hle_NetconfGetStatus(void) {
 }
 
 static void hle_NetconfShutdownStart(void) {
+    if (g_nc_status == DLG_RUNNING) adhoc_netconf_cancel();
     g_nc_status = DLG_SHUTDOWN;
     psp_ret(0);
 }
@@ -522,4 +534,6 @@ void psp_net_register(void) {
     psp_hle_register(0x91E70E35, "sceUtility", "sceUtilityNetconfUpdate",        hle_NetconfUpdate);
     psp_hle_register(0x6332AA39, "sceUtility", "sceUtilityNetconfGetStatus",     hle_NetconfGetStatus);
     psp_hle_register(0xF88155F6, "sceUtility", "sceUtilityNetconfShutdownStart", hle_NetconfShutdownStart);
+
+    psp_adhoc_register();
 }

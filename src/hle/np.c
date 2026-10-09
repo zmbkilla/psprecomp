@@ -212,9 +212,11 @@ static void hle_NpAuthCreateStartRequest(void) {
 }
 
 void psp_np2_poll(void);                         /* np2.c */
+void adhoc_pump(void);                           /* adhoc.c */
 
 void psp_np_poll(void) {
     psp_np2_poll();
+    adhoc_pump();
     for (int i = 0; i < MAX_AUTH; i++) {
         if (!g_req[i].used || g_req[i].delivered) continue;
         if (!g_req[i].failed && g_be && g_be->ticket_state) {
