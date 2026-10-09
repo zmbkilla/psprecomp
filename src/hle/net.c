@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -74,7 +75,29 @@ static void sockets_up(void) {
 #endif
 }
 
+/* The answer is cached for 2 s: GetAdaptersAddresses is an RPC to a system
+ * service, and this is called all the time in multiplayer (the game polls the
+ * WLAN switch; ad hoc resolves addresses per packet) -- 12% of all samples in
+ * a profile of the Clad 6 ad hoc lobby at 60 fps, enough to push frames past
+ * 16.7 ms. A network change still shows within 2 s. */
+static int host_info_query(psp_net_host *out);
 int psp_net_host_info(psp_net_host *out) {
+    static psp_net_host cached;
+    static int have;
+    static uint64_t at_ms;
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (!have || now_ms - at_ms >= 2000u) {
+        host_info_query(&cached);
+        have = 1;
+        at_ms = now_ms;
+    }
+    if (out) *out = cached;
+    return cached.connected;
+}
+
+static int host_info_query(psp_net_host *out) {
     psp_net_host h;
     memset(&h, 0, sizeof h);
     if (g_forced_off < 0) {
