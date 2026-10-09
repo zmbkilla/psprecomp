@@ -27,6 +27,7 @@ typedef struct {
     int nentries, centries;
     const uint32_t *hooks; /* functions with a run-time hook (emit_opts) */
     int nhooks;
+    int *scc;              /* per function index: tail-call cycle id, 0 = none (see compute_tail_cycles) */
 } ectx;
 
 static void entry_push(ectx *c, uint32_t a) {
@@ -141,6 +142,118 @@ static const a_func *func_at(const a_analysis *an, uint32_t addr) {
         if (an->funcs[mid].addr < addr) lo = mid + 1; else hi = mid - 1;
     }
     return NULL;
+}
+
+/* ---- tail-call cycles -----------------------------------------------------
+ * A tail transfer (`j` or a branch to another function's entry) is emitted as
+ * a call followed by `return`. The C compiler may or may not turn that into a
+ * jump; where it does not, functions that tail-transfer to each other in a
+ * loop (A -> B -> A ...) grow the host stack by a frame per pass, and a long
+ * loop overflows it (0xC00000FD). PSP2i has ~290 such cycles. Within a cycle,
+ * the transfer instead sets psp_scc_next and returns; every entry into a cycle
+ * member drains psp_scc_next in a loop, so control passes on without growing
+ * the stack -- the old frame is gone first, as with a real jump.
+ * Hooked functions stay out: a hook may run guest code after the original. */
+
+static int is_hooked(const ectx *c, uint32_t addr) {
+    for (int h = 0; h < c->nhooks; h++) if (c->hooks[h] == addr) return 1;
+    return 0;
+}
+
+/* The function index an emitted tail transfer from `owner` to `t` would call,
+ * or -1 when that transfer is not a cross-function call. Mirrors the emitter. */
+static int tail_edge(const ectx *c, uint32_t owner, const a_insn *in) {
+    const a_analysis *an = c->an;
+    if (!in->has_target || in->is_call || in->is_indirect) return -1;
+    if (in->target == owner || is_import(an, in->target)) return -1;
+    if (in->is_jump) {
+        if (owned_by(an, in->target, owner) && !is_function(an, in->target)) return -1;
+    } else if (in->is_branch) {
+        if (owned_by(an, in->target, owner)) return -1;
+    } else return -1;
+    const a_func *t = func_at(an, in->target);
+    if (!t || is_hooked(c, t->addr)) return -1;
+    return (int)(t - an->funcs);
+}
+
+/* Strongly connected components (> 1 member) of the tail-call graph: c->scc. */
+static void compute_tail_cycles(ectx *c) {
+    const a_analysis *an = c->an;
+    const int n = an->nfuncs;
+    c->scc = (int *)calloc((size_t)(n ? n : 1), sizeof(int));
+    int *head = (int *)malloc(sizeof(int) * (size_t)(n + 1));
+    int ne = 0, cap = 1024;
+    int *to = (int *)malloc(sizeof(int) * (size_t)cap), *from = (int *)malloc(sizeof(int) * (size_t)cap);
+    if (!c->scc || !head || !to || !from) { free(head); free(to); free(from); return; }
+    for (int i = 0; i < n; i++) {
+        const a_func *fn = &an->funcs[i];
+        if (is_hooked(c, fn->addr)) continue;
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, fn->addr)) continue;
+            a_insn in;
+            a_decode(fetch(an, a), a, &in);
+            const int t = tail_edge(c, fn->addr, &in);
+            if (t < 0 || t == i) continue;
+            if (ne == cap) {
+                cap *= 2;
+                to = (int *)realloc(to, sizeof(int) * (size_t)cap);
+                from = (int *)realloc(from, sizeof(int) * (size_t)cap);
+                if (!to || !from) { free(head); free(to); free(from); return; }
+            }
+            from[ne] = i; to[ne] = t; ne++;
+        }
+    }
+    /* CSR by source (edges were added in source order). */
+    for (int i = 0, e = 0; i <= n; i++) { while (e < ne && from[e] < i) e++; head[i] = e; }
+
+    /* Iterative Tarjan. */
+    int *idx = (int *)malloc(sizeof(int) * (size_t)n), *low = (int *)malloc(sizeof(int) * (size_t)n);
+    int *onst = (int *)calloc((size_t)n, sizeof(int)), *st = (int *)malloc(sizeof(int) * (size_t)n);
+    int *cs = (int *)malloc(sizeof(int) * (size_t)n), *ce = (int *)malloc(sizeof(int) * (size_t)n);
+    if (!idx || !low || !onst || !st || !cs || !ce) goto done;
+    for (int i = 0; i < n; i++) idx[i] = -1;
+    int counter = 0, sp = 0, nscc = 0;
+    for (int root = 0; root < n; root++) {
+        if (idx[root] >= 0) continue;
+        int depth = 0;
+        cs[0] = root; ce[0] = head[root];
+        idx[root] = low[root] = counter++; st[sp++] = root; onst[root] = 1;
+        while (depth >= 0) {
+            const int v = cs[depth];
+            if (ce[depth] < head[v + 1]) {
+                const int w = to[ce[depth]++];
+                if (idx[w] < 0) {
+                    idx[w] = low[w] = counter++; st[sp++] = w; onst[w] = 1;
+                    depth++; cs[depth] = w; ce[depth] = head[w];
+                } else if (onst[w] && idx[w] < low[v]) low[v] = idx[w];
+                continue;
+            }
+            if (low[v] == idx[v]) {
+                int k = sp;
+                while (st[k - 1] != v) k--;
+                const int size = sp - (k - 1);
+                if (size > 1) { nscc++; for (int j = k - 1; j < sp; j++) c->scc[st[j]] = nscc; }
+                for (int j = k - 1; j < sp; j++) onst[st[j]] = 0;
+                sp = k - 1;
+            }
+            depth--;
+            if (depth >= 0 && low[v] < low[cs[depth]]) low[cs[depth]] = low[v];
+        }
+    }
+    fprintf(stderr, "allegrexrecomp: %d tail-call cycles; their transfers go through psp_scc_next\n", nscc);
+done:
+    free(idx); free(low); free(onst); free(st); free(cs); free(ce);
+    free(head); free(to); free(from);
+}
+
+/* Is this tail transfer from the current function to `target` inside a cycle? */
+static int scc_transfer(const ectx *c, uint32_t target) {
+    if (!c->scc) return 0;
+    const int cur = (int)(c->func - c->an->funcs);
+    const a_func *t = func_at(c->an, target);
+    if (!t) return 0;
+    const int ti = (int)(t - c->an->funcs);
+    return c->scc[cur] != 0 && c->scc[cur] == c->scc[ti];
 }
 
 /* Does `f` contain a call whose delay slot reloads $ra (`jal g ; lw $ra, ..`)?
@@ -1037,6 +1150,8 @@ static void emit_function(ectx *c, const a_func *fn) {
                     emit_static_call(c, in.target);
                     emit_return_check(c, "        ", a + 8);
                 }
+                else if (scc_transfer(c, in.target))
+                    fprintf(f, "        psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n        return;\n", in.target);
                 else
                     { emit_static_call(c, in.target); fprintf(f, "        return;\n"); }
                 fprintf(f, "    }\n");
@@ -1061,6 +1176,8 @@ static void emit_function(ectx *c, const a_func *fn) {
                 else {
                     fprintf(f, "      if (_c) { ");
                     if (is_import(an, in.target))      fprintf(f, "psp_import_%08X();", in.target);
+                    else if (!in.is_call && scc_transfer(c, in.target))
+                        fprintf(f, "psp_scc_next = 0x%08Xu;", in.target);
                     else if (is_function(an, in.target)) fprintf(f, "psp_func_%08X();", in.target);
                     else                                fprintf(f, "psp_dispatch(0x%08Xu);", in.target);
                     /* bltzal / bgezal (and bal) are conditional *calls*: the
@@ -1155,6 +1272,8 @@ static void emit_function(ectx *c, const a_func *fn) {
                     fprintf(f, "    PSP_LOOP(0x%08Xu);\n    goto L_%08X;\n", in.target, in.target);
             } else if (owned_by(an, in.target, owner) && !is_function(an, in.target)) {
                 fprintf(f, "    goto L_%08X;\n", in.target);
+            } else if (scc_transfer(c, in.target)) {
+                fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n    return;\n", in.target);
             } else {
                 emit_static_call(c, in.target);  /* tail call */
                 fprintf(f, "    return;\n");
@@ -1213,15 +1332,23 @@ static void emit_function(ectx *c, const a_func *fn) {
                    "    psp_hook_fn h_ = psp_hook_find(0x%08Xu);\n"
                    "    if (h_) h_(psp_orig_%08X); else psp_orig_%08X();\n"
                    "}\n", fn->addr, fn->addr, fn->addr, fn->addr);
+    } else if (c->scc && c->scc[c->func - an->funcs]) {
+        /* A tail-call cycle member: entering it runs the cycle to its end
+         * (see compute_tail_cycles); psp_step_X is one pass, for the drain. */
+        fprintf(f, "static void psp_step_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
+                fn->addr, fn->addr, fn->addr);
+        fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); psp_scc_drain(); }\n",
+                fn->addr, fn->addr, fn->addr);
     } else {
         fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
                 fn->addr, fn->addr, fn->addr);
     }
+    const int in_cycle = c->scc && c->scc[c->func - an->funcs];
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
         if (c->is_slot[widx(an, a)] || a == fn->addr) continue;
-        fprintf(f, "void psp_at_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
-                a, fn->addr, a);
+        fprintf(f, "void psp_at_%08X(void) { psp_body_%08X(0x%08Xu);%s }\n",
+                a, fn->addr, a, in_cycle ? " psp_scc_drain();" : "");
         entry_push(c, a);
     }
 }
@@ -1399,12 +1526,29 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
         return -1;
     }
 
+    c.hooks = o->hooks; c.nhooks = o->nhooks;
+    c.scc = NULL;
+    compute_tail_cycles(&c);
+    /* Tail transfers inside a cycle: see compute_tail_cycles. */
+    fprintf(f,
+        "\nstatic uint32_t psp_scc_next;   /* a pending tail transfer within a tail-call cycle */\n"
+        "static void psp_scc_step(uint32_t t);\n"
+        "static void psp_scc_drain(void) {\n"
+        "    while (psp_scc_next) { const uint32_t t_ = psp_scc_next; psp_scc_next = 0; psp_scc_step(t_); }\n"
+        "}\n");
+
     mark_continuations(&c);
     for (int i = 0; i < an->nfuncs; i++) {
         c.func = &an->funcs[i];
         c.hooks = o->hooks; c.nhooks = o->nhooks;
         emit_function(&c, &an->funcs[i]);
     }
+
+    fprintf(f, "\nstatic void psp_scc_step(uint32_t t) {\n    switch (t) {\n");
+    for (int i = 0; c.scc && i < an->nfuncs; i++)
+        if (c.scc[i]) fprintf(f, "    case 0x%08Xu: psp_step_%08X(); break;\n", an->funcs[i].addr, an->funcs[i].addr);
+    fprintf(f, "    default: psp_dispatch(t); break;\n    }\n}\n");
+    free(c.scc);
 
     /* Registration */
     fprintf(f,
