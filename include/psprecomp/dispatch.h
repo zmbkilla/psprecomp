@@ -36,6 +36,9 @@ psp_fn_t psp_lookup(uint32_t addr);
  * (below) rather than crashing, so bring-up gets a report naming the address
  * instead of an access violation. */
 void psp_dispatch(uint32_t addr);
+/* The calling PSP thread stops for good (waits for vblanks forever), as one
+ * spinning in a one-instruction `j .` does on hardware; the rest keeps running. */
+void psp_park_thread(void);
 
 /* Called when psp_dispatch hits an unregistered address. The default prints
  * the address and aborts; a host can override it to log and continue, which is

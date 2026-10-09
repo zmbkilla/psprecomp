@@ -1144,7 +1144,16 @@ static void emit_function(ectx *c, const a_func *fn) {
 
         if (in.is_jump) {                        /* j */
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
-            if (owned_by(an, in.target, owner) && !is_function(an, in.target)) {
+            if (in.target == owner) {
+                /* A jump back to the function's own entry is a loop (a compiler's
+                 * tail-recursion elimination, or `for (;;)`). Emitted as a call it
+                 * would add a host stack frame per iteration and overflow the
+                 * stack on a long loop (0xC00000FD): 296 functions of PSP2i do this. */
+                if (in.target == a)     /* `j .` at the entry: a deliberate hang; stop the thread, keep the rest alive */
+                    fprintf(f, "    psp_park_thread();\n    return;\n");
+                else
+                    fprintf(f, "    PSP_LOOP(0x%08Xu);\n    goto L_%08X;\n", in.target, in.target);
+            } else if (owned_by(an, in.target, owner) && !is_function(an, in.target)) {
                 fprintf(f, "    goto L_%08X;\n", in.target);
             } else {
                 emit_static_call(c, in.target);  /* tail call */
