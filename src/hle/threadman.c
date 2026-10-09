@@ -527,6 +527,10 @@ uint32_t psp_sched_sleep_until(uint64_t when_us) {
     return t->wait_result;
 }
 
+void psp_park_thread(void) {
+    for (;;) psp_sched_wait_vblank(0);
+}
+
 uint32_t psp_sched_wait_vblank(int cb) {
     if (!g_sched_on || !g_current) { g_vblank_count++; return 0; }
     return wait_current(W_VBLANK, 0, 0, cb, 0, 0, 0);
