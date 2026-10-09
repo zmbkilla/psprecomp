@@ -707,6 +707,45 @@ static void sockets_pump(void) {
     }
 }
 
+/* ---- optional traffic capture (PSP2I_ADHOC_CAPTURE=<file>) ------------------------------------
+ * For finding where game values go wrong: every PTP payload the game sends or
+ * receives, appended to the file. Records: u64 ms since start, u8 direction
+ * (1 sent, 0 received), u8 socket id, u16 local port, u16 peer port, peer
+ * MAC[6], u32 length, data. Off unless the variable is set; local file only. */
+static FILE *g_cap;
+static int g_cap_tried;
+static uint64_t g_cap_t0;
+
+static void cap_ptp(const asock *a, int sent, uint32_t guest, uint32_t len) {
+    if (!g_cap_tried) {
+        g_cap_tried = 1;
+        const char *path = getenv("PSP2I_ADHOC_CAPTURE");
+        if (path && *path) {
+            g_cap = fopen(path, "ab");
+            g_cap_t0 = adhoc_real_us();
+            adhoc_log(g_cap ? "capturing game traffic to %s" : "cannot open the capture file %s", path);
+        }
+    }
+    if (!g_cap || !len) return;
+    uint8_t h[20];
+    const uint64_t ms = (adhoc_real_us() - g_cap_t0) / 1000u;
+    memcpy(h, &ms, 8);
+    h[8] = (uint8_t)sent;
+    h[9] = (uint8_t)((a - g_s) + 1);
+    memcpy(h + 10, &a->lport, 2);
+    memcpy(h + 12, &a->pport, 2);
+    memcpy(h + 14, a->paddr, 6);
+    fwrite(h, 1, sizeof h, g_cap);
+    fwrite(&len, 4, 1, g_cap);
+    uint8_t tmp[4096];
+    for (uint32_t o = 0; o < len; o += sizeof tmp) {
+        const uint32_t n = len - o < sizeof tmp ? len - o : (uint32_t)sizeof tmp;
+        psp_mem_read_block(tmp, guest + o, n);
+        fwrite(tmp, 1, n, g_cap);
+    }
+    fflush(g_cap);
+}
+
 /* ---- connections to ourselves ------------------------------------------------------------------
  * PSP2i's host connects to its own listening ports (13009, 12000). Through the
  * relay that is a round trip to the server per connection -- observed taking up
@@ -1762,7 +1801,7 @@ static void hle_PtpSend(void) {
                 psp_mem_read_block(tmp, data, len);
                 buf_add(&p->stream, tmp, len);
                 free(tmp);
-                a->tx += len;
+                a->tx += len; cap_ptp(a, 1, data, len);
                 psp_write32(lenp, len);
                 psp_ret(0);
                 return;
@@ -1774,7 +1813,7 @@ static void hle_PtpSend(void) {
                 psp_mem_read_block(tmp, data, len);
                 const int n = mesh_stream_send(a->sid, tmp, (int)len);
                 free(tmp);
-                if (n > 0) { a->tx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
+                if (n > 0) { a->tx += (uint32_t)n; cap_ptp(a, 1, data, (uint32_t)n); psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
                 if (n < 0) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             } else if (a->relay) {
                 if (a->rdead) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
@@ -1787,7 +1826,7 @@ static void hle_PtpSend(void) {
                     buf_add(&a->rout, tmp, len);
                     free(tmp);
                     relay_io(a);
-                    a->tx += len; psp_write32(lenp, len);
+                    a->tx += len; cap_ptp(a, 1, data, len); psp_write32(lenp, len);
                     psp_ret(0);
                     return;
                 }
@@ -1798,7 +1837,7 @@ static void hle_PtpSend(void) {
                 const int n = send(a->s, (const char *)tmp, (int)len, 0);
                 const int e = n < 0 ? last_error() : 0;
                 free(tmp);
-                if (n > 0) { a->tx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
+                if (n > 0) { a->tx += (uint32_t)n; cap_ptp(a, 1, data, (uint32_t)n); psp_write32(lenp, (uint32_t)n); psp_ret(0); return; }
                 if (!WOULD_BLOCK(e)) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             }
         }
@@ -1826,7 +1865,7 @@ static void hle_PtpRecv(void) {
                 const uint32_t n = a->stream.len < cap ? a->stream.len : cap;
                 psp_mem_write_block(buf, a->stream.p, n);
                 buf_drop(&a->stream, n);
-                a->rx += n;
+                a->rx += n; cap_ptp(a, 0, buf, n);
                 psp_write32(lenp, n);
                 psp_ret(0);
                 return;
@@ -1840,7 +1879,7 @@ static void hle_PtpRecv(void) {
                 const int n = mesh_stream_recv(a->sid, tmp, (int)cap);
                 if (n > 0) psp_mem_write_block(buf, tmp, (uint32_t)n);
                 free(tmp);
-                if (n > 0) { a->rx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
+                if (n > 0) { a->rx += (uint32_t)n; cap_ptp(a, 0, buf, (uint32_t)n); psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
                 if (n < 0) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             } else if (a->relay) {
                 relay_io(a);
@@ -1848,7 +1887,7 @@ static void hle_PtpRecv(void) {
                     const uint32_t n = a->stream.len < cap ? a->stream.len : cap;
                     psp_mem_write_block(buf, a->stream.p, n);
                     buf_drop(&a->stream, n);
-                    a->rx += n; psp_write32(lenp, n);
+                    a->rx += n; cap_ptp(a, 0, buf, n); psp_write32(lenp, n);
                     adhoc_peer_seen(a->paddr);
                     psp_ret(0);
                     return;
@@ -1861,7 +1900,7 @@ static void hle_PtpRecv(void) {
                 const int e = n < 0 ? last_error() : 0;
                 if (n > 0) psp_mem_write_block(buf, tmp, (uint32_t)n);
                 free(tmp);
-                if (n > 0) { a->rx += (uint32_t)n; psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
+                if (n > 0) { a->rx += (uint32_t)n; cap_ptp(a, 0, buf, (uint32_t)n); psp_write32(lenp, (uint32_t)n); adhoc_peer_seen(a->paddr); psp_ret(0); return; }
                 if (n == 0 || !WOULD_BLOCK(e)) { a->state = PTP_CLOSED; psp_ret(ADHOC_DISCONNECTED); return; }
             }
         }
