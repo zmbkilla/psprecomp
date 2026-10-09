@@ -8,7 +8,17 @@
  * SCE_HTTP_ERROR_NETWORK. Every call that shapes or reads a request is
  * reported to the transport's log, so what a game sends -- and what it then
  * asks of the response (status code, length, how much it reads) -- can be
- * seen in full. */
+ * seen in full.
+ *
+ * sceHttpSendRequest blocks only the calling PSP thread, as zmbkilla's fix in
+ * Komak57/ppsspp (sceHttp.cpp, commits f82c85a / 0be42cd: the send runs on a
+ * host thread and __KernelWaitCurThread(WAITTYPE_ASYNCIO, ...) parks the
+ * caller): the transport runs on a host worker thread while the caller waits
+ * in short scheduler sleeps, so every other PSP thread keeps running instead
+ * of the whole game stalling for the network round trip (TLS handshake
+ * included). The scheduler is single-threaded and cooperative, so the worker
+ * never touches it: it only sets a flag the waiting thread polls. Deleting
+ * the request or sceHttpEnd joins an outstanding worker first. */
 
 #include "psprecomp/hle.h"
 #include "psprecomp/net.h"
@@ -17,6 +27,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+typedef HANDLE http_thread;
+#else
+#  include <pthread.h>
+#  include <sched.h>
+typedef pthread_t http_thread;
+#endif
 
 #define SCE_HTTP_ERROR_BEFORE_INIT   0x80431001u
 #define SCE_HTTP_ERROR_ALREADY_INITED 0x80431020u
@@ -38,6 +58,13 @@ typedef struct {
     int  sent;
     psp_http_response resp;
     uint32_t read_pos;
+    /* an asynchronous send (see the top of the file) */
+    int  busy;                    /* a worker exists and has not been joined */
+    volatile long done;           /* set by the worker when the transport returned */
+    int  rc;
+    http_thread worker;
+    psp_http_request q;
+    uint8_t *body;
 } http_obj;
 
 static http_obj g_obj[MAX_OBJ];
@@ -71,8 +98,68 @@ static http_obj *obj(uint32_t id, int kind) {
     return &g_obj[id];
 }
 
+/* ---- the worker ---------------------------------------------------------------------- */
+
+#ifdef _WIN32
+static DWORD WINAPI send_main(LPVOID p) {
+#else
+static void *send_main(void *p) {
+#endif
+    http_obj *r = (http_obj *)p;
+    r->rc = g_tr && g_tr->send ? g_tr->send(&r->q, &r->resp) : (int)SCE_HTTP_ERROR_NETWORK;
+#ifdef _WIN32
+    InterlockedExchange(&r->done, 1);
+    return 0;
+#else
+    __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+#endif
+}
+
+static int send_done(http_obj *r) {
+#ifdef _WIN32
+    return InterlockedCompareExchange(&r->done, 0, 0) != 0;
+#else
+    return __atomic_load_n(&r->done, __ATOMIC_ACQUIRE) != 0;
+#endif
+}
+
+static int send_start(http_obj *r) {
+    r->done = 0;
+#ifdef _WIN32
+    r->worker = CreateThread(NULL, 0, send_main, r, 0, NULL);
+    if (!r->worker) return -1;
+#else
+    if (pthread_create(&r->worker, NULL, send_main, r) != 0) return -1;
+#endif
+    r->busy = 1;
+    return 0;
+}
+
+/* Wait for the worker to finish and release it (the host thread, not the PSP one). */
+static void send_join(http_obj *r) {
+    if (!r->busy) return;
+#ifdef _WIN32
+    WaitForSingleObject(r->worker, INFINITE);
+    CloseHandle(r->worker);
+#else
+    pthread_join(r->worker, NULL);
+#endif
+    r->busy = 0;
+    free(r->body);
+    r->body = NULL;
+}
+
+static void host_yield(void) {
+#ifdef _WIN32
+    Sleep(0);
+#else
+    sched_yield();
+#endif
+}
+
 static void free_obj(int id) {
-    if (g_obj[id].kind == 3) free(g_obj[id].resp.body);
+    if (g_obj[id].kind == 3) { send_join(&g_obj[id]); free(g_obj[id].resp.body); }
     memset(&g_obj[id], 0, sizeof g_obj[id]);
 }
 
@@ -170,6 +257,7 @@ static void hle_SendRequest(void) {
     if (!r) { psp_ret(SCE_HTTP_ERROR_INVALID_ID); return; }
     http_obj *c = obj((uint32_t)r->parent, 2);
     http_obj *t = c ? obj((uint32_t)c->parent, 1) : NULL;
+    if (r->busy) send_join(r);                          /* a previous send on this request */
     psp_http_request q;
     memset(&q, 0, sizeof q);
     static const char *const M[] = { "GET", "POST", "HEAD" };
@@ -186,11 +274,28 @@ static void hle_SendRequest(void) {
         if (body) psp_mem_read_block(body, psp_arg(1), q.body_len);
     }
     q.body = body;
-    hlog("request %d: game sends %u bytes from 0x%08X", (int)psp_arg(0), q.body_len, psp_arg(1));
+    const uint32_t id = psp_arg(0);
+    hlog("request %d: game sends %u bytes from 0x%08X", (int)id, q.body_len, psp_arg(1));
     free(r->resp.body);
     memset(&r->resp, 0, sizeof r->resp);
-    int rc = g_tr && g_tr->send ? g_tr->send(&q, &r->resp) : (int)SCE_HTTP_ERROR_NETWORK;
-    free(body);
+    r->q = q;                                           /* strings point into r, c, t: alive until joined */
+    r->body = body;
+    int rc;
+    if (send_start(r) == 0) {
+        /* Only this PSP thread waits; the scheduler runs the others meanwhile. */
+        while (!send_done(r)) {
+            psp_sched_sleep_until(psp_sched_now_us() + 1000);
+            host_yield();                               /* without a scheduler (tests): do not spin hard */
+        }
+        r = obj(id, 3);                                 /* deleted meanwhile? (delete joined the worker) */
+        if (!r) { psp_ret(SCE_HTTP_ERROR_INVALID_ID); return; }
+        rc = r->rc;
+        send_join(r);
+    } else {                                            /* no thread: the old synchronous way */
+        rc = g_tr && g_tr->send ? g_tr->send(&q, &r->resp) : (int)SCE_HTTP_ERROR_NETWORK;
+        free(body);
+        r->body = NULL;
+    }
     r->sent = rc == 0;
     r->read_pos = 0;
     psp_ret((uint32_t)rc);

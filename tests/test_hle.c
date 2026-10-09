@@ -12,9 +12,24 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include "crypto/sha1.h"
+#include "psprecomp/net.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+/* Two kernel32 calls, declared here: windows.h defines DELETE and OUT, which
+ * the tests below use as names. */
+__declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+#  define test_thread_id() ((unsigned long)GetCurrentThreadId())
+#  define test_sleep_ms(n) Sleep(n)
+#else
+#  include <pthread.h>
+#  include <unistd.h>
+#  define test_thread_id() ((unsigned long)pthread_self())
+#  define test_sleep_ms(n) usleep((n) * 1000)
+#endif
 
 static int failures;
 
@@ -519,6 +534,50 @@ static void test_savedata_roundtrip(void) {
     snprintf(path, sizeof path, "%s/ms/PSP/SAVEDATA/NPJH50332/PARAM.SFO", root); remove(path);
 }
 
+/* sceHttpSendRequest runs the transport on a host worker thread and parks
+ * only the calling PSP thread (zmbkilla's fix in Komak57/ppsspp sceHttp.cpp):
+ * the response still arrives intact, from a thread other than the caller's. */
+static unsigned long g_http_main_thread, g_http_send_thread;
+static char g_http_seen[256];
+static int fake_send(const psp_http_request *q, psp_http_response *r) {
+    g_http_send_thread = test_thread_id();
+    snprintf(g_http_seen, sizeof g_http_seen, "%s %s://%s:%u%s %u", q->method, q->scheme, q->host, q->port, q->path, q->body_len);
+    test_sleep_ms(50);                                  /* a slow server */
+    r->status = 200;
+    r->body = (uint8_t *)malloc(5);
+    memcpy(r->body, "hello", 5);
+    r->len = 5;
+    return 0;
+}
+static void fake_log(const char *line) { (void)line; }
+
+static void test_http_async(void) {
+    static const psp_http_transport T = { fake_send, fake_log };
+    psp_http_set_transport(&T);
+    g_http_main_thread = test_thread_id();
+    const uint32_t S = 0x08A00000u;
+    psp_mem_write_block(S, "PSP2", 5);
+    psp_mem_write_block(S + 0x10, "example.org", 12);
+    psp_mem_write_block(S + 0x20, "https", 6);
+    psp_mem_write_block(S + 0x30, "/cgi/front.fcgi", 16);
+    psp_mem_write_block(S + 0x80, "abc", 3);
+    CHECK(call(psp_nid("sceHttpInit"), 0x10000, 0, 0, 0) == 0, "sceHttpInit");
+    const uint32_t tmpl = call(psp_nid("sceHttpCreateTemplate"), S, 1, 0, 0);
+    const uint32_t conn = call5(psp_nid("sceHttpCreateConnection"), tmpl, S + 0x10, S + 0x20, 12020, 0);
+    psp_cpu.r[PSP_REG_T1] = 0;
+    const uint32_t req = call5(psp_nid("sceHttpCreateRequest"), conn, 1, S + 0x30, 0, 3);
+    CHECK((int)tmpl > 0 && (int)conn > 0 && (int)req > 0, "http objects (%d %d %d)", (int)tmpl, (int)conn, (int)req);
+    CHECK(call(psp_nid("sceHttpSendRequest"), req, S + 0x80, 3, 0) == 0, "sceHttpSendRequest");
+    CHECK(strcmp(g_http_seen, "POST https://example.org:12020/cgi/front.fcgi 3") == 0, "the transport got the request (%s)", g_http_seen);
+    CHECK(g_http_send_thread && g_http_send_thread != g_http_main_thread, "the transport ran on another host thread");
+    CHECK(call(psp_nid("sceHttpGetStatusCode"), req, S + 0x40, 0, 0) == 0 && psp_read32(S + 0x40) == 200, "status 200");
+    CHECK(call(psp_nid("sceHttpReadData"), req, S + 0x50, 16, 0) == 5 && !memcmp(psp_mem_ptr(S + 0x50, 5), "hello", 5), "body");
+    CHECK(call(psp_nid("sceHttpSendRequest"), req, S + 0x80, 3, 0) == 0, "a second send on the same request");
+    CHECK(call(psp_nid("sceHttpDeleteRequest"), req, 0, 0, 0) == 0, "delete");
+    CHECK(call(psp_nid("sceHttpEnd"), 0, 0, 0, 0) == 0, "sceHttpEnd");
+    psp_http_set_transport(NULL);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -540,6 +599,7 @@ int main(void) {
     test_sas_loop_markers();
     test_display();
     test_savedata_roundtrip();
+    test_http_async();
 
     psp_mem_free();
 
