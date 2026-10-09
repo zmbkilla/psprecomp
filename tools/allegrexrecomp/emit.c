@@ -424,6 +424,185 @@ static int emit_vfpu_unary(FILE *f, const char *ind, const a_insn *in, const cha
     return 1;
 }
 
+/* ---- prefixes resolved at recompile time -------------------------------------
+ * PSP2i sets a prefix (vpfxs / vpfxt / vpfxd) right before most vector
+ * operations in its hot routines (0x08D921F8, 0x08D8B864: swizzles, constants,
+ * write masks), so the no-prefix inline path above almost never ran there and
+ * each operation went through the runtime's prefix decoding -- the largest
+ * single cost in a profile of the Clad 6 lobby at 60 fps. A prefix that
+ * immediately precedes the operation is a constant: the lanes it selects are
+ * resolved here (the "plan", exactly src/vfpu.c read_src / write_dst), and the
+ * group -- prefixes plus operation -- is emitted as one unit: inline when no
+ * other prefix is pending at run time, else the original prefix calls and the
+ * runtime operation. */
+
+/* The quad an operand starts in, which a swizzle indexes: src/vfpu.c quad_compute. */
+static void vfpu_quad(unsigned vreg, int size, int out[4]) {
+    const int mtx = (vreg >> 2) & 7, col = vreg & 3;
+    int transpose = (vreg >> 5) & 1, row;
+    switch (size) {
+    case 1: row = (vreg >> 5) & 3; transpose = 0; break;
+    case 3: row = (vreg >> 6) & 1; break;
+    default: row = (vreg >> 5) & 2; break;
+    }
+    for (int i = 0; i < 4; i++) {
+        const int step = (row + i) & 3;
+        out[i] = transpose ? mtx * 4 + step * 32 + col : mtx * 4 + col * 32 + step;
+    }
+}
+
+int a_vpfx_plan_src(unsigned vreg, int size, long prefix, a_vpfx_src out[4]) {
+    if (size < 1 || size > 4) return 0;
+    if (prefix < 0) {                                   /* the operand's own lanes */
+        int L[4];
+        vfpu_lanes(vreg, size, L);
+        for (int i = 0; i < size; i++) { out[i].reg = L[i]; out[i].cst = -1; out[i].abs = out[i].neg = 0; }
+        return size;
+    }
+    const unsigned long p = (unsigned long)prefix & 0xFFFFFul;
+    int Q[4];
+    vfpu_quad(vreg, size, Q);
+    for (int i = 0; i < size; i++) {
+        const int swz = (int)(p >> (2 * i)) & 3, abs_ = (int)(p >> (8 + i)) & 1;
+        const int cst = (int)(p >> (12 + i)) & 1, neg = (int)(p >> (16 + i)) & 1;
+        out[i].reg = cst ? -1 : Q[swz];
+        out[i].cst = cst ? swz + 4 * abs_ : -1;
+        out[i].abs = cst ? 0 : abs_;
+        out[i].neg = neg;
+    }
+    return size;
+}
+
+int a_vpfx_plan_dst(unsigned vreg, int size, long prefix, a_vpfx_dst out[4]) {
+    if (size < 1 || size > 4) return 0;
+    int L[4];
+    vfpu_lanes(vreg, size, L);
+    const unsigned long p = prefix < 0 ? 0 : (unsigned long)prefix & 0xFFFFFul;
+    for (int i = 0; i < size; i++) {
+        out[i].reg = L[i];
+        out[i].masked = (int)(p >> (8 + i)) & 1;
+        const int s = (int)(p >> (2 * i)) & 3;
+        out[i].sat = s == 1 || s == 3 ? s : 0;
+    }
+    return size;
+}
+
+/* A source lane as a C expression (src/vfpu.c PFX_CONST, fabsf as a bit mask). */
+static void src_c(char *buf, size_t n, const a_vpfx_src *s) {
+    static const char *const K[8] = { "0.0f", "1.0f", "2.0f", "0.5f", "3.0f", "(1.0f / 3.0f)", "0.25f", "(1.0f / 6.0f)" };
+    char x[96];
+    if (s->cst >= 0) snprintf(x, sizeof x, "%s", K[s->cst]);
+    else if (s->abs) snprintf(x, sizeof x, "psp_bits_to_f32(psp_f32_to_bits(psp_cpu.v[%d]) & 0x7FFFFFFFu)", s->reg);
+    else snprintf(x, sizeof x, "psp_cpu.v[%d]", s->reg);
+    if (s->neg) snprintf(buf, n, "-(%s)", x);
+    else snprintf(buf, n, "%s", x);
+}
+
+/* The operations a group can inline, and their runtime fallbacks. */
+static int pfx_op_kind(const a_insn *in, const char **call) {
+    switch (in->op) {
+    case A_VADD: *call = "psp_vadd"; return VB_ADD;
+    case A_VSUB: *call = "psp_vsub"; return VB_SUB;
+    case A_VMUL: *call = "psp_vmul"; return VB_MUL;
+    case A_VDIV: *call = "psp_vdiv"; return VB_DIV;
+    case A_VMIN: *call = "psp_vmin"; return VB_MIN;
+    case A_VMAX: *call = "psp_vmax"; return VB_MAX;
+    case A_VSGE: *call = "psp_vsge"; return VB_SGE;
+    case A_VSLT: *call = "psp_vslt"; return VB_SLT;
+    case A_VDOT: *call = "psp_vdot"; return VB_DOT;
+    case A_VSCL: *call = "psp_vscl"; return VB_SCL;
+    case A_VMOV: *call = "PSP_VU_MOV"; return 100;
+    case A_VABS: *call = "PSP_VU_ABS"; return 101;
+    case A_VNEG: *call = "PSP_VU_NEG"; return 102;
+    case A_VZERO: *call = "PSP_VU_ZERO"; return 103;
+    case A_VONE: *call = "PSP_VU_ONE"; return 104;
+    default: return -1;
+    }
+}
+
+/* Emit the group starting with the prefix at a0 (see above). Returns 1 and
+ * the operation's address in *last, or 0 to leave it to the usual path. */
+static int emit_vfpu_pfx_group(ectx *c, uint32_t a0, uint32_t owner, uint32_t *last) {
+    const a_analysis *an = c->an;
+    FILE *f = c->out;
+    if (c->is_slot[widx(an, a0)]) return 0;
+    long pfx[3] = { -1, -1, -1 };
+    a_insn pre[8], op;
+    int np = 0;
+    uint32_t a = a0;
+    for (;;) {
+        if (a != a0 && (!owned_by(an, a, owner) || c->is_label[widx(an, a)] || c->is_slot[widx(an, a)])) return 0;
+        a_insn in;
+        a_decode(fetch(an, a), a, &in);
+        const int w = in.op == A_VPFXS ? 0 : in.op == A_VPFXT ? 1 : in.op == A_VPFXD ? 2 : -1;
+        if (w >= 0) {
+            if (np == 8) return 0;
+            pre[np++] = in;
+            pfx[w] = (long)(in.raw & 0xFFFFFu);
+            a += 4;
+            continue;
+        }
+        op = in;
+        break;
+    }
+    const char *call = NULL;
+    const int kind = pfx_op_kind(&op, &call);
+    const int n = op.vsize;
+    if (kind < 0 || n < 1 || n > 4) return 0;
+    const int unary = kind >= 100, nosrc = kind == 103 || kind == 104;
+    a_vpfx_src S[4], T[4];
+    a_vpfx_dst D[4];
+    if (!nosrc) a_vpfx_plan_src(op.vs, n, pfx[0], S);
+    if (!unary) a_vpfx_plan_src(op.vt, kind == VB_SCL ? 1 : n, pfx[1], T);
+    const int dn = kind == VB_DOT ? 1 : n;
+    a_vpfx_plan_dst(op.vd, dn, pfx[2], D);
+
+    for (int i = 1; i < np; i++) comment(c, &pre[i]);
+    comment(c, &op);
+    char e[160];
+    fprintf(f, "    if (!psp_vfpu_pfx_any) {");
+    if (!nosrc) for (int i = 0; i < n; i++) { src_c(e, sizeof e, &S[i]); fprintf(f, " const float _a%d = %s;", i, e); }
+    if (!unary) for (int i = 0; i < (kind == VB_SCL ? 1 : n); i++) { src_c(e, sizeof e, &T[i]); fprintf(f, " const float _b%d = %s;", i, e); }
+    for (int i = 0; i < dn; i++) {
+        fprintf(f, " const float _r%d = ", i);
+        if (kind == VB_DOT) {
+            fprintf(f, "0.0f");
+            for (int k = 0; k < n; k++) fprintf(f, " + _a%d * _b%d", k, k);
+        } else switch (kind) {
+        case VB_ADD: fprintf(f, "_a%d + _b%d", i, i); break;
+        case VB_SUB: fprintf(f, "_a%d - _b%d", i, i); break;
+        case VB_MUL: fprintf(f, "_a%d * _b%d", i, i); break;
+        case VB_SCL: fprintf(f, "_a%d * _b0", i); break;
+        case VB_DIV: fprintf(f, "_a%d / _b%d", i, i); break;
+        case VB_MIN: fprintf(f, "_a%d < _b%d ? _a%d : _b%d", i, i, i, i); break;
+        case VB_MAX: fprintf(f, "_a%d > _b%d ? _a%d : _b%d", i, i, i, i); break;
+        case VB_SGE: fprintf(f, "_a%d >= _b%d ? 1.0f : 0.0f", i, i); break;
+        case VB_SLT: fprintf(f, "_a%d < _b%d ? 1.0f : 0.0f", i, i); break;
+        case 100: fprintf(f, "_a%d", i); break;
+        case 101: fprintf(f, "psp_bits_to_f32(psp_f32_to_bits(_a%d) & 0x7FFFFFFFu)", i); break;
+        case 102: fprintf(f, "-_a%d", i); break;
+        case 103: fprintf(f, "0.0f"); break;
+        default:  fprintf(f, "1.0f"); break;
+        }
+        fprintf(f, ";");
+    }
+    for (int i = 0; i < dn; i++) {
+        if (D[i].masked) continue;
+        if (D[i].sat == 1) fprintf(f, " psp_cpu.v[%d] = _r%d < 0.0f ? 0.0f : (_r%d > 1.0f ? 1.0f : _r%d);", D[i].reg, i, i, i);
+        else if (D[i].sat == 3) fprintf(f, " psp_cpu.v[%d] = _r%d < -1.0f ? -1.0f : (_r%d > 1.0f ? 1.0f : _r%d);", D[i].reg, i, i, i);
+        else fprintf(f, " psp_cpu.v[%d] = _r%d;", D[i].reg, i);
+    }
+    fprintf(f, " } else {");
+    for (int i = 0; i < np; i++) {
+        const int w = pre[i].op == A_VPFXS ? 0 : pre[i].op == A_VPFXT ? 1 : 2;
+        fprintf(f, " psp_vfpu_set_prefix(%d, 0x%06Xu);", w, pre[i].raw & 0xFFFFFF);
+    }
+    if (unary) fprintf(f, " psp_vunary(%s, %u, %u, %u); }\n", call, op.vd, op.vs, op.vsize);
+    else fprintf(f, " %s(%u, %u, %u, %u); }\n", call, op.vd, op.vs, op.vt, op.vsize);
+    *last = a;
+    return 1;
+}
+
 /* vtfm / vhtfm (order 2..4). They take no prefixes: always inline, then drop
  * any pending prefix as the runtime does. src/vfpu.c transform. */
 static void emit_vfpu_tfm(FILE *f, const char *ind, const a_insn *in, int order, int homogeneous) {
@@ -1327,6 +1506,10 @@ static void emit_function(ectx *c, const a_func *fn) {
             continue;
         }
 
+        if (in.op == A_VPFXS || in.op == A_VPFXT || in.op == A_VPFXD) {
+            uint32_t last;
+            if (emit_vfpu_pfx_group(c, a, owner, &last)) { a = last; continue; }   /* prefixes + operation */
+        }
         emit_simple(c, &in, "    ");
     }
 
