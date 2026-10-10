@@ -194,11 +194,7 @@ static uint32_t new_request(uint32_t ctx, uint32_t opt, uint32_t assigned_ptr, u
 #define MAX_PENDING 64
 static struct { uint32_t cb, a[8]; unsigned due; uint64_t due_ms; } g_pending[MAX_PENDING];
 
-static uint64_t now_ms(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
+static uint64_t now_ms(void) { return psp_wall_us() / 1000u; }
 static int g_npending;
 static unsigned g_polls;
 

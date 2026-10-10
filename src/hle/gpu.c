@@ -45,7 +45,10 @@
 #include "psprecomp/ge_vertex.h"
 
 #include <math.h>
-#include <emmintrin.h>
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
+#  include <emmintrin.h>
+#  define GPU_SSE2 1
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -729,6 +732,18 @@ static inline uint32_t fast_sample(float u, float v) {
     float ax = fu - (float)x0, ay = fv - (float)y0;
     uint32_t xa = wrap(x0, w, cu), xb = wrap(x0 + 1, w, cu);
     uint32_t ya = wrap(y0, h, cv), yb = wrap(y0 + 1, h, cv);
+#ifndef GPU_SSE2
+    /* the same arithmetic per channel, for hosts without SSE2 (arm64) */
+    const uint32_t t0 = fast_texel(xa, ya), t1 = fast_texel(xb, ya), t2 = fast_texel(xa, yb), t3 = fast_texel(xb, yb);
+    uint32_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        const float c0 = (float)((t0 >> sh) & 0xFF), c1 = (float)((t1 >> sh) & 0xFF);
+        const float c2 = (float)((t2 >> sh) & 0xFF), c3 = (float)((t3 >> sh) & 0xFF);
+        const float a = c0 * (1 - ax) + c1 * ax, b = c2 * (1 - ax) + c3 * ax;
+        out |= ((uint32_t)(int32_t)(a * (1 - ay) + b * ay + 0.5f) & 0xFFu) << sh;
+    }
+    return out;
+#else
     const __m128i z = _mm_setzero_si128();
 #define CH4(t) _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)(t)), z), z))
     __m128 t0 = CH4(fast_texel(xa, ya)), t1 = CH4(fast_texel(xb, ya));
@@ -744,6 +759,7 @@ static inline uint32_t fast_sample(float u, float v) {
     q = _mm_packs_epi32(q, z);
     q = _mm_packus_epi16(q, z);
     return (uint32_t)_mm_cvtsi128_si32(q);
+#endif
 }
 
 /* shade(), verbatim but for the sampler. */

@@ -120,11 +120,7 @@ void adhoc_log(const char *fmt, ...) {
     psp_net_log_line("adhoc: %s", line);
 }
 
-uint64_t adhoc_real_us(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
+uint64_t adhoc_real_us(void) { return psp_wall_us(); }
 /* Never 0: a friend's last_recv doubles as its "active" flag. */
 uint64_t adhoc_guest_us(void) { const uint64_t t = psp_sched_now_us(); return t ? t : 1; }
 

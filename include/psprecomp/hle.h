@@ -23,6 +23,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -95,6 +96,17 @@ static inline uint32_t psp_arg(int n) {
 }
 
 static inline void psp_ret(uint32_t v) { psp_cpu.r[PSP_REG_V0] = v; }
+
+/* Wall-clock time in microseconds (timespec_get is not on older Android). */
+static inline uint64_t psp_wall_us(void) {
+    struct timespec ts;
+#ifdef _WIN32
+    timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 /* Read a NUL-terminated string out of guest memory into a host buffer.
  * Always terminates; returns `dst`. */

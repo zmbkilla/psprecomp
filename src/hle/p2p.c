@@ -87,16 +87,8 @@ static uint32_t g_public_ip_n;      /* as the matching server saw us */
 static uint16_t g_public_port;
 static uint64_t g_ping_ms, g_pong_ms;
 
-static uint64_t now_ms(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
-static uint64_t now_us(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
+static uint64_t now_ms(void) { return psp_wall_us() / 1000u; }
+static uint64_t now_us(void) { return psp_wall_us(); }
 
 static const char *ip_text(uint32_t ip_n, char *buf) {
     const uint8_t *b = (const uint8_t *)&ip_n;
