@@ -85,9 +85,7 @@ int psp_net_host_info(psp_net_host *out) {
     static psp_net_host cached;
     static int have;
     static uint64_t at_ms;
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    const uint64_t now_ms = psp_wall_us() / 1000u;
     if (!have || now_ms - at_ms >= 2000u) {
         host_info_query(&cached);
         have = 1;
