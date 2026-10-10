@@ -766,8 +766,8 @@ static void test_io_case(void) {
     psp_mem_write_block(S + 0x080, "ms0:/Dir_A/Sub_B/File_C.bin", 28);
     psp_mem_write_block(S + 0x0C0, "ms0:/dir_a/SUB_b/file_c.BIN", 28);
     psp_mem_write_block(BUF, "abc", 3);
-    CHECK(call(psp_nid("sceIoMkdir"), S, 0777, 0, 0) == 0, "mkdir Dir_A");
-    CHECK(call(psp_nid("sceIoMkdir"), S + 0x40, 0777, 0, 0) == 0, "mkdir Sub_B");
+    { const uint32_t r = call(psp_nid("sceIoMkdir"), S, 0777, 0, 0); CHECK(r == 0 || r == 0x80010011u, "mkdir Dir_A (%08x)", r); }   /* or left by an earlier run */
+    { const uint32_t r = call(psp_nid("sceIoMkdir"), S + 0x40, 0777, 0, 0); CHECK(r == 0 || r == 0x80010011u, "mkdir Sub_B (%08x)", r); }
     int fd = (int)call(psp_nid("sceIoOpen"), S + 0x80, 0x0602, 0777, 0);
     CHECK(fd >= 0, "create File_C.bin (%08x)", (unsigned)fd);
     CHECK(call(psp_nid("sceIoWrite"), (uint32_t)fd, BUF, 3, 0) == 3, "write");
