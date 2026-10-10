@@ -743,6 +743,43 @@ static void test_scheduler(void) {
         CHECK(g_sched_log[i] == i + 1, "step %d was %d: priorities and waits decide who runs", i + 1, g_sched_log[i]);
 }
 
+/* ---- file names ignore case, as on the PSP ------------------------------------ */
+
+#ifdef _WIN32
+int _mkdir(const char *path);
+#  define test_mkdir(p) _mkdir(p)
+#else
+#  include <sys/stat.h>
+#  define test_mkdir(p) mkdir(p, 0777)
+#endif
+
+static void test_io_case(void) {
+    char root[256], ms[300];
+    snprintf(root, sizeof root, "psprecomp_test_case_%u", (unsigned)psp_cpu.r[PSP_REG_SP]);
+    snprintf(ms, sizeof ms, "%s/ms", root);
+    test_mkdir(root);
+    test_mkdir(ms);
+    psp_io_set_root(root);
+    const uint32_t S = 0x08A10000u, BUF = 0x08A11000u;
+    psp_mem_write_block(S + 0x000, "ms0:/Dir_A", 11);
+    psp_mem_write_block(S + 0x040, "ms0:/Dir_A/Sub_B", 17);
+    psp_mem_write_block(S + 0x080, "ms0:/Dir_A/Sub_B/File_C.bin", 28);
+    psp_mem_write_block(S + 0x0C0, "ms0:/dir_a/SUB_b/file_c.BIN", 28);
+    psp_mem_write_block(BUF, "abc", 3);
+    CHECK(call(psp_nid("sceIoMkdir"), S, 0777, 0, 0) == 0, "mkdir Dir_A");
+    CHECK(call(psp_nid("sceIoMkdir"), S + 0x40, 0777, 0, 0) == 0, "mkdir Sub_B");
+    int fd = (int)call(psp_nid("sceIoOpen"), S + 0x80, 0x0602, 0777, 0);
+    CHECK(fd >= 0, "create File_C.bin (%08x)", (unsigned)fd);
+    CHECK(call(psp_nid("sceIoWrite"), (uint32_t)fd, BUF, 3, 0) == 3, "write");
+    call(psp_nid("sceIoClose"), (uint32_t)fd, 0, 0, 0);
+    fd = (int)call(psp_nid("sceIoOpen"), S + 0xC0, 1, 0, 0);
+    CHECK(fd >= 0, "the same file in another case opens (%08x)", (unsigned)fd);
+    psp_write32(BUF + 0x10, 0);
+    CHECK(call(psp_nid("sceIoRead"), (uint32_t)fd, BUF + 0x10, 3, 0) == 3 &&
+          !memcmp(psp_mem_ptr(BUF + 0x10, 3), "abc", 3), "and reads back");
+    call(psp_nid("sceIoClose"), (uint32_t)fd, 0, 0, 0);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -766,6 +803,7 @@ int main(void) {
     test_savedata_roundtrip();
     test_http_async();
     test_mpeg_movie();
+    test_io_case();
     test_scheduler();                /* last: it leaves the scheduler state behind */
 
     psp_mem_free();

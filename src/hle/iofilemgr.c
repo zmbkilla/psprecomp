@@ -25,6 +25,8 @@
 #  define host_mkdir(p) _mkdir(p)
 #else
 #  include <dirent.h>
+#  include <strings.h>
+#  include <unistd.h>
 #  define fseek64 fseeko
 #  define ftell64 ftello
 #  define host_mkdir(p) mkdir(p, 0777)
@@ -193,6 +195,39 @@ static int tracing(void) {
 /* Rewrite a PSP path into a host path. The device prefix becomes a
  * subdirectory so a disc image and a memory-stick image can coexist under one
  * root without colliding. */
+#ifndef _WIN32
+/* PSP paths ignore case; a case-sensitive host filesystem (Linux, some
+ * Android storage) needs a missing component matched against its directory.
+ * Only the part after `prefix` (the root and the device folder) is fixed. */
+static void fix_case(char *path, size_t prefix) {
+    if (access(path, F_OK) == 0) return;
+    size_t i = prefix;
+    while (path[i]) {
+        while (path[i] == '/') i++;
+        const size_t start = i;
+        while (path[i] && path[i] != '/') i++;
+        if (i == start) break;
+        const char saved = path[i];
+        path[i] = '\0';
+        if (access(path, F_OK) != 0) {
+            path[start - 1] = '\0';                         /* the directory holding it */
+            DIR *d = opendir(path);
+            path[start - 1] = '/';
+            struct dirent *e;
+            while (d && (e = readdir(d)) != NULL)
+                if (strlen(e->d_name) == i - start && !strcasecmp(e->d_name, path + start)) {
+                    memcpy(path + start, e->d_name, i - start);
+                    break;
+                }
+            if (d) closedir(d);
+        }
+        const int found = access(path, F_OK) == 0;
+        path[i] = saved;
+        if (!found) return;                                 /* missing: nothing below it exists either */
+    }
+}
+#endif
+
 static void map_path(const char *guest, char *out, size_t cap) {
     const char *p = guest;
     const char *sub = "disc";
@@ -205,8 +240,12 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "host0:", 6))  { p += 6; sub = "host"; }
 
     while (*p == '/' || *p == '\\') p++;
-    if (g_ms_root[0] && !strcmp(sub, "ms")) { snprintf(out, cap, "%s/%s", g_ms_root, p); return; }
-    snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    if (g_ms_root[0] && !strcmp(sub, "ms")) snprintf(out, cap, "%s/%s", g_ms_root, p);
+    else snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+#ifndef _WIN32
+    const size_t prefix = strlen(out) - strlen(p);
+    if (prefix > 0 && prefix < strlen(out)) fix_case(out, prefix);
+#endif
 }
 
 /* For other HLE modules that touch guest paths (the savedata utility). */
