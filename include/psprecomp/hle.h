@@ -185,6 +185,9 @@ typedef struct {
 } psp_atrac_codec;
 void psp_atrac_set_codec(const psp_atrac_codec *codec);
 const psp_atrac_codec *psp_atrac_get_codec(void);   /* also used for movie audio */
+/* ATRAC events (IDs opened and released, resets, errors, streams running
+ * dry) as lines for the host's log; NULL = stderr. */
+void psp_atrac_set_log(void (*fn)(const char *line));
 uint64_t psp_audio_blocks(void);
 
 /* H.264 decoding for sceMpeg movies is supplied by the host as well (see
