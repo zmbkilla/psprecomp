@@ -908,6 +908,28 @@ static void thread_body(psp_thread *t) {
 static void WINAPI fiber_proc(void *p) { thread_body((psp_thread *)p); }
 #elif defined(PSPRECOMP_ASM_FIBERS)
 static void fiber_proc(void *p) { thread_body((psp_thread *)p); }
+
+/* Seed a fresh stack so that the first switch to it calls fn(arg). Returns
+ * the stack pointer to switch to. */
+static void *asm_seed(void *stack, size_t size, void (*fn)(void *), void *arg) {
+    uintptr_t top = ((uintptr_t)stack + size) & ~(uintptr_t)15;
+#if defined(__aarch64__)
+    uint64_t *frame = (uint64_t *)(top - 160);
+    memset(frame, 0, 160);
+    frame[0] = (uint64_t)(uintptr_t)fn;                  /* x19 */
+    frame[1] = (uint64_t)(uintptr_t)arg;                 /* x20 */
+    frame[11] = (uint64_t)(uintptr_t)psp_fiber_start;    /* x30: where the first switch returns */
+#else
+    /* After the return into psp_fiber_start the stack is 16-aligned, as a
+     * call needs. Slots from the saved sp: r15 r14 r13 r12 rbx rbp ret. */
+    uint64_t *frame = (uint64_t *)(top - 16 - 8 * 7);
+    memset(frame, 0, 8 * 7);
+    frame[2] = (uint64_t)(uintptr_t)arg;                 /* r13 */
+    frame[3] = (uint64_t)(uintptr_t)fn;                  /* r12 */
+    frame[6] = (uint64_t)(uintptr_t)psp_fiber_start;     /* return address */
+#endif
+    return frame;
+}
 #elif defined(PSPRECOMP_THREAD_FIBERS)
 static void *fiber_proc(void *p) {
     host_fiber *f = (host_fiber *)p;
@@ -932,23 +954,7 @@ static int fiber_create(psp_thread *t) {
     if (!f) return -1;
     f->stack = malloc(FIBER_STACK_RESERVE);
     if (!f->stack) { free(f); return -1; }
-    uintptr_t top = ((uintptr_t)f->stack + FIBER_STACK_RESERVE) & ~(uintptr_t)15;
-#if defined(__aarch64__)
-    uint64_t *frame = (uint64_t *)(top - 160);
-    memset(frame, 0, 160);
-    frame[0] = (uint64_t)(uintptr_t)fiber_proc;          /* x19 */
-    frame[1] = (uint64_t)(uintptr_t)t;                   /* x20 */
-    frame[11] = (uint64_t)(uintptr_t)psp_fiber_start;    /* x30: where the first switch returns */
-#else
-    /* After the return into psp_fiber_start the stack is 16-aligned, as a
-     * call needs. Slots from the saved sp: r15 r14 r13 r12 rbx rbp ret. */
-    uint64_t *frame = (uint64_t *)(top - 16 - 8 * 7);
-    memset(frame, 0, 8 * 7);
-    frame[2] = (uint64_t)(uintptr_t)t;                   /* r13 */
-    frame[3] = (uint64_t)(uintptr_t)fiber_proc;          /* r12 */
-    frame[6] = (uint64_t)(uintptr_t)psp_fiber_start;     /* return address */
-#endif
-    f->sp = frame;
+    f->sp = asm_seed(f->stack, FIBER_STACK_RESERVE, fiber_proc, t);
     t->fiber = f;
     return 0;
 #elif defined(PSPRECOMP_THREAD_FIBERS)
@@ -1117,8 +1123,46 @@ static psp_thread *new_thread(const char *name, uint32_t entry, uint32_t prio,
 /* Run the game: `entry` becomes the first thread, and the scheduler runs
  * until every thread has ended, the game exits, or nothing can ever run again
  * (reported, with every thread's state). */
+static int sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+                     uint32_t prio, uint32_t stack_size, uint32_t gp);
+
+#if defined(PSPRECOMP_ASM_FIBERS)
+/* The scheduler -- and the guest code it runs between threads (interrupt
+ * handlers, posted calls) -- gets a large stack of its own as well, on the
+ * same OS thread: the caller's may be small (Android's SDL thread has about
+ * 1 MB, where the Windows exe asks for 16). */
+static struct {
+    uint32_t entry, arglen, argp, prio, stack_size, gp;
+    int      rc;
+    void    *caller_sp;
+} g_run;
+
+static void sched_on_own_stack(void *unused) {
+    (void)unused;
+    g_run.rc = sched_run(g_run.entry, g_run.arglen, g_run.argp, g_run.prio, g_run.stack_size, g_run.gp);
+    void *dead;                             /* this stack is never resumed */
+    psp_fiber_switch(&dead, g_run.caller_sp);
+}
+
 int psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
                   uint32_t prio, uint32_t stack_size, uint32_t gp) {
+    void *stack = malloc(FIBER_STACK_RESERVE);
+    if (!stack) return sched_run(entry, arglen, argp, prio, stack_size, gp);
+    g_run.entry = entry; g_run.arglen = arglen; g_run.argp = argp;
+    g_run.prio = prio; g_run.stack_size = stack_size; g_run.gp = gp;
+    psp_fiber_switch(&g_run.caller_sp, asm_seed(stack, FIBER_STACK_RESERVE, sched_on_own_stack, NULL));
+    free(stack);
+    return g_run.rc;
+}
+#else
+int psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+                  uint32_t prio, uint32_t stack_size, uint32_t gp) {
+    return sched_run(entry, arglen, argp, prio, stack_size, gp);
+}
+#endif
+
+static int sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+                     uint32_t prio, uint32_t stack_size, uint32_t gp) {
 #ifdef _WIN32
     g_main_fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
     if (!g_main_fiber) { fprintf(stderr, "psprecomp: ConvertThreadToFiber failed\n"); return -1; }
