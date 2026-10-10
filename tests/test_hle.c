@@ -700,6 +700,49 @@ static void test_mpeg_movie(void) {
     psp_mpeg_set_video_codec(NULL);
 }
 
+/* ---- the scheduler: threads on host fibers ----------------------------------- */
+
+static int g_sched_log[8], g_sched_n;
+static uint32_t g_sched_sema;
+
+static void sched_log(int v) { if (g_sched_n < 8) g_sched_log[g_sched_n++] = v; }
+
+/* Lower priority than root: runs only while root waits. */
+static void sched_child(void) {
+    sched_log(2);
+    call(psp_nid("sceKernelSignalSema"), g_sched_sema, 1, 0, 0);   /* wakes root, which preempts */
+    sched_log(4);
+    psp_cpu.r[PSP_REG_V0] = 0;
+}
+
+static void sched_root(void) {
+    const uint32_t CHILD = 0x08801100u;
+    psp_register(CHILD, sched_child);
+    sched_log(1);
+    g_sched_sema = call5(psp_nid("sceKernelCreateSema"), 0, 0, 0, 1, 0);
+    psp_cpu.r[PSP_REG_T1] = 0;
+    const uint32_t th = call5(psp_nid("sceKernelCreateThread"), 0, CHILD, 0x30, 0x4000, 0);
+    call(psp_nid("sceKernelStartThread"), th, 0, 0, 0);
+    call(psp_nid("sceKernelWaitSema"), g_sched_sema, 1, 0, 0);         /* blocks: the child runs */
+    sched_log(3);
+    call(psp_nid("sceKernelDelayThread"), 2000, 0, 0, 0);               /* the child finishes */
+    sched_log(5);
+    psp_cpu.r[PSP_REG_V0] = 0;
+}
+
+static void test_scheduler(void) {
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_dispatch_reset();
+    const uint32_t ROOT = 0x08801000u;
+    psp_register(ROOT, sched_root);
+    g_sched_n = 0;
+    psp_sched_run(ROOT, 0, 0, 0x20, 0x4000, 0);
+    CHECK(g_sched_n == 5, "both threads ran to the end (%d steps)", g_sched_n);
+    for (int i = 0; i < g_sched_n && i < 5; i++)
+        CHECK(g_sched_log[i] == i + 1, "step %d was %d: priorities and waits decide who runs", i + 1, g_sched_log[i]);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -723,6 +766,7 @@ int main(void) {
     test_savedata_roundtrip();
     test_http_async();
     test_mpeg_movie();
+    test_scheduler();                /* last: it leaves the scheduler state behind */
 
     psp_mem_free();
 
