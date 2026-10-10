@@ -63,6 +63,7 @@ add_library(psprecomp STATIC
     src/hle/adhoc.c
     src/hle/adhoc_mesh.c
     src/hle/adhoc_matching.c
+    src/hle/adhoc_server.c
 )
 
 target_include_directories(psprecomp PUBLIC
@@ -72,6 +73,17 @@ target_include_directories(psprecomp PUBLIC
 # Networking HLE (src/hle/net.c) uses the host's sockets and adapter list.
 if(WIN32)
     target_link_libraries(psprecomp PUBLIC ws2_32 iphlpapi)
+endif()
+
+# --- the modern ad hoc server on its own (tools/modern_server) --------------------
+# The server the game runs with modern_server=host, as a program for a machine
+# players can reach (a VPS, a PC with an open port). Builds anywhere the runtime does.
+
+add_executable(modern_server tools/modern_server/main.c)
+target_link_libraries(modern_server PRIVATE psprecomp)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(modern_server PRIVATE Threads::Threads)
 endif()
 
 # --- the recompiler -----------------------------------------------------------
