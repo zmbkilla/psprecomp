@@ -4,6 +4,10 @@
  * `disc0:/` and the Memory Stick as `ms0:/`, so those prefixes are rewritten to
  * subdirectories of a root the host chooses.
  *
+ * The UMD can instead be served straight from a disc image (an ISO9660 .iso,
+ * psp_io_set_disc_image): files, directories and sector-range reads come from
+ * the image, read-only, and the other devices stay under the root.
+ *
  * Reads go straight into guest memory, which means a game loading assets is
  * doing the real thing -- and a texture or model that arrives byte-correct is
  * strong evidence the recompiled code around it is behaving too.
@@ -64,6 +68,10 @@ typedef struct {
      * An ordinary open has base 0 and limit -1. */
     int64_t base;
     int64_t limit;
+    /* From the disc image: f is NULL, the window is in the image, and `pos`
+     * is the position within it (the image's FILE is shared). */
+    int     iso;
+    int64_t pos;
 } io_file;
 
 /* The UMD's sector map: where each file starts on the disc. The host serves
@@ -89,6 +97,8 @@ typedef struct {
 #else
     DIR *dir;
 #endif
+    int iso;             /* listing the disc image: */
+    int cursor;          /* 0 ".", 1 "..", then g_umd[cursor - 2] onward */
 } io_dir;
 
 static io_file g_file[MAX_FILES];
@@ -97,7 +107,112 @@ static char    g_root[512];
 static uint64_t g_bytes_read;
 static int     g_trace = -1;
 
+/* ---- a disc image ----------------------------------------------------------- */
+
+static FILE    *g_iso;
+static int64_t  g_iso_size;
+static uint8_t *g_umd_dir;       /* per g_umd entry: a directory (images only) */
+static time_t  *g_umd_time;      /* per g_umd entry: its recorded date (images only) */
+
+static int iso_read(int64_t off, void *dst, size_t n) {
+    if (fseek64(g_iso, off, SEEK_SET) != 0) return 0;
+    return fread(dst, 1, n, g_iso) == n;
+}
+
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+static void umd_add(uint32_t lba, uint32_t size, const char *path, int is_dir, const uint8_t *date) {
+    static int cap;
+    if (g_numd == 0) cap = 0;
+    if (g_numd == cap) {
+        cap = cap ? cap * 2 : 256;
+        umd_entry *n = (umd_entry *)realloc(g_umd, (size_t)cap * sizeof *n);
+        uint8_t *d = (uint8_t *)realloc(g_umd_dir, (size_t)cap);
+        time_t *t = (time_t *)realloc(g_umd_time, (size_t)cap * sizeof *t);
+        if (n) g_umd = n;
+        if (d) g_umd_dir = d;
+        if (t) g_umd_time = t;
+        if (!n || !d || !t) { cap = g_numd; return; }
+    }
+    g_umd[g_numd].lba = lba;
+    g_umd[g_numd].size = size;
+    snprintf(g_umd[g_numd].path, sizeof g_umd[g_numd].path, "%s", path);
+    g_umd_dir[g_numd] = (uint8_t)is_dir;
+    struct tm tmv;
+    memset(&tmv, 0, sizeof tmv);
+    tmv.tm_year = date[0];
+    tmv.tm_mon = date[1] ? date[1] - 1 : 0;
+    tmv.tm_mday = date[2] ? date[2] : 1;
+    tmv.tm_hour = date[3];
+    tmv.tm_min = date[4];
+    tmv.tm_sec = date[5];
+    g_umd_time[g_numd] = mktime(&tmv);
+    g_numd++;
+}
+
+/* Every entry of the directory at (lba, size), recursively, as paths under `prefix`. */
+static void iso_walk(uint32_t lba, uint32_t size, const char *prefix, int depth) {
+    if (depth > 16 || size > (16u << 20)) return;
+    uint8_t *d = (uint8_t *)malloc(size);
+    if (!d) return;
+    if (!iso_read((int64_t)lba * UMD_SECTOR, d, size)) { free(d); return; }
+    for (uint32_t i = 0; i < size; ) {
+        const uint32_t len = d[i];
+        if (len == 0) { i = (i / UMD_SECTOR + 1) * UMD_SECTOR; continue; }   /* records never cross a sector */
+        if (len < 34 || i + len > size) break;
+        const uint8_t *e = d + i;
+        const uint32_t nl = e[32];
+        if (nl && 33 + nl <= len && !(nl == 1 && (e[33] == 0 || e[33] == 1))) {
+            char name[128];
+            uint32_t k = 0;
+            for (; k < nl && k < sizeof name - 1 && e[33 + k] != ';'; k++) name[k] = (char)e[33 + k];
+            name[k] = '\0';
+            if (k && name[k - 1] == '.') name[k - 1] = '\0';                  /* "NAME." with no extension */
+            char path[192];
+            snprintf(path, sizeof path, "%s%s%s", prefix, prefix[0] ? "/" : "", name);
+            const int is_dir = (e[25] & 2) != 0;
+            umd_add(le32(e + 2), le32(e + 10), path, is_dir, e + 18);
+            if (is_dir) iso_walk(le32(e + 2), le32(e + 10), path, depth + 1);
+        }
+        i += len;
+    }
+    free(d);
+}
+
+/* Serve the UMD from an ISO9660 image (the runtime keeps `f`, read-only).
+ * 0, or -1 if it is not one. NULL goes back to the extracted files. */
+int psp_io_set_disc_image(FILE *f) {
+    if (g_iso) fclose(g_iso);
+    g_iso = NULL;
+    free(g_umd); free(g_umd_dir); free(g_umd_time);
+    g_umd = NULL; g_umd_dir = NULL; g_umd_time = NULL;
+    g_numd = 0;
+    if (!f) { if (g_root[0]) psp_io_set_root(g_root); return 0; }
+    g_iso = f;
+    uint8_t pvd[UMD_SECTOR];
+    if (!iso_read(16 * (int64_t)UMD_SECTOR, pvd, sizeof pvd) || pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
+        g_iso = NULL;
+        return -1;
+    }
+    fseek64(f, 0, SEEK_END);
+    g_iso_size = ftell64(f);
+    iso_walk(le32(pvd + 156 + 2), le32(pvd + 156 + 10), "", 0);
+    fprintf(stderr, "psprecomp: UMD from a disc image: %d files and folders, %lld MB\n",
+            g_numd, (long long)(g_iso_size >> 20));
+    return g_numd ? 0 : -1;
+}
+
+int psp_io_open_disc_image(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (psp_io_set_disc_image(f) != 0) { fclose(f); return -1; }
+    return 0;
+}
+
+int psp_io_has_disc_image(void) { return g_iso != NULL; }
+
 static void load_lba_map(void) {
+    if (g_iso) return;                       /* the image has its own sectors */
     free(g_umd);
     g_umd = NULL;
     g_numd = 0;
@@ -158,6 +273,17 @@ static int path_eq(const char *a, const char *b) {
 static const umd_entry *umd_find(const char *rel) {
     for (int i = 0; i < g_numd; i++) if (path_eq(g_umd[i].path, rel)) return &g_umd[i];
     return NULL;
+}
+
+/* A whole file from the disc image (e.g. the EBOOT), malloc'd, or NULL. */
+uint8_t *psp_io_disc_file(const char *rel, uint32_t *len) {
+    while (*rel == '/' || *rel == '\\') rel++;
+    const umd_entry *e = g_iso ? umd_find(rel) : NULL;
+    if (!e || g_umd_dir[e - g_umd]) return NULL;
+    uint8_t *b = (uint8_t *)malloc(e->size ? e->size : 1);
+    if (!b || !iso_read((int64_t)e->lba * UMD_SECTOR, b, e->size)) { free(b); return NULL; }
+    *len = e->size;
+    return b;
 }
 
 /* The file whose extent contains sector `lbn`. */
@@ -256,8 +382,49 @@ void psp_io_host_path(const char *guest, char *out, size_t cap) { map_path(guest
 /* Open `guest` with PSP flags. Returns a descriptor or an error code; with
  * `keep_on_error` a descriptor is allocated even when the open fails, and the
  * failure is reported through `*err` (the asynchronous form). */
+static uint32_t new_fd(FILE *f, int64_t base, int64_t limit, int iso) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (g_file[i].used) continue;
+        memset(&g_file[i], 0, sizeof g_file[i]);
+        g_file[i].f = f;
+        g_file[i].used = 1;
+        g_file[i].base = base;
+        g_file[i].limit = limit;
+        g_file[i].iso = iso;
+        if (f && base) fseek64(f, base, SEEK_SET);
+        return (uint32_t)(i + 3);                 /* 0-2 are the std streams */
+    }
+    if (f) fclose(f);
+    return ERR_EMFILE;
+}
+
+/* A disc0:/umd0: open served by the disc image. */
+static uint32_t iso_open(const char *guest, const char *rel, uint32_t flags, int keep_on_error, int64_t *err) {
+    int64_t base = -1, limit = -1;
+    unsigned lbn, rsize;
+    if (sscanf(rel, "sce_lbn0x%x_size0x%x", &lbn, &rsize) == 2) {
+        base = (int64_t)lbn * UMD_SECTOR;
+        limit = rsize;
+    } else if (!rel[0]) {
+        base = 0; limit = g_iso_size;            /* the whole disc */
+    } else {
+        const umd_entry *e = umd_find(rel);
+        if (e && !g_umd_dir[e - g_umd]) { base = (int64_t)e->lba * UMD_SECTOR; limit = e->size; }
+    }
+    if (base >= 0 && base + limit > g_iso_size) limit = g_iso_size > base ? g_iso_size - base : 0;
+    const int ok = base >= 0 && !(flags & (PSP_O_WRONLY | PSP_O_TRUNC | PSP_O_CREAT | PSP_O_APPEND) & ~PSP_O_RDONLY);
+    if (tracing()) fprintf(stderr, "sceIoOpen(%s, 0x%X) [image]%s\n", guest, flags, ok ? "" : " -> not found");
+    *err = ok ? 0 : (int64_t)(int32_t)ERR_ENOENT;
+    if (!ok && !keep_on_error) return ERR_ENOENT;
+    return new_fd(NULL, ok ? base : 0, ok ? limit : 0, 1);
+}
+
 static uint32_t do_open(const char *guest, uint32_t flags, int keep_on_error, int64_t *err) {
     char host[1024];
+    {
+        const char *r = disc_rel(guest);
+        if (r && g_iso) return iso_open(guest, r, flags, keep_on_error, err);
+    }
     map_path(guest, host, sizeof host);
 
     /* disc0:/sce_lbn0x<sector>_size0x<bytes>: the disc by sector range. It is
@@ -305,18 +472,7 @@ static uint32_t do_open(const char *guest, uint32_t flags, int keep_on_error, in
         if (!keep_on_error) return ERR_ENOENT;
     }
 
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (g_file[i].used) continue;
-        memset(&g_file[i], 0, sizeof g_file[i]);
-        g_file[i].f = f;
-        g_file[i].used = 1;
-        g_file[i].base = base;
-        g_file[i].limit = limit;
-        if (f && base) fseek64(f, base, SEEK_SET);
-        return (uint32_t)(i + 3);                 /* 0-2 are the std streams */
-    }
-    if (f) fclose(f);
-    return ERR_EMFILE;
+    return new_fd(f, base, limit, 0);
 }
 
 static void hle_Open(void) {
@@ -350,21 +506,23 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(ERR_BADF); return; }
-    if (h->f) fclose(h->f);
+    if (h->f) fclose(h->f);                 /* never the shared disc image (f is NULL for it) */
     h->f = NULL;
     h->used = 0;
     psp_ret(0);
 }
 
 static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
-    if (!h->f) return (int64_t)(int32_t)ERR_BADF;
+    if (!h->f && !h->iso) return (int64_t)(int32_t)ERR_BADF;
+    if (h->iso && !g_iso) return (int64_t)(int32_t)ERR_BADF;
     if (h->limit >= 0) {                     /* a sector window ends where it ends */
-        int64_t at = ftell64(h->f) - h->base;
+        int64_t at = h->iso ? h->pos : ftell64(h->f) - h->base;
         int64_t left = h->limit - at;
         if (left <= 0) return 0;
         if ((int64_t)size > left) size = (uint32_t)left;
     }
     if (!size) return 0;
+    if (h->iso && fseek64(g_iso, h->base + h->pos, SEEK_SET) != 0) return 0;
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -372,7 +530,8 @@ static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
     uint8_t *tmp = (uint8_t *)malloc(size);
     if (!tmp) return (int64_t)(int32_t)SCE_KERNEL_ERROR_NO_MEMORY;
 
-    size_t got = fread(tmp, 1, size, h->f);
+    size_t got = fread(tmp, 1, size, h->iso ? g_iso : h->f);
+    if (h->iso) h->pos += (int64_t)got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -446,6 +605,18 @@ static void hle_Lseek(void) {
     io_file *h = fd_arg();
     uint64_t off = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
     uint32_t whence = psp_arg(4);
+    if (h && h->iso) {                      /* positions within the image window */
+        int64_t target = whence == 1 ? h->pos + (int64_t)off : whence == 2 ? h->limit + (int64_t)off : (int64_t)off;
+        if (target < 0) {
+            psp_cpu.r[PSP_REG_V0] = ERR_EINVAL;
+            psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
+            return;
+        }
+        h->pos = target;
+        psp_cpu.r[PSP_REG_V0] = (uint32_t)target;
+        psp_cpu.r[PSP_REG_V1] = (uint32_t)((uint64_t)target >> 32);
+        return;
+    }
     if (!h || !h->f) {
         psp_cpu.r[PSP_REG_V0] = ERR_BADF;
         psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
@@ -537,9 +708,40 @@ static int fill_stat(const char *host, uint32_t out, const char *disc) {
     return 0;
 }
 
+/* A SceIoStat for a disc-image entry (rel "" = the root). 0, or -1 if absent. */
+static int iso_stat(const char *rel, uint32_t out) {
+    int is_dir = 1;
+    uint32_t size = 0, lba = 0;
+    time_t t = 0;
+    while (*rel == '/' || *rel == '\\') rel++;
+    if (rel[0]) {
+        const umd_entry *e = umd_find(rel);
+        if (!e) return -1;
+        is_dir = g_umd_dir[e - g_umd];
+        size = is_dir ? 0 : e->size;
+        lba = e->lba;
+        t = g_umd_time[e - g_umd];
+    }
+    for (uint32_t i = 0; i < SCE_IO_STAT_SIZE; i += 4) psp_write32(out + i, 0);
+    psp_write32(out + 0, (is_dir ? 0x1000u : 0x2000u) | 0x16Du);   /* read and execute only */
+    psp_write32(out + 4, (is_dir ? 0x10u : 0x20u) | 0x5u);
+    psp_write32(out + 8, size);
+    write_datetime(out + 16, t);
+    write_datetime(out + 32, t);
+    write_datetime(out + 48, t);
+    if (!is_dir) psp_write32(out + 64, lba);
+    return 0;
+}
+
 static void hle_Getstat(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
+    if (g_iso && disc_rel(guest)) {
+        const int r = iso_stat(disc_rel(guest), psp_arg(1));
+        if (tracing()) fprintf(stderr, "sceIoGetstat(%s) [image]%s\n", guest, r ? " -> not found" : "");
+        psp_ret(r == 0 ? 0 : ERR_ENOENT);
+        return;
+    }
     map_path(guest, host, sizeof host);
     int rc = fill_stat(host, psp_arg(1), disc_rel(guest));
     if (tracing()) fprintf(stderr, "sceIoGetstat(%s)%s\n", guest, rc ? " -> not found" : "");
@@ -624,6 +826,25 @@ static void hle_Dopen(void) {
 
     for (int i = 0; i < MAX_DIRS; i++) {
         if (g_dir[i].used) continue;
+        if (g_iso && disc_rel(guest)) {         /* a directory of the disc image */
+            const char *rel = disc_rel(guest);
+            char d[512];
+            snprintf(d, sizeof d, "%s", rel);
+            size_t dl = strlen(d);
+            while (dl && (d[dl - 1] == '/' || d[dl - 1] == '\\')) d[--dl] = '\0';
+            const umd_entry *e = d[0] ? umd_find(d) : NULL;
+            if (d[0] && (!e || !g_umd_dir[e - g_umd])) { psp_ret(ERR_ENOENT); return; }
+            memset(&g_dir[i], 0, sizeof g_dir[i]);
+#ifdef _WIN32
+            g_dir[i].handle = -1;
+#endif
+            g_dir[i].iso = 1;
+            g_dir[i].is_disc = 1;
+            snprintf(g_dir[i].disc, sizeof g_dir[i].disc, "%s", d);
+            g_dir[i].used = 1;
+            psp_ret((uint32_t)(i + 1));
+            return;
+        }
 #ifdef _WIN32
         char pattern[1088];
         snprintf(pattern, sizeof pattern, "%s/*", host);
@@ -657,6 +878,36 @@ static void hle_Dread(void) {
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(ERR_BADF); return; }
 
     const char *name = NULL;
+    if (g_dir[id].iso) {
+        io_dir *dd = &g_dir[id];
+        char entry_path[700];
+        if (dd->cursor < 2) {
+            name = dd->cursor == 0 ? "." : "..";
+            snprintf(entry_path, sizeof entry_path, "%s", dd->disc);
+            dd->cursor++;
+        } else {
+            int k = dd->cursor - 2;
+            for (; k < g_numd; k++) {                /* the next entry whose folder is this one */
+                const char *p = g_umd[k].path, *slash = strrchr(p, '/');
+                char parent[192];
+                snprintf(parent, sizeof parent, "%.*s", slash ? (int)(slash - p) : 0, p);
+                if (path_eq(parent, dd->disc)) break;
+            }
+            if (k >= g_numd) { psp_ret(0); return; }
+            name = strrchr(g_umd[k].path, '/') ? strrchr(g_umd[k].path, '/') + 1 : g_umd[k].path;
+            snprintf(entry_path, sizeof entry_path, "%s", g_umd[k].path);
+            dd->cursor = k + 3;
+        }
+        if (iso_stat(entry_path, dirent) != 0)
+            for (uint32_t i = 0; i < SCE_IO_STAT_SIZE; i += 4) psp_write32(dirent + i, 0);
+        uint32_t at = dirent + SCE_IO_STAT_SIZE;
+        size_t n = strlen(name);
+        if (n > 255) n = 255;
+        for (uint32_t i = 0; i < (uint32_t)n; i++) psp_write8(at + i, (uint8_t)name[i]);
+        psp_write8(at + (uint32_t)n, 0);
+        psp_ret(1);
+        return;
+    }
 #ifdef _WIN32
     if (g_dir[id].done) { psp_ret(0); return; }
     if (g_dir[id].first) {
@@ -693,7 +944,7 @@ static void hle_Dclose(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(ERR_BADF); return; }
 #ifdef _WIN32
-    if (g_dir[id].handle != -1) _findclose(g_dir[id].handle);
+    if (!g_dir[id].iso && g_dir[id].handle != -1) _findclose(g_dir[id].handle);
 #else
     if (g_dir[id].dir) closedir(g_dir[id].dir);
 #endif
