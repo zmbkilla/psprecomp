@@ -162,6 +162,14 @@ void psp_io_reset(void);
 void psp_io_set_root(const char *root);
 /* The host path a guest path (disc0:, ms0:, flash0:, ...) maps to. */
 void psp_io_host_path(const char *guest, char *out, size_t cap);
+/* Serve the UMD (disc0:, umd0:) from an ISO9660 image instead of the root's
+ * disc/ folder; the runtime keeps the FILE (read-only). 0, or -1 if `f` is
+ * not an ISO. NULL returns to the extracted files. */
+int  psp_io_set_disc_image(FILE *f);
+int  psp_io_open_disc_image(const char *path);
+int  psp_io_has_disc_image(void);
+/* A whole file from the disc image, malloc'd (e.g. "PSP_GAME/SYSDIR/EBOOT.BIN"), or NULL. */
+uint8_t *psp_io_disc_file(const char *rel, uint32_t *len);
 uint64_t psp_io_bytes_read(void);
 
 void psp_misc_init(void);

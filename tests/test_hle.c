@@ -872,6 +872,80 @@ static void test_atrac_streaming(void) {
     psp_atrac_set_codec(NULL);
 }
 
+/* ---- the UMD from a disc image ------------------------------------------------------- */
+
+static void iso_rec(uint8_t *p, uint32_t lba, uint32_t size, int dir, const char *name) {
+    const uint32_t nl = name[0] ? (uint32_t)strlen(name) : 1, len = (33 + nl + 1) & ~1u;   /* the . and .. records */
+    memset(p, 0, len);
+    p[0] = (uint8_t)len;
+    memcpy(p + 2, &lba, 4);
+    memcpy(p + 10, &size, 4);
+    p[18] = 109; p[19] = 3; p[20] = 4;      /* 2009-03-04 */
+    p[25] = dir ? 2 : 0;
+    p[32] = (uint8_t)nl;
+    memcpy(p + 33, name, nl);
+}
+
+static void test_disc_image(void) {
+    /* sectors: 16 PVD, 18 root, 19 PSP_GAME, 20..22 PSP_GAME/A.BIN (5000 bytes) */
+    static uint8_t img[24 * 2048];
+    memset(img, 0, sizeof img);
+    img[16 * 2048] = 1;
+    memcpy(img + 16 * 2048 + 1, "CD001", 5);
+    iso_rec(img + 16 * 2048 + 156, 18, 2048, 1, "\0");
+    uint8_t *r = img + 18 * 2048;
+    iso_rec(r, 18, 2048, 1, "\0"); r += r[0];
+    iso_rec(r, 18, 2048, 1, "\1"); r += r[0];
+    iso_rec(r, 19, 2048, 1, "PSP_GAME");
+    uint8_t *g = img + 19 * 2048;
+    iso_rec(g, 19, 2048, 1, "\0"); g += g[0];
+    iso_rec(g, 18, 2048, 1, "\1"); g += g[0];
+    iso_rec(g, 20, 5000, 0, "A.BIN;1");
+    for (int i = 0; i < 5000; i++) img[20 * 2048 + i] = (uint8_t)(i * 13 + 1);
+    char path[256];
+    snprintf(path, sizeof path, "psprecomp_test_disc_%u.iso", (unsigned)psp_cpu.r[PSP_REG_SP]);
+    FILE *f = fopen(path, "wb");
+    CHECK(f && fwrite(img, 1, sizeof img, f) == sizeof img, "write the test image");
+    if (f) fclose(f);
+    CHECK(psp_io_open_disc_image(path) == 0, "open the image");
+
+    const uint32_t S = 0x08A20000u, BUF = 0x08A21000u, ST = 0x08A23000u;
+    psp_mem_write_block(S, "disc0:/psp_game/a.bin", 22);
+    int fd = (int)call(psp_nid("sceIoOpen"), S, 1, 0, 0);
+    CHECK(fd >= 3, "open a file in another case (%08x)", (unsigned)fd);
+    CHECK(call(psp_nid("sceIoRead"), (uint32_t)fd, BUF, 6000, 0) == 5000, "read stops at the file's end");
+    CHECK(psp_read8(BUF) == 1 && psp_read8(BUF + 4999) == (uint8_t)(4999 * 13 + 1), "the file's bytes");
+    psp_cpu.r[PSP_REG_T0] = 0;                                          /* whence SET */
+    call(psp_nid("sceIoLseek"), (uint32_t)fd, 0, 4000, 0);
+    CHECK(psp_cpu.r[PSP_REG_V0] == 4000, "seek");
+    CHECK(call(psp_nid("sceIoRead"), (uint32_t)fd, BUF, 16, 0) == 16 && psp_read8(BUF) == (uint8_t)(4000 * 13 + 1), "read after a seek");
+    call(psp_nid("sceIoClose"), (uint32_t)fd, 0, 0, 0);
+
+    CHECK(call(psp_nid("sceIoGetstat"), S, ST, 0, 0) == 0 && psp_read32(ST + 8) == 5000 &&
+          psp_read32(ST + 64) == 20 && (psp_read32(ST) & 0x2000), "stat: a 5000-byte file at sector 20");
+    psp_mem_write_block(S + 0x40, "disc0:/sce_lbn0x14_size0x1388", 30);
+    fd = (int)call(psp_nid("sceIoOpen"), S + 0x40, 1, 0, 0);
+    CHECK(fd >= 3 && call(psp_nid("sceIoRead"), (uint32_t)fd, BUF, 8, 0) == 8 && psp_read8(BUF) == 1, "a sector-range read");
+    if (fd >= 3) call(psp_nid("sceIoClose"), (uint32_t)fd, 0, 0, 0);
+    CHECK(call(psp_nid("sceIoOpen"), S, 0x0602, 0777, 0) == 0x80010002u, "the image is read-only");
+
+    psp_mem_write_block(S + 0x80, "disc0:/", 8);
+    const uint32_t dd = call(psp_nid("sceIoDopen"), S + 0x80, 0, 0, 0);
+    int n = 0, saw_game = 0;
+    for (int k = 0; k < 8 && (int)call(psp_nid("sceIoDread"), dd, ST, 0, 0) > 0; k++) {
+        n++;
+        if (!strcmp((const char *)psp_mem_ptr(ST + 88, 9), "PSP_GAME") && (psp_read32(ST) & 0x1000)) saw_game = 1;
+    }
+    call(psp_nid("sceIoDclose"), dd, 0, 0, 0);
+    CHECK((int)dd > 0 && n == 3 && saw_game, "the root lists ., .. and the PSP_GAME folder (%d entries)", n);
+    uint32_t len = 0;
+    uint8_t *b = psp_io_disc_file("PSP_GAME/A.BIN", &len);
+    CHECK(b && len == 5000 && b[1] == 14, "a whole file for the host");
+    free(b);
+    psp_io_set_disc_image(NULL);
+    remove(path);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -896,6 +970,7 @@ int main(void) {
     test_http_async();
     test_mpeg_movie();
     test_io_case();
+    test_disc_image();
     test_atrac_streaming();
     test_scheduler();                /* last: it leaves the scheduler state behind */
 
