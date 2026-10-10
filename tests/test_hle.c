@@ -578,6 +578,128 @@ static void test_http_async(void) {
     psp_http_set_transport(NULL);
 }
 
+/* ---- sceMpeg: a synthetic PSMF movie --------------------------------------- */
+
+#define MP_PACKS 6
+static uint8_t g_mp_stream[MP_PACKS][2048];
+static int g_mp_next;
+
+/* The game's ring-buffer read callback: copy whole packets, return how many. */
+static void mp_read_cb(void) {
+    const uint32_t dest = psp_cpu.r[PSP_REG_A0], n = psp_cpu.r[PSP_REG_A1];
+    uint32_t got = 0;
+    while (got < n && g_mp_next < MP_PACKS) { psp_mem_write_block(dest + got * 2048, g_mp_stream[g_mp_next++], 2048); got++; }
+    psp_cpu.r[PSP_REG_V0] = got;
+}
+
+/* One pack: pack header, one PES packet, padding to 2048 bytes. */
+static void mp_pack(uint8_t *p, int id, int64_t pts, const uint8_t *pay, int n) {
+    static const uint8_t PACK[14] = { 0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 1, 0x89, 0xC3, 0xF8 };
+    memset(p, 0, 2048);
+    memcpy(p, PACK, 14);
+    uint8_t *q = p + 14;
+    const int hl = pts >= 0 ? 5 : 0, len = 3 + hl + n;
+    q[0] = 0; q[1] = 0; q[2] = 1; q[3] = (uint8_t)id; q[4] = (uint8_t)(len >> 8); q[5] = (uint8_t)len;
+    q[6] = 0x81; q[7] = pts >= 0 ? 0x80 : 0; q[8] = (uint8_t)hl;
+    if (pts >= 0) {
+        q[9] = (uint8_t)(0x21 | ((pts >> 29) & 0x0E)); q[10] = (uint8_t)(pts >> 22);
+        q[11] = (uint8_t)(((pts >> 14) & 0xFE) | 1); q[12] = (uint8_t)(pts >> 7); q[13] = (uint8_t)((pts << 1) | 1);
+    }
+    memcpy(q + 9 + hl, pay, (size_t)n);
+    uint8_t *pad = q + 6 + len;
+    const int left = (int)(p + 2048 - pad) - 6;
+    pad[0] = 0; pad[1] = 0; pad[2] = 1; pad[3] = 0xBE; pad[4] = (uint8_t)(left >> 8); pad[5] = (uint8_t)left;
+    memset(pad + 6, 0xFF, (size_t)left);
+}
+
+/* A codec that decodes every unit to a white picture, 480x272. */
+static uint8_t g_mp_y[480], g_mp_uv[240];
+static int g_mp_units;
+static void *mp_open(void) { return &g_mp_units; }
+static int mp_decode(void *d, const uint8_t *au, int size, int64_t pts, psp_video_frame *out) {
+    (void)d;
+    if (!au) return 0;
+    CHECK(size >= 6 && au[3] == 1 && au[4] == 9, "a unit starts with its delimiter");
+    g_mp_units++;
+    memset(g_mp_y, 235, sizeof g_mp_y);
+    memset(g_mp_uv, 128, sizeof g_mp_uv);
+    out->width = 480; out->height = 272;
+    out->y = g_mp_y; out->u = out->v = g_mp_uv;
+    out->ystride = 0; out->uvstride = 0;      /* every line the same */
+    out->pts = pts;
+    return 1;
+}
+static void mp_close(void *d) { (void)d; }
+
+static void test_mpeg_movie(void) {
+    static const psp_video_codec CODEC = { "test", mp_open, mp_decode, mp_close };
+    /* the stream: four pictures, one ATRAC3plus frame, a padding pack */
+    for (int k = 0; k < 4; k++) {
+        const uint8_t au[12] = { 0, 0, 0, 1, 9, 0xF0, 0, 0, 0, 1, 0x65, (uint8_t)k };
+        mp_pack(g_mp_stream[k], 0xE0, 90000 + k * 3003, au, sizeof au);
+    }
+    {
+        uint8_t a[4 + 8 + 744] = { 0, 0, 0, 0, 0x0F, 0xD0, 0x28, 0x5C };   /* sub-stream 0 */
+        mp_pack(g_mp_stream[4], 0xBD, 90000, a, sizeof a);
+        mp_pack(g_mp_stream[5], 0xBE, -1, a, 4);
+    }
+    g_mp_next = 0;
+
+    const uint32_t B = 0x08B00000u, HDR = B, RING = B + 0x1000, MPEGP = B + 0x1100, AU = B + 0x1200,
+                   ATTR = B + 0x1240, BUFP = B + 0x1250, INITP = B + 0x1260, DETAIL = B + 0x1280,
+                   RANGE = B + 0x1300, OUT = B + 0x1400, MDATA = B + 0x10000, DATA = B + 0x20000,
+                   PIX = B + 0x80000, CB = 0x08900100u;
+    psp_register(CB, mp_read_cb);
+    uint8_t h[0x90] = { 'P', 'S', 'M', 'F', '0', '0', '1', '5', 0, 0, 0x08, 0 };
+    h[14] = (MP_PACKS * 2048) >> 8;
+    h[0x54 + 3] = 0x01; h[0x54 + 4] = 0x5F; h[0x54 + 5] = 0x90;          /* first timestamp 90000 */
+    h[142] = 30; h[143] = 17;
+    psp_mem_write_block(HDR, h, sizeof h);
+
+    psp_mpeg_set_video_codec(&CODEC);
+    CHECK(call(psp_nid("sceMpegInit"), 0, 0, 0, 0) == 0, "sceMpegInit");
+    const uint32_t rsize = call(psp_nid("sceMpegRingbufferQueryMemSize"), 16, 0, 0, 0);
+    CHECK(rsize == 16 * (104 + 2048), "ring size %u", rsize);
+    psp_cpu.r[PSP_REG_T1] = 0;
+    CHECK(call5(psp_nid("sceMpegRingbufferConstruct"), RING, 16, DATA, rsize, CB) == 0, "ring construct");
+    const uint32_t msize = call(psp_nid("sceMpegQueryMemSize"), 0, 0, 0, 0);
+    psp_cpu.r[PSP_REG_T1] = 0; psp_cpu.r[PSP_REG_T2] = 0;
+    CHECK(call5(psp_nid("sceMpegCreate"), MPEGP, MDATA, msize, RING, 512) == 0, "create");
+    CHECK(!memcmp(psp_mem_ptr(psp_read32(MPEGP), 8), "LIBMPEG", 8), "the handle");
+    CHECK(call(psp_nid("sceMpegQueryStreamOffset"), MPEGP, HDR, OUT, 0) == 0 && psp_read32(OUT) == 0x800, "stream offset");
+    CHECK(call(psp_nid("sceMpegQueryStreamSize"), HDR, OUT, 0, 0) == 0 && psp_read32(OUT) == MP_PACKS * 2048, "stream size");
+    const uint32_t vs = call(psp_nid("sceMpegRegistStream"), MPEGP, 0, 0, 0);
+    const uint32_t as = call(psp_nid("sceMpegRegistStream"), MPEGP, 1, 0, 0);
+    CHECK(call(psp_nid("sceMpegRingbufferAvailableSize"), RING, 0, 0, 0) == 16, "an empty ring");
+    CHECK(call(psp_nid("sceMpegRingbufferPut"), RING, 16, 16, 0) == MP_PACKS, "put reads the whole stream");
+    CHECK((int)call(psp_nid("sceMpegRingbufferAvailableSize"), RING, 0, 0, 0) < 16, "the ring reports data");
+
+    psp_write32(RANGE, 0); psp_write32(RANGE + 4, 0); psp_write32(RANGE + 8, 480); psp_write32(RANGE + 12, 272);
+    for (int k = 0; k < 4; k++) {
+        CHECK(call(psp_nid("sceMpegGetAvcAu"), MPEGP, vs, AU, ATTR) == 0, "picture %d: au", k);
+        CHECK(call(psp_nid("sceMpegAvcDecodeYCbCr"), MPEGP, AU, BUFP, INITP) == 0, "picture %d: decode", k);
+        CHECK(call(psp_nid("sceMpegAvcDecodeDetail"), MPEGP, DETAIL, 0, 0) == 0 && psp_read32(DETAIL + 32) == 1 &&
+              psp_read32(DETAIL + 4) == (uint32_t)k + 1 && psp_read32(DETAIL + 8) == 480, "picture %d: detail", k);
+        CHECK(psp_read32(AU + 4) == (uint32_t)(90000 + k * 3003), "picture %d: pts %u", k, psp_read32(AU + 4));
+        psp_write32(PIX, 0xDEADBEEF);
+        CHECK(call5(psp_nid("sceMpegAvcCsc"), MPEGP, BUFP, RANGE, 512, PIX) == 0, "picture %d: csc", k);
+        CHECK(psp_read32(PIX) == 0x00FFFFFFu && psp_read32(PIX + 479 * 4) == 0x00FFFFFFu &&
+              psp_read32(PIX + 271 * 512 * 4) == 0x00FFFFFFu, "picture %d: white, alpha 0 (%08x)", k, psp_read32(PIX));
+    }
+    CHECK(g_mp_units == 4, "four units decoded (%d)", g_mp_units);
+    CHECK(call(psp_nid("sceMpegGetAtracAu"), MPEGP, as, AU, ATTR) == 0, "audio au");
+    CHECK(call(psp_nid("sceMpegAtracDecode"), MPEGP, AU, OUT, 1) == 0, "audio decode");
+    CHECK(call(psp_nid("sceMpegGetAtracAu"), MPEGP, as, AU, ATTR) == 0x80618001u && psp_read32(AU + 12) == 0xFFFFFFFFu, "audio end");
+    /* the end: one more decode finds nothing, then the end is reported */
+    CHECK(call(psp_nid("sceMpegGetAvcAu"), MPEGP, vs, AU, ATTR) == 0, "au before the end");
+    call(psp_nid("sceMpegAvcDecodeYCbCr"), MPEGP, AU, BUFP, INITP);
+    CHECK(call(psp_nid("sceMpegAvcDecodeDetail"), MPEGP, DETAIL, 0, 0) == 0 && psp_read32(DETAIL + 32) == 0, "no picture");
+    CHECK(call(psp_nid("sceMpegGetAvcAu"), MPEGP, vs, AU, ATTR) == 0x80618001u && psp_read32(AU + 12) == 0xFFFFFFFFu, "video end, dts -1");
+    CHECK(call(psp_nid("sceMpegDelete"), MPEGP, 0, 0, 0) == 0, "delete");
+    CHECK(call(psp_nid("sceMpegFinish"), 0, 0, 0, 0) == 0, "finish");
+    psp_mpeg_set_video_codec(NULL);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -600,6 +722,7 @@ int main(void) {
     test_display();
     test_savedata_roundtrip();
     test_http_async();
+    test_mpeg_movie();
 
     psp_mem_free();
 

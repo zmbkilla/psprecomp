@@ -554,6 +554,12 @@ static uint32_t call_guest(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2,
     return ret;
 }
 
+/* A firmware library calling into the game from inside an HLE call, on the
+ * calling thread just below its stack (sceMpegRingbufferPut's read callback). */
+uint32_t psp_call_guest(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2) {
+    return call_guest(func, a0, a1, a2, psp_cpu.r[PSP_REG_SP] - 0x40);
+}
+
 /* Deliver every pending callback owned by `t`. Callbacks run on the owning
  * thread, below its current stack pointer. A nonzero return deletes the
  * callback, as on hardware. */

@@ -51,6 +51,7 @@ add_library(psprecomp STATIC
     src/hle/system.c
     src/hle/modules.c
     src/hle/atrac.c
+    src/hle/mpeg.c
     src/hle/utility.c
     src/hle/font.c
     src/hle/net.c
