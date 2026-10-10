@@ -780,6 +780,98 @@ static void test_io_case(void) {
     call(psp_nid("sceIoClose"), (uint32_t)fd, 0, 0, 0);
 }
 
+/* ---- sceAtrac: a looping track streamed through a small ring buffer ------------------ */
+
+#define AT_FRAMES 40
+#define AT_SS     280
+static uint8_t g_at_file[0x40 + 0x200 + AT_FRAMES * AT_SS];
+static uint32_t g_at_file_size, g_at_data_off;
+static int g_at_seen[1024], g_at_nseen, g_at_bad;
+
+/* Every frame starts with 0xF00000nn, its index in the file. */
+static void *at_open(int at3plus, int ch, int ba, int rate) { (void)at3plus; (void)ch; (void)ba; (void)rate; return &g_at_nseen; }
+static int at_decode(void *d, const uint8_t *f, int size, int16_t *out, int max) {
+    (void)d;
+    uint32_t tag;
+    memcpy(&tag, f, 4);
+    if ((tag & 0xFFFFFF00u) != 0xF0000000u || size != AT_SS) g_at_bad++;
+    else if (g_at_nseen < 1024) g_at_seen[g_at_nseen++] = (int)(tag & 0xFF);
+    memset(out, 0, (size_t)max * 4);
+    return max;
+}
+static void at_reset(void *d) { (void)d; }
+static void at_close(void *d) { (void)d; }
+
+static void at_put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+
+static void test_atrac_streaming(void) {
+    static const psp_atrac_codec CODEC = { "test", at_open, at_decode, at_reset, at_close };
+    /* the file: RIFF/WAVE, fmt (ATRAC3plus, stereo, 280-byte frames), fact, smpl (loop to the end), data */
+    uint8_t *p = g_at_file;
+    const int32_t end = AT_FRAMES * 2048 - 4000, fso = 0x800;
+    memcpy(p, "RIFF\0\0\0\0WAVE", 12);
+    memcpy(p + 12, "fmt ", 4); at_put32(p + 16, 0x34);
+    p[20] = 0xFE; p[21] = 0xFF; p[22] = 2; at_put32(p + 24, 44100); p[32] = AT_SS & 0xFF; p[33] = AT_SS >> 8;
+    uint32_t o = 20 + 0x34;
+    memcpy(p + o, "fact", 4); at_put32(p + o + 4, 8); at_put32(p + o + 8, (uint32_t)end); at_put32(p + o + 12, (uint32_t)fso);
+    o += 16;
+    memcpy(p + o, "smpl", 4); at_put32(p + o + 4, 0x3C); memset(p + o + 8, 0, 0x3C);
+    at_put32(p + o + 8 + 0x1C, 1); at_put32(p + o + 8 + 0x2C, 3000); at_put32(p + o + 8 + 0x30, (uint32_t)(end + fso - 1));
+    o += 8 + 0x3C;
+    memcpy(p + o, "data", 4); at_put32(p + o + 4, AT_FRAMES * AT_SS);
+    g_at_data_off = o + 8;
+    for (int k = 0; k < AT_FRAMES; k++) {
+        memset(p + g_at_data_off + k * AT_SS, 0x55, AT_SS);
+        at_put32(p + g_at_data_off + k * AT_SS, 0xF0000000u | (uint32_t)k);
+    }
+    g_at_file_size = g_at_data_off + AT_FRAMES * AT_SS;
+    at_put32(p + 4, g_at_file_size - 8);
+
+    const uint32_t BUF = 0x08B40000u, BUFSIZE = 0x1000, OUT = 0x08B50000u, V = 0x08B5A000u;
+    psp_mem_write_block(BUF, g_at_file, BUFSIZE);
+    psp_atrac_set_codec(&CODEC);
+    g_at_nseen = g_at_bad = 0;
+    const int32_t id = (int32_t)call(psp_nid("sceAtracSetDataAndGetID"), BUF, BUFSIZE, 0, 0);
+    CHECK(id >= 0, "SetDataAndGetID (%08x)", (unsigned)id);
+    CHECK(call(psp_nid("sceAtracSetLoopNum"), (uint32_t)id, 0xFFFFFFFFu, 0, 0) == 0, "loop forever");
+    CHECK(call(psp_nid("sceAtracGetSoundSample"), (uint32_t)id, V, V + 4, V + 8) == 0 &&
+          psp_read32(V) == (uint32_t)(end - 1) && psp_read32(V + 4) == 3000 - fso && psp_read32(V + 8) == (uint32_t)(end - 1),
+          "sound samples: end %d, loop %d..%d", (int)psp_read32(V), (int)psp_read32(V + 4), (int)psp_read32(V + 8));
+
+    int decoded = 0, empties = 0;
+    for (int i = 0; i < 300; i++) {
+        /* a game's streaming loop: top up whatever the ring can take, then decode */
+        call(psp_nid("sceAtracGetStreamDataInfo"), (uint32_t)id, V, V + 4, V + 8);
+        const uint32_t wp = psp_read32(V), n = psp_read32(V + 4), roff = psp_read32(V + 8);
+        if (n) {
+            CHECK(wp >= BUF && wp + n <= BUF + BUFSIZE && roff + n <= g_at_file_size, "window in bounds (wp %08x n %u roff %u)", wp, n, roff);
+            psp_mem_write_block(wp, g_at_file + roff, n);
+            CHECK(call(psp_nid("sceAtracAddStreamData"), (uint32_t)id, n, 0, 0) == 0, "add");
+        }
+        psp_cpu.r[PSP_REG_T0] = V + 0x10;
+        const uint32_t r = call5(psp_nid("sceAtracDecodeData"), (uint32_t)id, OUT, V + 0x18, V + 0x1C, V + 0x10);
+        if (r == 0x80630023u) empties++;
+        else if (r == 0) decoded++;
+        else CHECK(0, "decode %08x", r);
+    }
+    CHECK(decoded > 250 && g_at_bad == 0, "decoded %d frames, %d empty, %d bad frames", decoded, empties, g_at_bad);
+    /* the frames reach the codec in file order, from the loop start again after the last */
+    int wraps = 0, order_ok = 1;
+    for (int i = 1; i < g_at_nseen; i++) {
+        if (g_at_seen[i] == g_at_seen[i - 1] + 1) continue;
+        if (g_at_seen[i - 1] == AT_FRAMES - 1 && g_at_seen[i] <= 1) { wraps++; continue; }
+        order_ok = 0;
+        printf("  frame order: %d after %d at %d\n", g_at_seen[i], g_at_seen[i - 1], i);
+        break;
+    }
+    CHECK(order_ok && wraps >= 5, "frames in file order with %d loops", wraps);
+    psp_cpu.r[PSP_REG_T0] = 0;
+    call(psp_nid("sceAtracGetRemainFrame"), (uint32_t)id, V, 0, 0);
+    CHECK((int32_t)psp_read32(V) >= 0, "a forever-looping stream never reports all data loaded (%d)", (int)psp_read32(V));
+    CHECK(call(psp_nid("sceAtracReleaseAtracID"), (uint32_t)id, 0, 0, 0) == 0, "release");
+    psp_atrac_set_codec(NULL);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -804,6 +896,7 @@ int main(void) {
     test_http_async();
     test_mpeg_movie();
     test_io_case();
+    test_atrac_streaming();
     test_scheduler();                /* last: it leaves the scheduler state behind */
 
     psp_mem_free();
