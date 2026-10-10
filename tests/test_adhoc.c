@@ -573,6 +573,113 @@ static void test_modern(hsock ls, hsock rl) {
     close_sock(srv); close_sock(mb); close_sock(stun); close_sock(bu);
 }
 
+/* ---- the modern connection's built-in server (adhoc_server.c) --------------------------- */
+
+static hsock srv_client(int fam, uint16_t port) {
+    hsock s = socket(fam, SOCK_STREAM, IPPROTO_TCP);
+    if (s == (hsock)-1) return s;
+    struct sockaddr_storage a;
+    memset(&a, 0, sizeof a);
+    int len;
+    if (fam == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&a;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons(port);
+        a6->sin6_addr.s6_addr[15] = 1;                       /* ::1 */
+        len = sizeof *a6;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&a;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons(port);
+        a4->sin_addr.s_addr = htonl(0x7F000001u);
+        len = sizeof *a4;
+    }
+    if (connect(s, (struct sockaddr *)&a, len) != 0) { close_sock(s); return (hsock)-1; }
+    return s;
+}
+
+/* Exactly n bytes within ~2 s; 1 on success. */
+static int srv_recv(hsock s, uint8_t *b, int n) {
+    int got = 0;
+    for (int tries = 0; got < n && tries < 400; tries++) {
+        fd_set f;
+        FD_ZERO(&f);
+        FD_SET(s, &f);
+        struct timeval tv = { 0, 5000 };
+        if (select((int)s + 1, &f, NULL, NULL, &tv) <= 0) continue;
+        const int k = recv(s, (char *)b + got, n - got, 0);
+        if (k <= 0) return 0;
+        got += k;
+    }
+    return got == n;
+}
+
+static void srv_login(hsock s, const uint8_t mac[6], const char *nick) {
+    uint8_t p[144];
+    memset(p, 0, sizeof p);
+    p[0] = 1;
+    memcpy(p + 1, mac, 6);
+    memcpy(p + 7, nick, strlen(nick));
+    memcpy(p + 135, "NPJH50332", 9);
+    send(s, (const char *)p, sizeof p, 0);
+}
+
+static void test_builtin_server(void) {
+    if (psp_adhoc_server_start(47330, 47331, NULL) != 0) { printf("SKIP: built-in server ports in use\n"); return; }
+    static const uint8_t A[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 }, B[6] = { 0x02, 0x66, 0x77, 0x88, 0x99, 0xAA };
+    hsock a = srv_client(AF_INET, 47330);
+    int fam_b = AF_INET6;
+    hsock b = srv_client(AF_INET6, 47330);
+    if (b == (hsock)-1) { printf("  (no IPv6 loopback here; the second player uses IPv4)\n"); fam_b = AF_INET; b = srv_client(AF_INET, 47330); }
+    CHECK(a != (hsock)-1 && b != (hsock)-1, "server: two players connect");
+    srv_login(a, A, "alice");
+    srv_login(b, B, "bob");
+    uint8_t p[256];
+    const uint8_t join[9] = { 2, 'G', 'R', 'O', 'U', 'P', '0', '0', '1' };
+    send(a, (const char *)join, sizeof join, 0);
+    CHECK(srv_recv(a, p, 7) && p[0] == 6 && !memcmp(p + 1, A, 6), "server: the first member hosts its group");
+    send(b, (const char *)join, sizeof join, 0);
+    CHECK(srv_recv(b, p, 139) && p[0] == 2 && !memcmp(p + 129, A, 6) && !strcmp((const char *)p + 1, "alice"),
+          "server: a joiner hears of the member");
+    uint32_t ip;
+    memcpy(&ip, p + 135, 4);
+    CHECK(ip != 0, "server: with an address to report");
+    CHECK(srv_recv(b, p, 7) && p[0] == 6 && !memcmp(p + 1, A, 6), "server: and joins under that host");
+    CHECK(srv_recv(a, p, 139) && p[0] == 2 && !memcmp(p + 129, B, 6), "server: the member hears of the joiner%s", fam_b == AF_INET6 ? " (over IPv6)" : "");
+
+    hsock c = srv_client(AF_INET, 47330);
+    srv_login(c, (const uint8_t *)"\x02\x01\x01\x01\x01\x01", "carol");
+    const uint8_t scan = 4;
+    send(c, (const char *)&scan, 1, 0);
+    CHECK(srv_recv(c, p, 15) && p[0] == 4 && !memcmp(p + 1, "GROUP001", 8) && !memcmp(p + 9, A, 6) &&
+          srv_recv(c, p, 1) && p[0] == 5, "server: a scan lists the group under its host, then completes");
+
+    /* the relay: mailbox frames between the two by MAC and port */
+    hsock ra = srv_client(AF_INET, 47331), rb = srv_client(fam_b, 47331);
+    uint8_t init[24];
+    const uint16_t mbox = 65534;
+    memset(init, 0, sizeof init);
+    memcpy(init + 4, A, 6); memcpy(init + 12, &mbox, 2);
+    send(ra, (const char *)init, sizeof init, 0);
+    memset(init, 0, sizeof init);
+    memcpy(init + 4, B, 6); memcpy(init + 12, &mbox, 2);
+    send(rb, (const char *)init, sizeof init, 0);
+    nap5(); nap5(); nap5(); nap5(); nap5(); nap5(); nap5(); nap5(); nap5(); nap5();
+    uint8_t f[14 + 5];
+    memset(f, 0, sizeof f);
+    memcpy(f, B, 6); memcpy(f + 8, &mbox, 2);
+    const uint32_t sz = 5;
+    memcpy(f + 10, &sz, 4);
+    memcpy(f + 14, "hello", 5);
+    send(ra, (const char *)f, sizeof f, 0);
+    CHECK(srv_recv(rb, p, 19) && !memcmp(p, A, 6) && !memcmp(p + 14, "hello", 5), "server: the relay forwards a frame by MAC, from its sender");
+
+    close_sock(a);                                            /* alice goes: bob hears it by MAC */
+    CHECK(srv_recv(b, p, 7) && p[0] == 8 && !memcmp(p + 1, A, 6), "server: a member who leaves is announced by MAC");
+    CHECK(psp_adhoc_server_players() == 2, "server: two players still logged in (%d)", psp_adhoc_server_players());
+    close_sock(b); close_sock(c); close_sock(ra); close_sock(rb);
+}
+
 int main(void) {
 #ifdef _WIN32
     WSADATA w;
@@ -595,8 +702,10 @@ int main(void) {
     psp_adhoc_configure(&c);
     test_relay(ls, rl);
     c.mode = PSP_ADHOC_MODE_MODERN; c.stun_server = "127.0.0.1:47314"; c.mesh_port = 47320;
+    c.modern_server = "127.0.0.1"; c.modern_port = 47312;            /* its relay: 47313 */
     psp_adhoc_configure(&c);
     test_modern(ls, rl);
+    test_builtin_server();
     psp_mem_free();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("all ad hoc checks passed\n");

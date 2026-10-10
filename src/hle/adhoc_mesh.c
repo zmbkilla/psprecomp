@@ -8,8 +8,8 @@
  *      IPv4 and global IPv6 address, the public IPv4 endpoint a STUN server
  *      (RFC 5389 binding request) saw, and, for a peer, the IPv4 address the ad
  *      hoc server reported with the mesh port (most NATs keep the port).
- *   2. Signaling: candidates are swapped through the ad hoc server's relay
- *      ("aemu postoffice") as PDP frames to a mailbox port no game uses.
+ *   2. Signaling: candidates are swapped through the modern server's relay
+ *      (adhoc_server.c) as PDP frames to a mailbox port no game uses.
  *   3. Punching: both sides send PROBEs to every candidate of the other; the
  *      outgoing probes open each NAT, and the first datagram that arrives fixes
  *      the path. PINGs every 2 s keep the NAT mappings alive.
@@ -271,22 +271,17 @@ static void mb_close(void) {
 }
 
 static void mb_open(void) {
-    uint32_t ip;
-    uint16_t port;
+    struct sockaddr_storage a;
+    int alen = 0;
     mb_close();
     g_mb_retry = adhoc_real_us() + 5000000u;
-    if (!adhoc_relay_addr(&ip, &port)) { g_mb_retry = 0; return; }   /* until adhocctl has resolved the server */
-    g_mb = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (!adhoc_relay_sockaddr(&a, &alen)) { g_mb_retry = 0; return; }   /* until adhocctl has resolved the server */
+    g_mb = socket(a.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (g_mb == BAD_SOCK) return;
     set_nonblocking(g_mb);
     const int one = 1;
     setsockopt(g_mb, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = ip;
-    a.sin_port = htons(port);
-    if (connect(g_mb, (struct sockaddr *)&a, sizeof a) != 0 && !IN_PROGRESS(last_error())) { mb_close(); return; }
+    if (connect(g_mb, (struct sockaddr *)&a, (socklen_t)alen) != 0 && !IN_PROGRESS(last_error())) { mb_close(); return; }
     g_mb_start = adhoc_real_us();
     uint8_t init[24];                                     /* {s32 0 = PDP, src MAC[8], u16 sport, dst MAC[8], u16 dport} */
     memset(init, 0, sizeof init);

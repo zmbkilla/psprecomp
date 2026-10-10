@@ -33,7 +33,9 @@ void     adhoc_netconf_cancel(void);
 /* For adhoc_mesh.c: a group member's IPv4 as the server reported it (network
  * order; 0 = not in the group), and the relay's address (0 = not resolved yet). */
 uint32_t adhoc_peer_ip(const uint8_t mac[6]);
-int      adhoc_relay_addr(uint32_t *ip_n, uint16_t *port);
+/* The relay's address (a struct sockaddr_storage, port set) and its length;
+ * 0 while the server is not resolved. */
+int      adhoc_relay_sockaddr(void *ss, int *len);
 
 /* adhoc_mesh.c: the modern connection (NAT traversal; see there) */
 void     mesh_configure(const char *stun, uint16_t port);

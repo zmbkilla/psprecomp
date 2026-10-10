@@ -71,7 +71,8 @@ void psp_net_log_line(const char *fmt, ...);      /* net.c */
 #define CTL_BUSY                  0x80410B10u
 #define CTL_TOO_MANY_HANDLERS     0x80410B12u
 
-enum { OP_PING = 0, OP_LOGIN, OP_CONNECT, OP_DISCONNECT, OP_SCAN, OP_SCAN_COMPLETE, OP_CONNECT_BSSID, OP_CHAT };
+enum { OP_PING = 0, OP_LOGIN, OP_CONNECT, OP_DISCONNECT, OP_SCAN, OP_SCAN_COMPLETE, OP_CONNECT_BSSID, OP_CHAT,
+       OP_DISCONNECT_MAC /* the modern server: {MAC} */ };
 enum { EV_ERROR = 0, EV_CONNECT = 1, EV_DISCONNECT = 2, EV_SCAN = 3 };
 enum { ST_DISCONNECTED = 0, ST_CONNECTED = 1, ST_SCANNING = 2 };
 enum { CONN_CONNECT = 0, CONN_CREATE = 1, CONN_JOIN = 2 };
@@ -83,6 +84,7 @@ enum { RELAY_PDP = 0, RELAY_PTP_LISTEN = 1, RELAY_PTP_CONNECT = 2, RELAY_PTP_ACC
 
 #define RELAY_PORT_DEFAULT 27313
 #define SERVER_PORT_DEFAULT 27312
+#define MODERN_PORT_DEFAULT 27330
 #define MAX_SOCK 255
 #define MAX_FRIENDS 32
 #define MAX_GROUPS 32
@@ -97,6 +99,8 @@ static uint16_t g_relay_port = RELAY_PORT_DEFAULT;
 static int      g_mode;                         /* PSP_ADHOC_MODE_* */
 static uint16_t g_offset = 10000;
 static char     g_nick[128] = "PSP2i";
+static char     g_modern_server[256] = "host";     /* modern: its own server only */
+static uint16_t g_modern_port = MODERN_PORT_DEFAULT;
 
 void psp_adhoc_configure(const psp_adhoc_config *c) {
     if (!c) return;
@@ -106,6 +110,8 @@ void psp_adhoc_configure(const psp_adhoc_config *c) {
     g_mode = c->mode;
     g_offset = (uint16_t)c->port_offset;
     if (c->nickname && c->nickname[0]) snprintf(g_nick, sizeof g_nick, "%s", c->nickname);
+    snprintf(g_modern_server, sizeof g_modern_server, "%s", c->modern_server && c->modern_server[0] ? c->modern_server : "host");
+    g_modern_port = c->modern_port ? c->modern_port : MODERN_PORT_DEFAULT;
     mesh_configure(c->stun_server, c->mesh_port);
 }
 
@@ -161,36 +167,85 @@ static int sock_error(hsock s) {
     return e;
 }
 
-static uint32_t g_server_ip;                    /* network order; 0 = unresolved */
+/* The server in use: PPSSPP-style modes use adhoc_server (IPv4); modern uses
+ * its own (modern_server, IPv6 or IPv4, "host" = the built-in one here). */
+static uint32_t g_server_ip;                    /* network order; nonzero = resolved (1 for IPv6) */
+static struct sockaddr_storage g_srv;           /* its address (port 0) */
+static socklen_t g_srv_len;
+static uint16_t g_cur_port = SERVER_PORT_DEFAULT, g_cur_relay = RELAY_PORT_DEFAULT;
+static char     g_cur_name[256] = "";
+
+static void server_log(const char *line) { adhoc_log("server: %s", line); }
+
+/* "name", "name:port", "v4:port", "[v6]:port" or a bare IPv6 address. */
+static void split_host_port(const char *in, char *host, size_t cap, uint16_t *port) {
+    const char *colon = strchr(in, ':');
+    if (in[0] == '[') {
+        const char *end = strchr(in, ']');
+        snprintf(host, cap, "%.*s", end ? (int)(end - in - 1) : (int)strlen(in + 1), in + 1);
+        if (end && end[1] == ':' && atoi(end + 2) > 0) *port = (uint16_t)atoi(end + 2);
+    } else if (colon && !strchr(colon + 1, ':')) {
+        snprintf(host, cap, "%.*s", (int)(colon - in), in);
+        if (atoi(colon + 1) > 0) *port = (uint16_t)atoi(colon + 1);
+    } else {
+        snprintf(host, cap, "%s", in);              /* a name, or an IPv6 address without a port */
+    }
+}
 
 static void resolve_server(void) {
+    const int modern = g_mode == PSP_ADHOC_MODE_MODERN;
+    char host[256];
+    uint16_t port = modern ? g_modern_port : g_server_port;
+    split_host_port(modern ? g_modern_server : g_server, host, sizeof host, &port);
+    g_cur_port = port;
+    g_cur_relay = modern ? (uint16_t)(port + 1) : g_relay_port;
+    g_server_ip = 0;
+    g_srv_len = 0;
+    snprintf(g_cur_name, sizeof g_cur_name, "%s", host);
+    if (modern && (!host[0] || !strcmp(host, "host") || !strcmp(host, "self"))) {
+        if (psp_adhoc_server_start(g_cur_port, g_cur_relay, server_log) != 0) {
+            adhoc_log("modern: the built-in server could not start; nothing will connect");
+            return;
+        }
+        snprintf(host, sizeof host, "127.0.0.1");
+        snprintf(g_cur_name, sizeof g_cur_name, "this game (built-in server)");
+    }
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    g_server_ip = 0;
-    if (getaddrinfo(g_server, NULL, &hints, &res) == 0 && res) {
-        g_server_ip = ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
+    hints.ai_family = modern ? AF_UNSPEC : AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) == 0 && res) {
+        memcpy(&g_srv, res->ai_addr, res->ai_addrlen);
+        g_srv_len = (socklen_t)res->ai_addrlen;
+        g_server_ip = res->ai_family == AF_INET ? ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr : 1;
         freeaddrinfo(res);
     }
-    char ip[16];
-    if (g_server_ip) adhoc_log("server %s -> %s (port %u, relay %u)", g_server, ip_text(g_server_ip, ip), g_server_port, g_relay_port);
-    else adhoc_log("cannot resolve the ad hoc server %s", g_server);
+    char ip[64] = "";
+    if (g_srv.ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&g_srv)->sin6_addr, ip, sizeof ip);
+    else if (g_server_ip) ip_text(g_server_ip, ip);
+    if (g_server_ip) adhoc_log("server %s -> %s (port %u, relay %u)", g_cur_name, ip, g_cur_port, g_cur_relay);
+    else adhoc_log("cannot resolve the %sserver %s", modern ? "modern " : "ad hoc ", host);
+}
+
+/* The server's address with `port` set. */
+static socklen_t server_addr(uint16_t port, struct sockaddr_storage *a) {
+    *a = g_srv;
+    if (a->ss_family == AF_INET6) ((struct sockaddr_in6 *)a)->sin6_port = htons(port);
+    else ((struct sockaddr_in *)a)->sin_port = htons(port);
+    return g_srv_len;
 }
 
 /* A non-blocking TCP connection to the server's port. */
 static hsock tcp_connect_server(uint16_t port) {
-    if (!g_server_ip) return BAD_SOCK;
-    hsock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (!g_server_ip || !g_srv_len) return BAD_SOCK;
+    struct sockaddr_storage a;
+    const socklen_t len = server_addr(port, &a);
+    hsock s = socket(a.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (s == BAD_SOCK) return BAD_SOCK;
     set_nonblocking(s);
     const int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = g_server_ip;
-    a.sin_port = htons(port);
-    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0 && !IN_PROGRESS(last_error())) { close_sock(s); return BAD_SOCK; }
+    if (connect(s, (struct sockaddr *)&a, len) != 0 && !IN_PROGRESS(last_error())) { close_sock(s); return BAD_SOCK; }
     return s;
 }
 
@@ -289,7 +344,7 @@ static void meta_open(void) {
     META_LOCK();
     meta_close();
     if (!g_server_ip) resolve_server();
-    g_meta = tcp_connect_server(g_server_port);
+    g_meta = tcp_connect_server(g_cur_port);
     g_meta_retry = adhoc_real_us() + 5000000u;
     if (g_meta == BAD_SOCK) { adhoc_log("cannot connect to the ad hoc server"); META_UNLOCK(); return; }
     /* login: opcode, MAC, nickname[128], product code[9] */
@@ -302,7 +357,7 @@ static void meta_open(void) {
     memcpy(p + 135, g_product + 4, 9);
     meta_send(p, sizeof p);
     char m[18];
-    adhoc_log("connecting to %s:%u as %s (%s), game %.9s", g_server, g_server_port, g_nick, mac_text(p + 1, m), (const char *)g_product + 4);
+    adhoc_log("connecting to %s:%u as %s (%s), game %.9s", g_cur_name, g_cur_port, g_nick, mac_text(p + 1, m), (const char *)g_product + 4);
     if (g_in_group) {                                   /* (re)join the group we are in */
         uint8_t c[9];
         c[0] = OP_CONNECT;
@@ -358,10 +413,10 @@ uint32_t adhoc_peer_ip(const uint8_t mac[6]) {
     return f >= 0 && g_friends[f].last_recv ? g_friends[f].ip : 0;
 }
 
-int adhoc_relay_addr(uint32_t *ip_n, uint16_t *port) {
-    *ip_n = g_server_ip;
-    *port = g_relay_port;
-    return g_server_ip != 0;
+int adhoc_relay_sockaddr(void *ss, int *len) {
+    if (!g_server_ip || !g_srv_len) return 0;
+    *len = (int)server_addr(g_cur_relay, (struct sockaddr_storage *)ss);
+    return 1;
 }
 
 /* MAC -> IPv4 (network order); 0 if unknown. */
@@ -388,6 +443,7 @@ static void meta_packets(void) {
         case OP_CHAT:          need = 1 + 64 + 128; break;
         case OP_CONNECT:       need = 1 + 128 + 6 + 4; break;
         case OP_DISCONNECT:    need = 5; break;
+        case OP_DISCONNECT_MAC: need = 7; break;
         case OP_SCAN:          need = 1 + 8 + 6; break;
         case OP_SCAN_COMPLETE: need = 1; break;
         case OP_PING:          need = 1; break;
@@ -443,6 +499,13 @@ static void meta_packets(void) {
                 }
             break;
         }
+        case OP_DISCONNECT_MAC:
+            for (int i = 0; i < MAX_FRIENDS; i++)
+                if (g_friends[i].used && !memcmp(g_friends[i].mac, p + 1, 6)) {
+                    adhoc_log("player %s left", g_friends[i].nick);
+                    g_friends[i].used = 0;
+                }
+            break;
         case OP_SCAN:
             if (g_nnew_groups < MAX_GROUPS) {
                 memcpy(g_new_groups[g_nnew_groups].name, p + 1, 8);
@@ -613,7 +676,7 @@ static uint16_t offset_port(uint16_t p) {          /* as the reference's offset_
 
 /* Relay: open a TCP connection and queue the init record. */
 static int relay_open(asock *a, int type, const uint8_t src[6], uint16_t sport, const uint8_t dst[6], uint16_t dport) {
-    a->s = tcp_connect_server(g_relay_port);
+    a->s = tcp_connect_server(g_cur_relay);
     if (a->s == BAD_SOCK) return -1;
     a->relay = 1;
     a->rconnecting = 1;
@@ -837,12 +900,15 @@ static void hle_AdhocInit(void) {
     }
     g_relay = g_mode == PSP_ADHOC_MODE_PPSSPP_RELAY;
     g_mesh = g_mode == PSP_ADHOC_MODE_MODERN;
-    adhoc_log("sceNetAdhocInit: %s, server %s:%u, port offset %u",
-              g_mesh ? "modern connection (direct hosting through NAT traversal; recomp players only)"
-              : g_relay ? "PPSSPP-style relay (all data through the server's relay; works behind any NAT)"
-                        : "PPSSPP-style direct (straight to other players; their ports must be reachable)",
-              g_server, g_server_port, g_offset);
-    if (g_relay || g_mesh) adhoc_log("relay port %u", g_relay_port);
+    if (g_mesh)
+        adhoc_log("sceNetAdhocInit: modern connection (direct hosting through NAT traversal; recomp players only), "
+                  "server %s, port %u", g_modern_server, g_modern_port);
+    else
+        adhoc_log("sceNetAdhocInit: %s, server %s:%u, port offset %u",
+                  g_relay ? "PPSSPP-style relay (all data through the server's relay; works behind any NAT)"
+                          : "PPSSPP-style direct (straight to other players; their ports must be reachable)",
+                  g_server, g_server_port, g_offset);
+    if (g_relay) adhoc_log("relay port %u", g_relay_port);
     if (g_mesh && mesh_start() != 0) adhoc_log("modern: could not start; nothing will connect");
     psp_ret(0);
 }

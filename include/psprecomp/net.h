@@ -10,6 +10,7 @@
 #ifndef PSPRECOMP_NET_H
 #define PSPRECOMP_NET_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -143,13 +144,19 @@ void psp_np2_register(void);
  *   PSP_ADHOC_MODE_MODERN         direct hosting through NAT traversal (recomp
  *                                 players only): one UDP socket (mesh_port) per
  *                                 player; addresses learned locally (IPv4 and
- *                                 IPv6), from a STUN server and from the ad hoc
- *                                 server are swapped through the relay, then
- *                                 both sides punch through their NATs (CGNAT
- *                                 included, unless it is symmetric). PTP gets a
- *                                 reliable stream over that UDP path. A pair that
- *                                 cannot punch through stays reachable: its
- *                                 packets are tunnelled through the relay. */
+ *                                 IPv6), from a STUN server and from the server
+ *                                 are swapped through the relay, then both sides
+ *                                 punch through their NATs (CGNAT included,
+ *                                 unless it is symmetric). PTP gets a reliable
+ *                                 stream over that UDP path. A pair that cannot
+ *                                 punch through stays reachable: its packets are
+ *                                 tunnelled through the relay. Modern uses its
+ *                                 own server only (modern_server; never a PPSSPP
+ *                                 one): "host" runs the built-in server
+ *                                 (adhoc_server.c) in this program and uses it;
+ *                                 otherwise the address of a player hosting, or
+ *                                 of a machine running it alone (IPv4, IPv6 or a
+ *                                 name; [v6]:port or v4:port for another port). */
 enum { PSP_ADHOC_MODE_PPSSPP_DIRECT = 0, PSP_ADHOC_MODE_PPSSPP_RELAY = 1, PSP_ADHOC_MODE_MODERN = 2 };
 typedef struct {
     const char *server;          /* host name or address */
@@ -160,8 +167,20 @@ typedef struct {
     const char *nickname;        /* shown to other players */
     const char *stun_server;     /* modern: host[:port]; NULL = stun.l.google.com:19302, "" = none */
     uint16_t    mesh_port;       /* modern: the UDP port; 0 = 27320 */
+    const char *modern_server;   /* modern: "host" (NULL/"") or an address[:port] (see above) */
+    uint16_t    modern_port;     /* modern: the server's TCP port; 0 = 27330 (its relay: the next one) */
 } psp_adhoc_config;
 void psp_adhoc_configure(const psp_adhoc_config *c);
+
+/* The modern connection's server (src/hle/adhoc_server.c), on a host thread:
+ * lobby on TCP `port`, relay on `relay_port`, IPv6 and IPv4. 0 if it runs
+ * (or already did); log may be NULL (stderr). */
+int  psp_adhoc_server_start(uint16_t port, uint16_t relay_port, void (*log)(const char *line));
+int  psp_adhoc_server_running(void);
+int  psp_adhoc_server_players(void);       /* logged-in players */
+/* What others type to join this machine: its IPv4 on its network and its
+ * global IPv6 address ("" if none), for the host program to show. */
+void psp_adhoc_host_addresses(char *v4, size_t v4cap, char *v6, size_t v6cap);
 
 #ifdef __cplusplus
 }
