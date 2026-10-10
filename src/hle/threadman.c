@@ -52,11 +52,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Android's C library has no makecontext/swapcontext: there (or with
- * PSPRECOMP_THREAD_FIBERS) each fiber is a host thread, and switching hands a
- * baton from one to the next, so exactly one ever runs. */
-#if defined(__ANDROID__) && !defined(PSPRECOMP_THREAD_FIBERS)
-#  define PSPRECOMP_THREAD_FIBERS 1
+/* Android's C library has no makecontext/swapcontext. On arm64 and x86-64
+ * (or with PSPRECOMP_ASM_FIBERS) a few lines of assembly switch stacks, so
+ * every fiber stays on the calling OS thread as on Windows -- which the host
+ * needs, since its GL context and event pump belong to that thread. Elsewhere
+ * (or with PSPRECOMP_THREAD_FIBERS) each fiber is a host thread and switching
+ * hands a baton from one to the next, so exactly one ever runs. */
+#if defined(__ANDROID__) && !defined(PSPRECOMP_THREAD_FIBERS) && !defined(PSPRECOMP_ASM_FIBERS)
+#  if defined(__aarch64__) || defined(__x86_64__)
+#    define PSPRECOMP_ASM_FIBERS 1
+#  else
+#    define PSPRECOMP_THREAD_FIBERS 1
+#  endif
 #endif
 
 #ifdef _WIN32
@@ -65,9 +72,9 @@
 #else
 #  include <time.h>
 #  include <unistd.h>
-#  ifdef PSPRECOMP_THREAD_FIBERS
+#  if defined(PSPRECOMP_THREAD_FIBERS)
 #    include <pthread.h>
-#  else
+#  elif !defined(PSPRECOMP_ASM_FIBERS)
 #    include <ucontext.h>
 #  endif
 #endif
@@ -154,6 +161,55 @@ static const char *const WAIT_NAME[] = {
 #if defined(_WIN32)
 typedef void *fiber_t;
 static fiber_t g_main_fiber;
+#elif defined(PSPRECOMP_ASM_FIBERS)
+/* fiber_switch(&from->sp, to->sp): push the callee-saved registers, store the
+ * stack pointer in *from, load `to`, pop its registers and return into it. A
+ * new fiber's stack starts as if it had switched away at fiber_start, which
+ * calls entry(arg) from the registers seeded below. */
+typedef struct asm_fiber { void *sp; void *stack; } asm_fiber;
+typedef asm_fiber *fiber_t;
+static asm_fiber g_main_af;
+static fiber_t g_main_fiber = &g_main_af;
+void psp_fiber_switch(void **from_sp, void *to_sp);
+void psp_fiber_start(void);
+#if defined(__aarch64__)
+/* x19-x28, x29 (fp), x30 (lr), d8-d15: 160 bytes. x19 = entry, x20 = arg. */
+__asm__(
+    ".text\n.p2align 2\n"
+    ".globl psp_fiber_switch\n.type psp_fiber_switch, %function\n"
+    "psp_fiber_switch:\n"
+    "  sub sp, sp, #160\n"
+    "  stp x19, x20, [sp, #0]\n  stp x21, x22, [sp, #16]\n  stp x23, x24, [sp, #32]\n"
+    "  stp x25, x26, [sp, #48]\n  stp x27, x28, [sp, #64]\n  stp x29, x30, [sp, #80]\n"
+    "  stp d8, d9, [sp, #96]\n  stp d10, d11, [sp, #112]\n  stp d12, d13, [sp, #128]\n  stp d14, d15, [sp, #144]\n"
+    "  mov x2, sp\n  str x2, [x0]\n  mov sp, x1\n"
+    "  ldp x19, x20, [sp, #0]\n  ldp x21, x22, [sp, #16]\n  ldp x23, x24, [sp, #32]\n"
+    "  ldp x25, x26, [sp, #48]\n  ldp x27, x28, [sp, #64]\n  ldp x29, x30, [sp, #80]\n"
+    "  ldp d8, d9, [sp, #96]\n  ldp d10, d11, [sp, #112]\n  ldp d12, d13, [sp, #128]\n  ldp d14, d15, [sp, #144]\n"
+    "  add sp, sp, #160\n  ret\n"
+    ".size psp_fiber_switch, .-psp_fiber_switch\n"
+    ".globl psp_fiber_start\n.type psp_fiber_start, %function\n"
+    "psp_fiber_start:\n"
+    "  mov x0, x20\n  blr x19\n  brk #0\n"
+    ".size psp_fiber_start, .-psp_fiber_start\n");
+#elif defined(__x86_64__)
+/* rbp, rbx, r12-r15, then the return address. r12 = entry, r13 = arg. */
+__asm__(
+    ".text\n.p2align 4\n"
+    ".globl psp_fiber_switch\n.type psp_fiber_switch, @function\n"
+    "psp_fiber_switch:\n"
+    "  pushq %rbp\n  pushq %rbx\n  pushq %r12\n  pushq %r13\n  pushq %r14\n  pushq %r15\n"
+    "  movq %rsp, (%rdi)\n  movq %rsi, %rsp\n"
+    "  popq %r15\n  popq %r14\n  popq %r13\n  popq %r12\n  popq %rbx\n  popq %rbp\n"
+    "  ret\n"
+    ".size psp_fiber_switch, .-psp_fiber_switch\n"
+    ".globl psp_fiber_start\n.type psp_fiber_start, @function\n"
+    "psp_fiber_start:\n"
+    "  movq %r13, %rdi\n  callq *%r12\n  ud2\n"
+    ".size psp_fiber_start, .-psp_fiber_start\n");
+#else
+#  error "PSPRECOMP_ASM_FIBERS: arm64 or x86-64 only"
+#endif
 #elif defined(PSPRECOMP_THREAD_FIBERS)
 typedef struct host_fiber {
     pthread_t       thread;
@@ -515,6 +571,8 @@ static int run_callbacks(psp_thread *t);
 static void switch_to_main(void) {
 #if defined(_WIN32)
     SwitchToFiber(g_main_fiber);
+#elif defined(PSPRECOMP_ASM_FIBERS)
+    psp_fiber_switch(&g_current->fiber->sp, g_main_fiber->sp);
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     hf_switch(g_current->fiber, g_main_fiber);
 #else
@@ -848,6 +906,8 @@ static void thread_body(psp_thread *t) {
 
 #if defined(_WIN32)
 static void WINAPI fiber_proc(void *p) { thread_body((psp_thread *)p); }
+#elif defined(PSPRECOMP_ASM_FIBERS)
+static void fiber_proc(void *p) { thread_body((psp_thread *)p); }
 #elif defined(PSPRECOMP_THREAD_FIBERS)
 static void *fiber_proc(void *p) {
     host_fiber *f = (host_fiber *)p;
@@ -867,6 +927,30 @@ static int fiber_create(psp_thread *t) {
     t->fiber = CreateFiberEx(256 * 1024, FIBER_STACK_RESERVE, FIBER_FLAG_FLOAT_SWITCH,
                              fiber_proc, t);
     return t->fiber ? 0 : -1;
+#elif defined(PSPRECOMP_ASM_FIBERS)
+    asm_fiber *f = (asm_fiber *)calloc(1, sizeof *f);
+    if (!f) return -1;
+    f->stack = malloc(FIBER_STACK_RESERVE);
+    if (!f->stack) { free(f); return -1; }
+    uintptr_t top = ((uintptr_t)f->stack + FIBER_STACK_RESERVE) & ~(uintptr_t)15;
+#if defined(__aarch64__)
+    uint64_t *frame = (uint64_t *)(top - 160);
+    memset(frame, 0, 160);
+    frame[0] = (uint64_t)(uintptr_t)fiber_proc;          /* x19 */
+    frame[1] = (uint64_t)(uintptr_t)t;                   /* x20 */
+    frame[11] = (uint64_t)(uintptr_t)psp_fiber_start;    /* x30: where the first switch returns */
+#else
+    /* After the return into psp_fiber_start the stack is 16-aligned, as a
+     * call needs. Slots from the saved sp: r15 r14 r13 r12 rbx rbp ret. */
+    uint64_t *frame = (uint64_t *)(top - 16 - 8 * 7);
+    memset(frame, 0, 8 * 7);
+    frame[2] = (uint64_t)(uintptr_t)t;                   /* r13 */
+    frame[3] = (uint64_t)(uintptr_t)fiber_proc;          /* r12 */
+    frame[6] = (uint64_t)(uintptr_t)psp_fiber_start;     /* return address */
+#endif
+    f->sp = frame;
+    t->fiber = f;
+    return 0;
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     host_fiber *f = (host_fiber *)calloc(1, sizeof *f);
     if (!f) return -1;
@@ -901,6 +985,9 @@ static void fiber_delete(psp_thread *t) {
     if (!t->fiber) return;
 #if defined(_WIN32)
     DeleteFiber(t->fiber);
+#elif defined(PSPRECOMP_ASM_FIBERS)
+    free(t->fiber->stack);                  /* never the running fiber: only parked ones are deleted */
+    free(t->fiber);
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     /* The fiber's thread is parked waiting for the baton (never running: only
      * the caller runs). Wake it to leave, and wait until it has. */
@@ -934,6 +1021,8 @@ static void run_thread(psp_thread *t) {
     }
 #if defined(_WIN32)
     SwitchToFiber(t->fiber);
+#elif defined(PSPRECOMP_ASM_FIBERS)
+    psp_fiber_switch(&g_main_af.sp, t->fiber->sp);
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     hf_switch(g_main_fiber, t->fiber);
 #else
