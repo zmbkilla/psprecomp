@@ -52,13 +52,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Android's C library has no makecontext/swapcontext: there (or with
+ * PSPRECOMP_THREAD_FIBERS) each fiber is a host thread, and switching hands a
+ * baton from one to the next, so exactly one ever runs. */
+#if defined(__ANDROID__) && !defined(PSPRECOMP_THREAD_FIBERS)
+#  define PSPRECOMP_THREAD_FIBERS 1
+#endif
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
 #  include <time.h>
-#  include <ucontext.h>
 #  include <unistd.h>
+#  ifdef PSPRECOMP_THREAD_FIBERS
+#    include <pthread.h>
+#  else
+#    include <ucontext.h>
+#  endif
 #endif
 
 #define MAX_THREADS 128
@@ -140,9 +151,46 @@ static const char *const WAIT_NAME[] = {
  * on demand. */
 #define FIBER_STACK_RESERVE (64u << 20)
 
-#ifdef _WIN32
+#if defined(_WIN32)
 typedef void *fiber_t;
 static fiber_t g_main_fiber;
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+typedef struct host_fiber {
+    pthread_t       thread;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    int             go;        /* the baton: this fiber may run */
+    int             quit;      /* deleted: leave instead of running */
+    int             has_thread;
+    struct psp_thread *owner;
+} host_fiber;
+typedef host_fiber *fiber_t;
+static host_fiber g_main_hf = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER };
+static fiber_t g_main_fiber = &g_main_hf;
+
+static void hf_post(host_fiber *f) {
+    pthread_mutex_lock(&f->lock);
+    f->go = 1;
+    pthread_cond_signal(&f->cond);
+    pthread_mutex_unlock(&f->lock);
+}
+
+/* Wait for the baton; a deleted fiber's thread ends here. */
+static void hf_wait(host_fiber *f) {
+    pthread_mutex_lock(&f->lock);
+    while (!f->go) pthread_cond_wait(&f->cond, &f->lock);
+    f->go = 0;
+    const int quit = f->quit;
+    pthread_mutex_unlock(&f->lock);
+    if (quit) pthread_exit(NULL);
+}
+
+/* Hand the baton from `from` (the caller's fiber) to `to`; returns when
+ * something hands it back. */
+static void hf_switch(host_fiber *from, host_fiber *to) {
+    hf_post(to);
+    hf_wait(from);
+}
 #else
 typedef ucontext_t *fiber_t;
 static ucontext_t g_main_ctx;
@@ -465,8 +513,10 @@ static int collect_waiters(int type, uint32_t id, uint32_t attr, psp_thread **ou
 static int run_callbacks(psp_thread *t);
 
 static void switch_to_main(void) {
-#ifdef _WIN32
+#if defined(_WIN32)
     SwitchToFiber(g_main_fiber);
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+    hf_switch(g_current->fiber, g_main_fiber);
 #else
     swapcontext(g_current->fiber, g_main_fiber);
 #endif
@@ -796,8 +846,15 @@ static void thread_body(psp_thread *t) {
     thread_finish(t, psp_cpu.r[PSP_REG_V0]);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32)
 static void WINAPI fiber_proc(void *p) { thread_body((psp_thread *)p); }
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+static void *fiber_proc(void *p) {
+    host_fiber *f = (host_fiber *)p;
+    hf_wait(f);                             /* the first switch to this fiber */
+    thread_body(f->owner);
+    return NULL;                            /* not reached: thread_finish never returns */
+}
 #else
 static void fiber_proc(int hi, int lo) {
     uintptr_t p = ((uintptr_t)(uint32_t)hi << 32) | (uintptr_t)(uint32_t)lo;
@@ -806,10 +863,25 @@ static void fiber_proc(int hi, int lo) {
 #endif
 
 static int fiber_create(psp_thread *t) {
-#ifdef _WIN32
+#if defined(_WIN32)
     t->fiber = CreateFiberEx(256 * 1024, FIBER_STACK_RESERVE, FIBER_FLAG_FLOAT_SWITCH,
                              fiber_proc, t);
     return t->fiber ? 0 : -1;
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+    host_fiber *f = (host_fiber *)calloc(1, sizeof *f);
+    if (!f) return -1;
+    pthread_mutex_init(&f->lock, NULL);
+    pthread_cond_init(&f->cond, NULL);
+    f->owner = t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, FIBER_STACK_RESERVE);
+    const int rc = pthread_create(&f->thread, &a, fiber_proc, f);
+    pthread_attr_destroy(&a);
+    if (rc != 0) { pthread_cond_destroy(&f->cond); pthread_mutex_destroy(&f->lock); free(f); return -1; }
+    f->has_thread = 1;
+    t->fiber = f;
+    return 0;
 #else
     ucontext_t *uc = (ucontext_t *)calloc(1, sizeof *uc);
     if (!uc) return -1;
@@ -827,8 +899,21 @@ static int fiber_create(psp_thread *t) {
 
 static void fiber_delete(psp_thread *t) {
     if (!t->fiber) return;
-#ifdef _WIN32
+#if defined(_WIN32)
     DeleteFiber(t->fiber);
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+    /* The fiber's thread is parked waiting for the baton (never running: only
+     * the caller runs). Wake it to leave, and wait until it has. */
+    host_fiber *f = t->fiber;
+    pthread_mutex_lock(&f->lock);
+    f->quit = 1;
+    f->go = 1;
+    pthread_cond_signal(&f->cond);
+    pthread_mutex_unlock(&f->lock);
+    if (f->has_thread) pthread_join(f->thread, NULL);
+    pthread_cond_destroy(&f->cond);
+    pthread_mutex_destroy(&f->lock);
+    free(f);
 #else
     free(t->fiber->uc_stack.ss_sp);
     free(t->fiber);
@@ -847,8 +932,10 @@ static void run_thread(psp_thread *t) {
         g_current = NULL;
         return;
     }
-#ifdef _WIN32
+#if defined(_WIN32)
     SwitchToFiber(t->fiber);
+#elif defined(PSPRECOMP_THREAD_FIBERS)
+    hf_switch(g_main_fiber, t->fiber);
 #else
     swapcontext(&g_main_ctx, t->fiber);
 #endif
