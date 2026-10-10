@@ -12,7 +12,7 @@
  * ATRAC3plus is a proprietary transform codec with no decoder in this
  * toolkit; the published decoders are GPL/LGPL and are kept out of this MIT
  * runtime. The host may supply one through psp_atrac_set_codec (the PSP2i
- * host loads FFmpeg's libavcodec at run time; another platform can supply its
+ * host loads an LGPL decoder DLL at run time; another platform can supply its
  * own). The runtime stays codec-agnostic:
  *
  *   - every file byte the game supplies (the first buffer, then each
@@ -84,6 +84,7 @@ static int   g_warned;
 static const psp_atrac_codec *g_codec;
 
 void psp_atrac_set_codec(const psp_atrac_codec *codec) { g_codec = codec; }
+const psp_atrac_codec *psp_atrac_get_codec(void) { return g_codec; }
 
 static void release(atrac *t) {
     if (t->codec && g_codec) g_codec->close(t->codec);

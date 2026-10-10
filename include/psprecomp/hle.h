@@ -184,7 +184,28 @@ typedef struct {
     void  (*close)(void *dec);
 } psp_atrac_codec;
 void psp_atrac_set_codec(const psp_atrac_codec *codec);
+const psp_atrac_codec *psp_atrac_get_codec(void);   /* also used for movie audio */
 uint64_t psp_audio_blocks(void);
+
+/* H.264 decoding for sceMpeg movies is supplied by the host as well (see
+ * src/hle/mpeg.c). Without one, movies play their sound and timing over
+ * black frames. */
+typedef struct {
+    int width, height;                 /* the picture, cropped */
+    const uint8_t *y, *u, *v;          /* 4:2:0 planes */
+    int ystride, uvstride;
+    int64_t pts;                       /* the pts given with the unit it came from */
+} psp_video_frame;
+typedef struct {
+    const char *name;
+    void *(*open)(void);
+    /* Decode one access unit (Annex B) presented at `pts`. au == NULL drains
+     * a picture held back for reordering. 1 = a picture is in *out (valid
+     * until the next call), 0 = none yet, -1 = the codec failed for good. */
+    int   (*decode)(void *dec, const uint8_t *au, int size, int64_t pts, psp_video_frame *out);
+    void  (*close)(void *dec);
+} psp_video_codec;
+void psp_mpeg_set_video_codec(const psp_video_codec *codec);
 
 void psp_font_init(void);
 void psp_font_register(void);
@@ -217,6 +238,10 @@ void psp_savedata_set_crypto(const psp_savedata_crypto *c);
 void psp_atrac_init(void);
 void psp_atrac_register(void);
 void psp_atrac_reset(void);
+
+void psp_mpeg_init(void);
+void psp_mpeg_register(void);
+void psp_mpeg_reset(void);
 
 void psp_modules_init(void);
 void psp_modules_register(void);
@@ -259,6 +284,7 @@ int      psp_sched_notify_callback(uint32_t cbid, uint32_t arg);
 void     psp_sched_after_hle(void);
 void     psp_sched_dump(FILE *out);
 /* Call guest code as an interrupt handler would run (GE callbacks). */
+uint32_t psp_call_guest(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2);
 uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1);
 /* Queue a call into guest code from a firmware library (up to five arguments,
  * the fifth in $t0), delivered at the next vblank on the interrupt stack. */

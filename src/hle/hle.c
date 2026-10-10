@@ -214,6 +214,8 @@ void psp_hle_init(void) {
     psp_utility_register();
     psp_atrac_init();
     psp_atrac_register();
+    psp_mpeg_init();
+    psp_mpeg_register();
     psp_modules_init();
     psp_modules_register();
     psp_net_register();
