@@ -29,9 +29,12 @@
 
 #ifdef _WIN32
 #  include <direct.h>
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
 #  define host_mkdir(p) _mkdir(p)
 #else
 #  include <sys/stat.h>
+#  include <dirent.h>
 #  define host_mkdir(p) mkdir(p, 0777)
 #endif
 
@@ -463,6 +466,103 @@ static uint32_t do_getsize(uint32_t p) {
     return exists ? 0 : SAVEDATA_RW_NO_DATA;
 }
 
+/* SIZES (8): free space on the stick, the space an existing save takes, and
+ * the space a new one would take -- PSP2i asks this before its download
+ * feature ("open website") writes NPJH50332DL/DOWNLOAD.FLD. Pointers in the
+ * parameter block (PPSSPP SavedataParam::GetSizes):
+ *   +0x5D0 msFree:      s32 clusterSize, freeClusters, freeSpaceKB; char freeSpaceStr[8]
+ *   +0x5D4 msData:      char gameName[13] + pad[3], saveName[20] (inputs), then
+ *   +0x5D8 utilityData: the used-data info below (msData's at +0x24)
+ *   used-data info:     s32 usedClusters, usedSpaceKB; char usedSpaceStr[8];
+ *                       s32 usedSpace32KB; char usedSpace32Str[8]
+ * A save that does not exist gives SIZES_NO_DATA (and zero sizes). */
+#define SD_MSFREE   0x5D0
+#define SD_MSDATA   0x5D4
+#define SD_UTILDATA 0x5D8
+#define SAVEDATA_SIZES_NO_DATA 0x801103C7u
+
+static void write_used(uint32_t at, uint64_t bytes) {
+    char txt[8];
+    const uint64_t clusters = (bytes + MS_SECTOR - 1) / MS_SECTOR;
+    psp_write32(at + 0, (uint32_t)clusters);
+    psp_write32(at + 4, (uint32_t)((bytes + 1023) / 1024));
+    space_text(bytes, 1, txt);
+    write_text(at + 8, txt);
+    psp_write32(at + 16, (uint32_t)(clusters * (MS_SECTOR / 1024)));   /* in 32 KB clusters, as KB */
+    space_text(clusters * MS_SECTOR, 1, txt);
+    write_text(at + 20, txt);
+}
+
+/* Bytes in the files of a host directory, each rounded up to a cluster (as
+ * the stick stores them); -1 if it does not exist. */
+static int64_t dir_bytes(const char *host) {
+    struct stat st;
+    if (stat(host, &st) != 0) return -1;
+    int64_t total = 0;
+#ifdef _WIN32
+    char pat[1100];
+    snprintf(pat, sizeof pat, "%s\\*", host);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        total += (int64_t)((sz + MS_SECTOR - 1) / MS_SECTOR * MS_SECTOR);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(host);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char f[1400];
+        struct stat fs;
+        snprintf(f, sizeof f, "%s/%s", host, e->d_name);
+        if (stat(f, &fs) == 0 && S_ISREG(fs.st_mode))
+            total += (int64_t)(((uint64_t)fs.st_size + MS_SECTOR - 1) / MS_SECTOR * MS_SECTOR);
+    }
+    closedir(d);
+#endif
+    return total;
+}
+
+static uint32_t do_sizes(uint32_t p) {
+    uint32_t result = 0;
+    const uint32_t msfree = psp_read32(p + SD_MSFREE), msdata = psp_read32(p + SD_MSDATA),
+                   util = psp_read32(p + SD_UTILDATA);
+    if (msfree) {
+        char txt[8];
+        psp_write32(msfree + 0, MS_SECTOR);
+        psp_write32(msfree + 4, (uint32_t)(MS_FREE / MS_SECTOR));
+        psp_write32(msfree + 8, (uint32_t)(MS_FREE / 1024));
+        space_text(MS_FREE, 0, txt);
+        write_text(msfree + 12, txt);
+    }
+    if (msdata) {
+        char game[14], save[21], guest[80], host[1024];
+        psp_str(msdata, game, sizeof game);
+        psp_str(msdata + 16, save, sizeof save);
+        if (!strcmp(save, "<>")) save[0] = '\0';
+        snprintf(guest, sizeof guest, "ms0:/PSP/SAVEDATA/%s%s", game, save);
+        psp_io_host_path(guest, host, sizeof host);
+        const int64_t bytes = dir_bytes(host);
+        if (bytes < 0) {
+            result = SAVEDATA_SIZES_NO_DATA;
+            for (uint32_t i = 0; i < 28; i += 4) psp_write32(msdata + 0x24 + i, 0);
+        } else {
+            write_used(msdata + 0x24, (uint64_t)bytes + MS_SECTOR);   /* + the directory entry */
+        }
+        fprintf(stderr, "psprecomp: savedata sizes: %s %s\n", guest, bytes < 0 ? "absent" : "present");
+    }
+    if (util) {
+        /* a new save of this parameter block: its data, PARAM.SFO, and the directory */
+        const uint64_t data = psp_read32(p + SD_DATASIZE);
+        write_used(util, (data + MS_SECTOR - 1) / MS_SECTOR * MS_SECTOR + 2 * (uint64_t)MS_SECTOR);
+    }
+    return result;
+}
+
 static void hle_SavedataInitStart(void) {
     uint32_t p = psp_arg(0);
     if (g_status != ST_NONE) { psp_ret(0x80110002u); return; }   /* busy */
@@ -476,6 +576,7 @@ static void hle_SavedataInitStart(void) {
     switch (mode) {
     case 0: case 2: result = do_load(p); break;
     case 1: case 3: result = do_save(p); break;
+    case 8:         result = do_sizes(p); break;
     case 22:        result = do_getsize(p); break;
     default:
         result = UTILITY_INVALID_PARAM;

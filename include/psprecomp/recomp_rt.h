@@ -219,6 +219,32 @@ static inline uint32_t psp_f32_to_bits(float v) {
 
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
 
+/* Float -> word, as the Allegrex FPU (and PPSSPP) does it: NaN and anything
+ * at or above 2^31 give 0x7FFFFFFF, anything below -2^31 gives 0x80000000,
+ * the rest is rounded by `mode` -- FCR31's RM field: 0 nearest (ties to
+ * even), 1 toward zero, 2 up, 3 down. cvt.w.s uses the current mode,
+ * trunc/round/ceil/floor.w.s their own. A plain C cast is undefined for NaN
+ * and overflow (x86 gives 0x80000000), and truncates where cvt.w.s rounds. */
+static inline uint32_t psp_f2w(float v, uint32_t mode) {
+    if (v != v || v >= 2147483648.0f) return 0x7FFFFFFFu;
+    if (v < -2147483648.0f) return 0x80000000u;
+    const double d = (double)v;                 /* exact: every float in range is */
+    int64_t t = (int64_t)d;                     /* toward zero */
+    switch (mode & 3) {
+    case 0: {
+        int64_t fl = (double)t > d ? t - 1 : t; /* floor */
+        const double frac = d - (double)fl;
+        if (frac > 0.5 || (frac == 0.5 && (fl & 1))) fl++;
+        t = fl;
+        break;
+    }
+    case 2: if ((double)t < d) t++; break;
+    case 3: if ((double)t > d) t--; break;
+    default: break;
+    }
+    return (uint32_t)(int32_t)t;
+}
+
 /* Newton-Raphson would be faster but the host FPU is exact and this is not the
  * hot path in any recompiled game; correctness first. */
 static inline float psp_fsqrt(float v) {

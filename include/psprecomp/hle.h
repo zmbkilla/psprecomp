@@ -177,6 +177,10 @@ void psp_misc_register(void);
 void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_request_exit(void);       /* host side: window closed, time limit */
+/* sceKernelLoadExec: the game asks to be replaced by another program (path,
+ * argument bytes at argp). The hook may act and never return; when it returns
+ * (or none is set) the game ends as if it had called sceKernelExitGame. */
+void psp_set_loadexec_hook(void (*fn)(const char *path, uint32_t argsize, uint32_t argp));
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 
 /* Audio out: called for every buffer a game outputs through sceAudio, as

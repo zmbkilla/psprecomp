@@ -29,6 +29,10 @@
  *
  * Only the four calls PSP2i imports are implemented: NewLib, Open,
  * GetCharInfo and GetCharGlyphImage.
+ *
+ * A host can stand in for the PGF files with a font of its own
+ * (psp_font_set_host): every open font then draws with it, and sceFontOpen
+ * succeeds with no PGF file present.
  */
 
 #include "psprecomp/hle.h"
@@ -191,6 +195,9 @@ typedef struct { int used; uint8_t *data; psp_pgf pgf; int index; } open_font;
 static open_font g_font[MAX_OPEN];
 static uint32_t  g_libs;
 static uint32_t  g_alt_char = 0x5F;   /* drawn for codes the font lacks */
+static psp_font_host_fn g_host;       /* draws in place of the PGF files when set */
+
+void psp_font_set_host(psp_font_host_fn fn) { g_host = fn; }
 
 void psp_font_reset(void) {
     for (int i = 0; i < MAX_OPEN; i++) free(g_font[i].data);
@@ -241,18 +248,24 @@ static void hle_Open(void) {
             snprintf(path, sizeof path, "flash0:/font/%s", FONT_FILES[index]);
             size_t size = 0;
             uint8_t *data = load_file(path, &size);
-            if (!data || psp_pgf_parse(&g_font[slot].pgf, data, size) != 0) {
-                free(data);
+            if (data && psp_pgf_parse(&g_font[slot].pgf, data, size) != 0) { free(data); data = NULL; }
+            if (!data && !g_host) {
                 fprintf(stderr, "psprecomp: sceFontOpen: cannot load %s (put the PSP font files in "
                                 "<root>/flash/font/)\n", path);
                 e = ERR_FONT_FILE_OPEN_FAILED;
             } else {
+                /* Without the file the slot draws only with the host font. */
+                if (!data) memset(&g_font[slot].pgf, 0, sizeof g_font[slot].pgf);
                 g_font[slot].used = 1;
                 g_font[slot].data = data;
                 g_font[slot].index = (int)index;
                 handle = FONT_HANDLE_BASE + (uint32_t)slot;
-                fprintf(stderr, "psprecomp: sceFontOpen(%u) -> %s, glyphs U+%04X..U+%04X\n", index,
-                        FONT_FILES[index], g_font[slot].pgf.first_glyph, g_font[slot].pgf.last_glyph);
+                if (data)
+                    fprintf(stderr, "psprecomp: sceFontOpen(%u) -> %s, glyphs U+%04X..U+%04X%s\n", index,
+                            FONT_FILES[index], g_font[slot].pgf.first_glyph, g_font[slot].pgf.last_glyph,
+                            g_host ? " (drawing with the host font)" : "");
+                else
+                    fprintf(stderr, "psprecomp: sceFontOpen(%u) -> host font (no %s)\n", index, FONT_FILES[index]);
             }
         }
     }
@@ -260,10 +273,33 @@ static void hle_Open(void) {
     psp_ret(handle);
 }
 
-/* The glyph for `code`, falling back to the alternate character. */
-static int find_glyph(const open_font *f, uint32_t code, psp_pgf_glyph *g) {
-    if (psp_pgf_find(&f->pgf, code, g) == 0) return 0;
-    return psp_pgf_find(&f->pgf, g_alt_char, g);
+/* The glyph for `code`, falling back to the alternate character: from the
+ * host font when one is set, else from the font's PGF file. *found is the
+ * character actually used. */
+static int find_one(const open_font *f, uint32_t code, psp_pgf_glyph *g) {
+    if (g_host) { memset(g, 0, sizeof *g); return g_host(code, g, NULL, 0); }
+    return f->data ? psp_pgf_find(&f->pgf, code, g) : -1;
+}
+
+static int find_glyph(const open_font *f, uint32_t code, psp_pgf_glyph *g, uint32_t *found) {
+    *found = code;
+    if (find_one(f, code, g) == 0) return 0;
+    *found = g_alt_char;
+    return find_one(f, g_alt_char, g);
+}
+
+/* The glyph's bitmap (w*h values 0..15), allocated; NULL on failure. */
+static uint8_t *glyph_pixels(const open_font *f, uint32_t code, const psp_pgf_glyph *g) {
+    const size_t n = (size_t)g->w * (size_t)g->h;
+    uint8_t *px = (uint8_t *)calloc(n, 1);
+    if (!px) return NULL;
+    if (g_host) {
+        psp_pgf_glyph again = *g;
+        if (g_host(code, &again, px, n) != 0 || again.w != g->w || again.h != g->h) { free(px); return NULL; }
+    } else {
+        psp_pgf_decode(&f->pgf, g, px);
+    }
+    return px;
 }
 
 /* SceFontCharInfo: bitmapWidth, bitmapHeight, bitmapLeft, bitmapTop (u32),
@@ -275,7 +311,8 @@ static void hle_GetCharInfo(void) {
     const uint32_t code = psp_arg(1), info = psp_arg(2);
     if (!f || !info) { psp_ret(ERR_FONT_INVALID_PARAMETER); return; }
     psp_pgf_glyph g;
-    if (find_glyph(f, code, &g) != 0) memset(&g, 0, sizeof g);
+    uint32_t found;
+    if (find_glyph(f, code, &g, &found) != 0) memset(&g, 0, sizeof g);
     psp_write32(info + 0,  (uint32_t)g.w);
     psp_write32(info + 4,  (uint32_t)g.h);
     psp_write32(info + 8,  (uint32_t)g.left);
@@ -344,10 +381,10 @@ static void hle_GetCharGlyphImage(void) {
     const int bw = psp_read16(img + 12), bh = psp_read16(img + 14);
     const uint32_t bpl = psp_read16(img + 16), buf = psp_read32(img + 20);
     psp_pgf_glyph g;
-    if (find_glyph(f, code, &g) != 0 || g.w <= 0 || g.h <= 0) { psp_ret(0); return; }
-    uint8_t *px = (uint8_t *)malloc((size_t)g.w * (size_t)g.h);
-    if (!px) { psp_ret(ERR_FONT_INVALID_PARAMETER); return; }
-    psp_pgf_decode(&f->pgf, &g, px);
+    uint32_t found;
+    if (find_glyph(f, code, &g, &found) != 0 || g.w <= 0 || g.h <= 0) { psp_ret(0); return; }
+    uint8_t *px = glyph_pixels(f, found, &g);
+    if (!px) { psp_ret(0); return; }
     for (int y = 0; y < g.h; y++) {
         const int yy = y0 + y;
         if (yy < 0 || yy >= bh) continue;

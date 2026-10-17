@@ -94,6 +94,13 @@ typedef struct {
 
 void psp_np_set_backend(const psp_np_backend *be);
 
+/* The firmware's PS Store, drawn over the running game (PSP2i: the PSN
+ * utility in mode 1, after sceNpCommerce2Init). A host with a store page sets
+ * these: open(title_id) shows it without blocking and returns 0 (nonzero:
+ * no store -- the dialog then just finishes), showing() is 1 while it is up.
+ * The dialog reports "processing" meanwhile and finishes when it closes. */
+void psp_np_set_store(int (*open)(const char *title_id), int (*showing)(void));
+
 enum {
     PSP_M2_SEARCH_ROOM = 1, PSP_M2_CREATE_JOIN_ROOM, PSP_M2_JOIN_ROOM, PSP_M2_LEAVE_ROOM,
     PSP_M2_GET_ROOM_DATA_EXTERNAL_LIST, PSP_M2_SET_ROOM_DATA_EXTERNAL, PSP_M2_SET_ROOM_DATA_INTERNAL,

@@ -79,10 +79,18 @@ extern uint64_t psp_mem_bad_access;
 void psp_mem_watch_write(uint32_t addr);
 /* Called once, at the first out-of-range access (a host can dump memory). */
 void psp_mem_set_first_bad_hook(void (*fn)(uint32_t addr));
+/* Called on every unmapped access (the host dedupes / logs). */
+void psp_mem_set_bad_hook(void (*fn)(uint32_t addr, int write, int width));
 int psp_mem_watch_hits(void);
 /* Called on each reported watch hit (after the line is printed): a host can
  * add context, e.g. which recompiled functions are on the stack. */
 void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value));
+/* Reads: up to four watched words (0 clears them all); the hook gets the
+ * watched address and the address read, on every hit (the host dedupes). */
+void psp_mem_watch_read(uint32_t addr);
+/* Every guest write goes to fn while it is set (NULL = off). */
+void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value));
+void psp_mem_set_read_watch_hook(void (*fn)(uint32_t watched, uint32_t addr));
 
 uint8_t  psp_read8 (uint32_t addr);
 uint16_t psp_read16(uint32_t addr);

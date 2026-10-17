@@ -21,7 +21,13 @@ int psp_mem_watch_hits(void) { return g_whits; }
 static void (*g_watch_hook)(uint32_t addr, uint32_t value);
 void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value)) { g_watch_hook = fn; }
 
+/* Write trace: every guest write while switched on (a host brackets one
+ * packet handler with it to see everything that handler stores). */
+static void (*g_wtrace)(uint32_t addr, uint32_t width, uint32_t value);
+void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value)) { g_wtrace = fn; }
+
 static void note_write(uint32_t addr, uint32_t width, uint32_t value) {
+    if (g_wtrace) g_wtrace(addr, width, value);
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
     if (g_whits++ < 32) {
         fprintf(stderr, "write%u 0x%08X to 0x%08X (watch 0x%08X) from fn 0x%08X\n",
@@ -30,13 +36,39 @@ static void note_write(uint32_t addr, uint32_t width, uint32_t value) {
     }
 }
 
+/* Watch reads of up to four addresses, the same idea for "which code reads
+ * this value" (e.g. which HUD code draws a number). Off unless armed: one
+ * predictable branch per read. */
+#define MAX_RWATCH 4
+static uint32_t g_rwatch[MAX_RWATCH];
+static int g_rwatch_n;
+static void (*g_rwatch_hook)(uint32_t watched, uint32_t addr);
+void psp_mem_watch_read(uint32_t addr) {
+    if (!addr) { g_rwatch_n = 0; return; }
+    for (int i = 0; i < g_rwatch_n; i++) if (g_rwatch[i] == addr) return;
+    if (g_rwatch_n < MAX_RWATCH) g_rwatch[g_rwatch_n++] = addr;
+}
+void psp_mem_set_read_watch_hook(void (*fn)(uint32_t watched, uint32_t addr)) { g_rwatch_hook = fn; }
+
+static void note_read(uint32_t addr, uint32_t width) {
+    for (int i = 0; i < g_rwatch_n; i++)
+        if (addr < g_rwatch[i] + 4 && addr + width > g_rwatch[i]) {
+            if (g_rwatch_hook) g_rwatch_hook(g_rwatch[i], addr);
+            return;
+        }
+}
+
 /* Bad accesses were only ever counted, which says an initialiser went wrong
  * without saying which one. The addresses are what identify it, and there are
  * few enough of them (28 in the current run) to simply print. */
 static void (*g_first_bad_hook)(uint32_t addr);
 void psp_mem_set_first_bad_hook(void (*fn)(uint32_t addr)) { g_first_bad_hook = fn; }
 
+static void (*g_bad_hook)(uint32_t addr, int write, int width);
+void psp_mem_set_bad_hook(void (*fn)(uint32_t addr, int write, int width)) { g_bad_hook = fn; }
+
 static void bad_access(uint32_t addr, int write, int width) {
+    if (g_bad_hook) g_bad_hook(addr, write, width);
     /* The first one matters most: everything after it may be cascade from a
      * register that was already wrong. Dump the whole file once. */
     if (psp_mem_bad_access == 0 && g_first_bad_hook) g_first_bad_hook(addr);
@@ -143,6 +175,7 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     }
 
 #define READ_BODY(TYPE)                              \
+    if (g_rwatch_n) note_read(addr, (uint32_t)sizeof(TYPE)); \
     RAM_FAST_READ(TYPE)                              \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
     if (!p) { bad_access(addr, 0, (int)sizeof(TYPE)); return 0; }      \
@@ -164,7 +197,7 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
         else p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE));                    \
     }                                                \
     if (!p) { bad_access(addr, 1, (int)sizeof(TYPE)); return; }         \
-    if (g_wwatch) { uint32_t v_ = 0; memcpy(&v_, &val, sizeof(TYPE) < 4 ? sizeof(TYPE) : 4); \
+    if (g_wwatch || g_wtrace) { uint32_t v_ = 0; memcpy(&v_, &val, sizeof(TYPE) < 4 ? sizeof(TYPE) : 4); \
       note_write(addr, (uint32_t)sizeof(TYPE), v_); }            \
     memcpy(p, &val, sizeof(TYPE));
 

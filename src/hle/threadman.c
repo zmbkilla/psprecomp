@@ -392,7 +392,12 @@ uint64_t psp_sched_idle_us(void) { return g_idle_us; }
 typedef struct { uint32_t handler, arg; int enabled, used; } subintr;
 static subintr g_subintr[MAX_INTR][MAX_SUBINTR];
 
+static void fiber_delete(psp_thread *t);
+
 void psp_threadman_reset(void) {
+    /* A reset after a run (a host rebooting the game in place): the threads'
+     * host fibers are parked, never running -- free them before forgetting them. */
+    for (int i = 0; i < g_thread_hi; i++) fiber_delete(&g_thread[i]);
     memset(g_thread, 0, sizeof g_thread);
     g_thread_hi = 0;
     memset(g_sema, 0, sizeof g_sema);
@@ -1164,7 +1169,8 @@ int psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
 static int sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
                      uint32_t prio, uint32_t stack_size, uint32_t gp) {
 #ifdef _WIN32
-    g_main_fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
+    /* a second run (a host rebooting the game in place): already a fiber */
+    g_main_fiber = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
     if (!g_main_fiber) { fprintf(stderr, "psprecomp: ConvertThreadToFiber failed\n"); return -1; }
 #endif
     g_sched_on = 1;

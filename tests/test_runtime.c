@@ -194,7 +194,33 @@ static void test_unaligned(void) {
     psp_mem_free();
 }
 
+static void test_float_to_word(void) {
+    /* cvt/trunc/round/ceil/floor.w.s: hardware saturation, not a C cast. */
+    const float nan = psp_bits_to_f32(0x7FC00000u), inf = psp_bits_to_f32(0x7F800000u);
+    CHECK_EQ(psp_f2w(nan, 1), 0x7FFFFFFFu, "NaN -> 0x7FFFFFFF");
+    CHECK_EQ(psp_f2w(-nan, 0), 0x7FFFFFFFu, "-NaN -> 0x7FFFFFFF");
+    CHECK_EQ(psp_f2w(inf, 1), 0x7FFFFFFFu, "+inf saturates");
+    CHECK_EQ(psp_f2w(-inf, 1), 0x80000000u, "-inf saturates");
+    CHECK_EQ(psp_f2w(3e9f, 1), 0x7FFFFFFFu, "+overflow saturates");
+    CHECK_EQ(psp_f2w(-3e9f, 1), 0x80000000u, "-overflow saturates");
+    CHECK_EQ(psp_f2w(-2147483648.0f, 0), 0x80000000u, "-2^31 exact");
+    /* rounding modes: 0 nearest-even, 1 toward zero, 2 up, 3 down */
+    CHECK_EQ(psp_f2w(2.5f, 0), 2u, "2.5 nearest -> 2 (even)");
+    CHECK_EQ(psp_f2w(3.5f, 0), 4u, "3.5 nearest -> 4 (even)");
+    CHECK_EQ(psp_f2w(0.6f, 0), 1u, "0.6 nearest -> 1");
+    CHECK_EQ(psp_f2w(-2.5f, 0), (uint32_t)-2, "-2.5 nearest -> -2");
+    CHECK_EQ(psp_f2w(-0.6f, 0), (uint32_t)-1, "-0.6 nearest -> -1");
+    CHECK_EQ(psp_f2w(0.6f, 1), 0u, "0.6 toward zero -> 0");
+    CHECK_EQ(psp_f2w(-1.7f, 1), (uint32_t)-1, "-1.7 toward zero -> -1");
+    CHECK_EQ(psp_f2w(1.2f, 2), 2u, "1.2 up -> 2");
+    CHECK_EQ(psp_f2w(-1.2f, 2), (uint32_t)-1, "-1.2 up -> -1");
+    CHECK_EQ(psp_f2w(1.7f, 3), 1u, "1.7 down -> 1");
+    CHECK_EQ(psp_f2w(-1.2f, 3), (uint32_t)-2, "-1.2 down -> -2");
+    CHECK_EQ(psp_f2w(821.0f, 0), 821u, "integers stay");
+}
+
 int main(void) {
+    test_float_to_word();
     test_zero_register();
     test_division();
     test_multiply();

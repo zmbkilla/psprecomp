@@ -39,6 +39,17 @@ int psp_pgf_decode(const psp_pgf *f, const psp_pgf_glyph *g, uint8_t *out);
 /* `n` bits at bit `pos`, LSB first (bits past `limit_bytes` read as 0). */
 uint32_t psp_pgf_bits(const uint8_t *base, size_t limit_bytes, uint64_t pos, int n);
 
+/* A host font in place of the PGF files (a TrueType font the platform draws).
+ * Fills g's size, placement and 26.6 metrics for `code` and, when px is not
+ * NULL, its bitmap as g->w * g->h values 0..15, row-major (px holds cap
+ * bytes). Returns 0, or -1 if the font has no such character. */
+typedef int (*psp_font_host_fn)(uint32_t code, psp_pgf_glyph *g, uint8_t *px, size_t cap);
+
+/* Set (or, with NULL, remove) the host font. While one is set, every open
+ * font draws with it and sceFontOpen needs no PGF file; without one the PGF
+ * files in flash0:/font/ are used. Takes effect from the next character. */
+void psp_font_set_host(psp_font_host_fn fn);
+
 #ifdef __cplusplus
 }
 #endif

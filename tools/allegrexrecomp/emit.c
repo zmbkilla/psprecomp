@@ -866,9 +866,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_CVT_S_W:
         fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                 ind, in->fd, in->fs); return;
-    case A_CVT_W_S: case A_TRUNC_W_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
+    /* Float -> word with the hardware's rules (psp_f2w): cvt.w.s rounds by
+     * FCR31's mode; NaN / overflow saturate as on the PSP, not as a C cast. */
+    case A_CVT_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f2w(psp_cpu.f[%u], psp_cpu.fcr31));\n",
                 ind, in->fd, in->fs); return;
+    case A_ROUND_W_S: case A_TRUNC_W_S: case A_CEIL_W_S: case A_FLOOR_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f2w(psp_cpu.f[%u], %du));\n", ind, in->fd, in->fs,
+                in->op == A_ROUND_W_S ? 0 : in->op == A_TRUNC_W_S ? 1 : in->op == A_CEIL_W_S ? 2 : 3); return;
     case A_C_COND_S:
         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
                 ind, in->fcond, in->fs, in->ft); return;

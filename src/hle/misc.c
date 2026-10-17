@@ -95,6 +95,28 @@ static void hle_ExitGame(void) {
 
 static void hle_RegisterExitCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
+/* (path, SceKernelLoadExecParam *): replace the running game with another
+ * program -- PSP2i's "open website" runs disc0:/PSP_GAME/USRDIR/module/browser.prx,
+ * which returns by loading the game again. It never returns on a PSP, and a
+ * game calls it after tearing itself down (what follows the call is unreachable
+ * there; in PSP2i it crashes), so: hand the request to the host, which may
+ * act on it and not come back, and otherwise end the game cleanly. */
+static void (*g_loadexec_hook)(const char *path, uint32_t argsize, uint32_t argp);
+void psp_set_loadexec_hook(void (*fn)(const char *path, uint32_t argsize, uint32_t argp)) { g_loadexec_hook = fn; }
+
+static void hle_LoadExec(void) {
+    char path[256];
+    psp_str(psp_arg(0), path, sizeof path);
+    const uint32_t prm = psp_arg(1);
+    const uint32_t argsize = prm ? psp_read32(prm + 4) : 0, argp = prm ? psp_read32(prm + 8) : 0;
+    fprintf(stderr, "psprecomp: sceKernelLoadExec(%s, %u argument bytes)\n", path, argsize);
+    if (g_loadexec_hook) g_loadexec_hook(path, argsize, argp);
+    g_exit_requested = 1;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    /* never back into the game: sleep until the scheduler acts on the exit */
+    for (;;) psp_sched_sleep_until(psp_sched_now_us() + 1000000000ull);
+}
+
 /* ---- ModuleMgrForUser ---------------------------------------------------- */
 /* A game-sharing microgame is self-contained and does not load further
  * modules, so these report a plausible identity rather than doing anything.
@@ -297,6 +319,7 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);
+    psp_hle_register(0xBD2F1094, "LoadExecForUser", "sceKernelLoadExec",             hle_LoadExec);
 
     /* Observed but unidentified. The game calls this three times on its
      * heap-setup path, and an unimplemented call returns 0 -- which for a
