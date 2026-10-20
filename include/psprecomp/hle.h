@@ -182,6 +182,7 @@ void psp_request_exit(void);       /* host side: window closed, time limit */
  * (or none is set) the game ends as if it had called sceKernelExitGame. */
 void psp_set_loadexec_hook(void (*fn)(const char *path, uint32_t argsize, uint32_t argp));
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+uint32_t psp_ctrl_buttons(void);   /* what psp_ctrl_set last gave the game */
 
 /* Audio out: called for every buffer a game outputs through sceAudio, as
  * interleaved stereo s16 at 44.1 kHz with the channel volume applied. The
@@ -293,6 +294,9 @@ int      psp_sched_active(void);
 uint64_t psp_sched_now_us(void);
 uint64_t psp_sched_idle_us(void);    /* host time with nothing runnable */
 uint64_t psp_display_flips(void);    /* sceDisplaySetFrameBuf calls */
+/* Called on every sceDisplayWaitVblank* (kind 0) and sceDisplayGetVcount
+ * (kind 1) with the caller's return address: who counts vblanks. NULL = off. */
+void psp_display_set_vblank_use_hook(void (*fn)(int kind, uint32_t ra));
 /* How many flips came 1, 2, 3 and 4+ vblanks after the previous one. */
 void psp_display_flip_spacing(uint64_t out[4]);
 /* Flips by host busy time since the previous one: <8, <16.7, <25, <33.3, <50, 50+ ms. */
@@ -300,6 +304,11 @@ void psp_display_frame_busy(uint64_t out[6]);
 uint64_t psp_ge_host_us(void);       /* host time executing display lists */
 uint64_t psp_gpu_host_us(void);      /* ...of which rasterizing primitives */
 uint64_t psp_sched_vblank_count(void);
+/* The emulated display's refresh: 1 = the PSP's 59.94 Hz (default), 2 = twice
+ * that, so a game that paces its frames by vblanks can run at 120 fps. Every
+ * vblank wait, the vblank interrupt and the vcount follow it. */
+void psp_sched_set_vblank_rate(int mult);
+int  psp_sched_vblank_rate(void);
 /* Called once per vblank on the scheduler's clock: present, pump input. */
 void     psp_sched_set_vblank_hook(void (*fn)(void));
 /* Block the calling PSP thread. Return immediately outside the scheduler. */

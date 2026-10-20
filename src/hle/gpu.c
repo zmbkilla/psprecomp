@@ -168,12 +168,21 @@ static uint32_t texel_offset(uint32_t x, uint32_t y, uint32_t bufw, int bpp, int
     return (by * blocks_per_row + bx) * 128 + (y % 8) * 16 + (xb % 16);
 }
 
+/* A DXT endpoint colour: 565 with RED IN THE HIGH BITS -- unlike the GE's
+ * 5650 texel format (c5650, red in the low bits), which swapped red and blue
+ * on every DXT texture (PSP2i's lobby billboard). Expanded as PPSSPP does
+ * (red (c >> 8) & 0xF8, green (c >> 3) & 0xFC, blue (c << 3) & 0xF8). */
+static uint32_t dxt565(uint16_t c) {
+    const uint32_t r = (c >> 8) & 0xF8, g = (c >> 3) & 0xFC, b = (c << 3) & 0xF8;
+    return 0xFF000000u | (b << 16) | (g << 8) | r;
+}
+
 /* DXT colour block in the PSP's layout: 4 bytes of 2-bit indices (one byte
  * per row), then two 565 colours. */
 static uint32_t dxt_color(uint32_t blk, uint32_t x, uint32_t y, int dxt1) {
     uint8_t lines = rd8(blk + y);
     uint16_t c0 = rd16(blk + 4), c1 = rd16(blk + 6);
-    uint32_t a = c5650(c0), b = c5650(c1);
+    uint32_t a = dxt565(c0), b = dxt565(c1);
     uint32_t idx = (lines >> (x * 2)) & 3;
     if (idx == 0) return a;
     if (idx == 1) return b;

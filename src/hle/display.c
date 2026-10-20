@@ -167,7 +167,11 @@ static void hle_SetFrameBuf(void) {
  * for, so it returns immediately and bumps the counter. Either way the count
  * is the frame number -- the most useful single number to have during
  * bring-up, because it tells you whether the game is looping or stuck. */
+static void (*g_vblank_use)(int kind, uint32_t ra);
+void psp_display_set_vblank_use_hook(void (*fn)(int kind, uint32_t ra)) { g_vblank_use = fn; }
+
 static void wait_vblank(int cb) {
+    if (g_vblank_use) g_vblank_use(0, psp_cpu.r[31]);
     psp_sched_wait_vblank(cb);
     g_vblank_count = psp_sched_active() ? psp_sched_vblank_count() : g_vblank_count + 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -176,12 +180,14 @@ static void hle_WaitVblank(void)   { wait_vblank(0); }
 static void hle_WaitVblankCB(void) { wait_vblank(1); }
 
 static void hle_GetVcount(void) {
+    if (g_vblank_use) g_vblank_use(1, psp_cpu.r[31]);
     psp_ret((uint32_t)(psp_sched_active() ? psp_sched_vblank_count() : g_vblank_count));
 }
 
-/* Returns a float, in $f0: the panel's refresh rate. */
+/* Returns a float, in $f0: the panel's refresh rate (the emulated one: twice
+ * the PSP's with psp_sched_set_vblank_rate(2)). */
 static void hle_GetFramePerSec(void) {
-    psp_cpu.f[0] = 59.9400599f;
+    psp_cpu.f[0] = 59.9400599f * (float)psp_sched_vblank_rate();
 }
 
 /* (topaddr*, bufferwidth*, pixelformat*, sync) */

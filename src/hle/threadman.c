@@ -394,6 +394,12 @@ static uint64_t g_idle_us;           /* host time spent with no thread runnable 
 uint64_t psp_sched_idle_us(void) { return g_idle_us; }
 
 #define VBLANK_US 16683u          /* 1e6 / 59.94 */
+static uint32_t g_vblank_us = VBLANK_US;   /* psp_sched_set_vblank_rate */
+
+void psp_sched_set_vblank_rate(int mult) {
+    g_vblank_us = mult >= 2 && mult <= 4 ? VBLANK_US / (uint32_t)mult : VBLANK_US;
+}
+int psp_sched_vblank_rate(void) { return (int)(VBLANK_US / g_vblank_us); }
 
 /* Sub-interrupt handlers (sceKernelRegisterSubIntrHandler). Only what the
  * scheduler can actually raise is delivered: the vblank, interrupt 30. */
@@ -795,7 +801,7 @@ static void process_events(uint64_t now) {
 
     while (now >= g_next_vblank) {
         g_vblank_count++;
-        g_next_vblank += VBLANK_US;
+        g_next_vblank += g_vblank_us;
         for (int i = 0; i < g_thread_hi; i++) {
             psp_thread *t = &g_thread[i];
             if (t->used && t->state == TH_WAITING && t->wait == W_VBLANK) wake(t, 0);
@@ -805,7 +811,7 @@ static void process_events(uint64_t now) {
         if (g_vblank_hook) g_vblank_hook();
         /* A host that falls far behind should not replay hundreds of
          * vblanks in a burst. */
-        if (now > g_next_vblank + 10 * VBLANK_US) g_next_vblank = now + VBLANK_US;
+        if (now > g_next_vblank + 10 * g_vblank_us) g_next_vblank = now + g_vblank_us;
     }
 
     for (int i = 0; i < g_thread_hi; i++) {
@@ -1185,7 +1191,7 @@ static int sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
     if (!g_main_fiber) { fprintf(stderr, "psprecomp: ConvertThreadToFiber failed\n"); return -1; }
 #endif
     g_sched_on = 1;
-    g_next_vblank = psp_sched_now_us() + VBLANK_US;
+    g_next_vblank = psp_sched_now_us() + g_vblank_us;
     g_last_progress = psp_sched_now_us();
 
     psp_thread *root = new_thread("root", entry, prio, stack_size, 0);

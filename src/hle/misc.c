@@ -156,6 +156,8 @@ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     g_analog_y = ay;
 }
 
+uint32_t psp_ctrl_buttons(void) { return g_buttons; }
+
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
