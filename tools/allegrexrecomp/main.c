@@ -739,8 +739,28 @@ static int read_addr_file(const char *path, uint32_t *out, int max, int pairs) {
     return n;
 }
 
+/* Lines of "ID 0xADDR 0xWORD [# comment]": instructions with a run-time
+ * alternative (emit_opts.sw_*). Returns the count, -1 on error. */
+static int read_switch_file(const char *path, uint32_t *addr, uint32_t *word, uint8_t *id, int max) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot read %s\n", path); return -1; }
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        unsigned long i, a, w;
+        if (sscanf(line, "%lu %lx %lx", &i, &a, &w) < 3) continue;
+        if (n >= max || i > 31) { fprintf(stderr, "%s: too many switches, or an id over 31\n", path); fclose(f); return -1; }
+        id[n] = (uint8_t)i; addr[n] = (uint32_t)a; word[n] = (uint32_t)w;
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
 static int cmd_emit(const char *path, const char *outdir, const char *prefix,
-                    const char *hooks_path, const char *fixes_path) {
+                    const char *hooks_path, const char *fixes_path, const char *switches_path) {
     psp_blob b;
     elf_info e;
     a_analysis an;
@@ -794,6 +814,25 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix,
     o.nimports = nimp;
     o.hooks = hooks;
     o.nhooks = nhook;
+    static uint32_t sw_addr[256], sw_word[256];
+    static uint8_t sw_id[256];
+    int nsw = switches_path ? read_switch_file(switches_path, sw_addr, sw_word, sw_id, 256) : 0;
+    if (nsw < 0) return 1;
+    for (int i = 0; i < nsw; i++) {
+        if (!a_in_range(&an, sw_addr[i])) { fprintf(stderr, "switch 0x%08X: outside the code\n", sw_addr[i]); return 1; }
+        a_insn orig, alt;
+        a_decode(*(const uint32_t *)((const uint8_t *)an.code + (sw_addr[i] - an.base)), sw_addr[i], &orig);
+        a_decode(sw_word[i], sw_addr[i], &alt);
+        const int orig_cf = orig.is_branch || orig.is_jump || orig.is_call || orig.is_indirect || orig.is_return;
+        const int alt_cf = alt.is_branch || alt.is_jump || alt.is_call || alt.is_indirect || alt.is_return;
+        if (alt_cf || (orig_cf && !(orig.is_branch && sw_word[i] == 0))) {
+            fprintf(stderr, "switch 0x%08X: only a branch -> nop, or a non-branch -> non-branch, can be switched\n", sw_addr[i]);
+            return 1;
+        }
+        printf("switch %2u:  0x%08X  %08X | %08X\n", sw_id[i], sw_addr[i],
+               *(const uint32_t *)((const uint8_t *)an.code + (sw_addr[i] - an.base)), sw_word[i]);
+    }
+    o.sw_addr = sw_addr; o.sw_word = sw_word; o.sw_id = sw_id; o.nsw = nsw;
     if (nhook) printf("hooks:      %d\n", nhook);
 
     printf("module:     %s\n", module);
@@ -1031,13 +1070,14 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "funcs"))   return cmd_funcs(argv[2], argc > 3 && !strcmp(argv[3], "--list"));
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
-        const char *prefix = NULL, *hooks = NULL, *fixes = NULL;
+        const char *prefix = NULL, *hooks = NULL, *fixes = NULL, *switches = NULL;
         for (int i = 4; i < argc; i++) {
             if (!strcmp(argv[i], "--hooks") && i + 1 < argc) hooks = argv[++i];
+            else if (!strcmp(argv[i], "--switches") && i + 1 < argc) switches = argv[++i];
             else if (!strcmp(argv[i], "--fixes") && i + 1 < argc) fixes = argv[++i];
             else if (!prefix) prefix = argv[i];
         }
-        return cmd_emit(argv[2], argv[3], prefix, hooks, fixes);
+        return cmd_emit(argv[2], argv[3], prefix, hooks, fixes, switches);
     }
     if (!strcmp(cmd, "extract")) {
         if (argc < 5) return usage();

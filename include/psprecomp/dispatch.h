@@ -64,6 +64,11 @@ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t));
  * For a port's deliberate, documented changes to game behaviour. */
 typedef void (*psp_hook_fn)(void (*original)(void));
 void        psp_hook_set(uint32_t addr, psp_hook_fn fn);
+
+/* Run-time switches for instructions emitted with an alternative
+ * (allegrexrecomp emit --switches): non-zero = the alternative runs. The host
+ * sets them; all start off. */
+extern uint8_t psp_switch[32];
 psp_hook_fn psp_hook_find(uint32_t addr);
 void psp_trace_loop(uint32_t addr);
 void psp_trace_mark(uint32_t addr);

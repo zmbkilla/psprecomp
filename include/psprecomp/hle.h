@@ -183,6 +183,7 @@ void psp_request_exit(void);       /* host side: window closed, time limit */
 void psp_set_loadexec_hook(void (*fn)(const char *path, uint32_t argsize, uint32_t argp));
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint32_t psp_ctrl_buttons(void);   /* what psp_ctrl_set last gave the game */
+int psp_utility_savedata_busy(void); /* a sceUtilitySavedata request is running */
 
 /* Audio out: called for every buffer a game outputs through sceAudio, as
  * interleaved stereo s16 at 44.1 kHz with the channel volume applied. The
@@ -297,6 +298,10 @@ uint64_t psp_display_flips(void);    /* sceDisplaySetFrameBuf calls */
 /* Called on every sceDisplayWaitVblank* (kind 0) and sceDisplayGetVcount
  * (kind 1) with the caller's return address: who counts vblanks. NULL = off. */
 void psp_display_set_vblank_use_hook(void (*fn)(int kind, uint32_t ra));
+/* While on, every sceDisplayWaitVblank* naps 1 ms instead of waiting for the
+ * vblank (the caller turns it off again): lower-priority threads still run,
+ * and the frame goes on without waiting out the display (fast loading). */
+void psp_display_skip_next_wait(int on);
 /* How many flips came 1, 2, 3 and 4+ vblanks after the previous one. */
 void psp_display_flip_spacing(uint64_t out[4]);
 /* Flips by host busy time since the previous one: <8, <16.7, <25, <33.3, <50, 50+ ms. */

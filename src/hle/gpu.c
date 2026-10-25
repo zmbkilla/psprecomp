@@ -1361,6 +1361,138 @@ static void rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static void verify_rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n);
 
+/* ---- transformed triangles with the vertex work on the GPU (render.h draw_tl) ----
+ *
+ * The per-vertex loop below -- decoding, skinning, the matrices, lighting,
+ * texture coordinates -- was a third of the game thread in PSP2i's lobby.
+ * For transformed triangles, strips and fans a backend with draw_tl does it
+ * in its vertex shader instead: it gets the game's vertex bytes as they are,
+ * the triangle list the CPU path would assemble (rasterize_rows' order), and
+ * the GE state packed as render.h lays it out. Morphing, flat shading,
+ * through mode, clear mode, points, lines and sprites keep the CPU path. */
+
+static void fill_hw_state(psp_gpu_state *st);
+static int g_gpu_tl = 1;
+static uint64_t g_tl_draws, g_tl_refused;
+void psp_gpu_set_gpu_transform(int on) { g_gpu_tl = on != 0; }
+int  psp_gpu_gpu_transform(void) { return g_gpu_tl; }
+
+static uint32_t g_tlel[65536];           /* each element's vertex number */
+static uint32_t g_tlidx[3 * 65536];      /* the triangle list */
+
+/* A GE 4x3 matrix (columns x, y, z, translation) as 3 rows of 4. */
+static void tl_rows43(float *u, const float *m) {
+    for (int r = 0; r < 3; r++) {
+        u[4 * r + 0] = m[r]; u[4 * r + 1] = m[3 + r]; u[4 * r + 2] = m[6 + r]; u[4 * r + 3] = m[9 + r];
+    }
+}
+
+static void tl_set(float *u, int row, float x, float y, float z, float w) {
+    u[4 * row] = x; u[4 * row + 1] = y; u[4 * row + 2] = z; u[4 * row + 3] = w;
+}
+
+/* 1: drawn (or nothing to draw); 0: the CPU path should draw it. */
+static int tl_draw(uint32_t type, uint32_t n, uint32_t vaddr, uint32_t iaddr, uint32_t vt, const layout *L) {
+    const int itype = (int)VT_INDEX(vt);
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    const uint8_t *ip = itype ? mem(iaddr, n << (itype - 1)) : NULL;
+    if (itype && !ip) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t idx = i;
+        if (itype == 1) idx = ip[i];
+        else if (itype == 2) { uint16_t h; memcpy(&h, ip + 2 * i, 2); idx = h; }
+        else if (itype == 3) memcpy(&idx, ip + 4 * i, 4);
+        g_tlel[i] = idx;
+        if (idx < lo) lo = idx;
+        if (idx > hi) hi = idx;
+    }
+    if (n < 3) return 1;
+    const uint32_t nv = hi - lo + 1;
+    if (nv > 4 * n + 256) return 0;                 /* a few vertices of a large buffer: not worth the copy */
+    const uint32_t stride = (uint32_t)L->stride;
+    const uint32_t a0 = vaddr + lo * stride, base = a0 & ~3u, mis = a0 - base;
+    const uint32_t bytes = (mis + nv * stride + 3) & ~3u;
+    const uint8_t *vp = mem(base, bytes);
+    if (!vp) return 0;
+
+    int k = 0;
+#define TL_TRI(a, b, c) do { g_tlidx[k++] = g_tlel[a] - lo; g_tlidx[k++] = g_tlel[b] - lo; g_tlidx[k++] = g_tlel[c] - lo; } while (0)
+    if (type == 3)      for (uint32_t i = 0; i + 2 < n; i += 3) TL_TRI(i, i + 1, i + 2);
+    else if (type == 4) for (uint32_t i = 0; i + 2 < n; i++) { if (i & 1) TL_TRI(i + 1, i, i + 2); else TL_TRI(i, i + 1, i + 2); }
+    else                for (uint32_t i = 1; i + 1 < n; i++) TL_TRI(0, i, i + 1);
+#undef TL_TRI
+    if (!k) return 1;
+
+    float U[PSP_TL_NU * 4];
+    int32_t I[PSP_TL_NI * 4];
+    memset(U, 0, sizeof U);
+    memset(I, 0, sizeof I);
+    tl_rows43(U + 4 * PSP_TL_U_WORLD, g_world);
+    tl_rows43(U + 4 * PSP_TL_U_VIEW, g_view);
+    for (int r = 0; r < 4; r++)
+        tl_set(U, PSP_TL_U_PROJ + r, g_proj[r], g_proj[4 + r], g_proj[8 + r], g_proj[12 + r]);
+    tl_rows43(U + 4 * PSP_TL_U_TGEN, g_tgen);
+    for (int b = 0; b < 8; b++) tl_rows43(U + 4 * (PSP_TL_U_BONES + 3 * b), g_bone + 12 * b);
+    tl_set(U, PSP_TL_U_VSCALE, ge_float(R[0x42]), ge_float(R[0x43]), ge_float(R[0x44]), 0);
+    tl_set(U, PSP_TL_U_VCENTRE, ge_float(R[0x45]) - (float)(R[0x4C] & 0xFFFF) / 16.0f,
+           ge_float(R[0x46]) - (float)(R[0x4D] & 0xFFFF) / 16.0f, ge_float(R[0x47]), 0);
+    float su = ge_float(R[0x48]), sv = ge_float(R[0x49]);
+    if (su == 0 && sv == 0) su = sv = 1.0f;
+    tl_set(U, PSP_TL_U_UV, su, sv, ge_float(R[0x4A]), ge_float(R[0x4B]));
+    tl_set(U, PSP_TL_U_TEXSIZE, (float)tex_w(0), (float)tex_h(0), 0, 0);
+
+    psp_ge_lighting li;
+    psp_ge_lighting_from_regs(R, L->c_off >= 0, &li);
+    tl_set(U, PSP_TL_U_EMISSIVE, li.mat_emissive[0], li.mat_emissive[1], li.mat_emissive[2], 0);
+    tl_set(U, PSP_TL_U_AMBIENT, li.mat_ambient[0], li.mat_ambient[1], li.mat_ambient[2], li.mat_ambient[3]);
+    tl_set(U, PSP_TL_U_DIFFUSE, li.mat_diffuse[0], li.mat_diffuse[1], li.mat_diffuse[2], 0);
+    tl_set(U, PSP_TL_U_SPECULAR, li.mat_specular[0], li.mat_specular[1], li.mat_specular[2], 0);
+    tl_set(U, PSP_TL_U_GLOBAL, li.global_ambient[0], li.global_ambient[1], li.global_ambient[2], li.global_ambient[3]);
+    tl_set(U, PSP_TL_U_SHINE, li.shininess, 0, 0, 0);
+    uint32_t lbits = 0;
+    for (int l = 0; l < 4; l++) {
+        const int b = PSP_TL_U_LIGHTS + 8 * l;
+        tl_set(U, b + 0, li.pos[l][0], li.pos[l][1], li.pos[l][2], 0);
+        tl_set(U, b + 1, li.dir[l][0], li.dir[l][1], li.dir[l][2], 0);
+        tl_set(U, b + 2, li.att[l][0], li.att[l][1], li.att[l][2], 0);
+        tl_set(U, b + 3, li.ambient[l][0], li.ambient[l][1], li.ambient[l][2], 0);
+        tl_set(U, b + 4, li.diffuse[l][0], li.diffuse[l][1], li.diffuse[l][2], 0);
+        tl_set(U, b + 5, li.specular[l][0], li.specular[l][1], li.specular[l][2], 0);
+        tl_set(U, b + 6, li.spot_exp[l], li.spot_cut[l], 0, 0);
+        lbits |= (uint32_t)((li.enabled[l] ? 1 : 0) | (li.type[l] << 1) | (li.comp[l] << 3)) << (8 * l);
+    }
+    for (int s = 0; s < 2; s++) {                   /* psp_ge_shade_map's two lights */
+        const int ls = (int)((R[0xC1] >> (8 * s)) & 3);
+        float p[3];
+        for (int c = 0; c < 3; c++) p[c] = ge_float(R[0x63 + ls * 3 + c]);
+        const float len = sqrtf(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (len > 0.0f) tl_set(U, PSP_TL_U_SHADE + s, p[0] / len, p[1] / len, p[2] / len, 0);
+        else tl_set(U, PSP_TL_U_SHADE + s, 0, 0, 1, 0);
+    }
+
+    int32_t *i0 = I + 4 * PSP_TL_I_LAYOUT0, *i1 = I + 4 * PSP_TL_I_LAYOUT1, *i2 = I + 4 * PSP_TL_I_LAYOUT2;
+    i0[0] = (int32_t)stride; i0[1] = (int32_t)mis; i0[2] = (int32_t)vt; i0[3] = (int32_t)VT_NWEIGHT(vt);
+    i1[0] = L->w_off; i1[1] = L->t_off; i1[2] = L->c_off; i1[3] = L->n_off;
+    i2[0] = L->p_off;
+    i2[1] = ((R[0x17] & 1) ? PSP_TL_F_LIT : 0) | (L->w_off >= 0 ? PSP_TL_F_SKIN : 0) |
+            ((R[0x51] & 1) ? PSP_TL_F_REVERSE_NORMALS : 0);
+    i2[2] = (int32_t)(R[0xC0] & 3);
+    i2[3] = (int32_t)((R[0xC0] >> 8) & 3);
+    I[4 * PSP_TL_I_LIGHT + 0] = (int32_t)lbits;
+    I[4 * PSP_TL_I_LIGHT + 1] = li.mat_update;
+
+    psp_gpu_state st;
+    fill_hw_state(&st);
+    psp_gpu_tl tl;
+    tl.vdata = vp; tl.vbytes = bytes; tl.idx = g_tlidx; tl.nidx = k; tl.nverts = nv;
+    tl.u = U; tl.i = I;
+    tl.cull = (R[0x1D] & 1) ? (!(R[0x9B] & 1) ? 1 : 2) : 0;   /* culled_area(): CCW front drops area > 0 */
+    if (g_hw->draw_tl(&st, &tl) != 0) { g_tl_refused++; return 0; }
+    g_tl_draws++;
+    g_hw_draws++;
+    return 1;
+}
+
 void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     const uint32_t vt = R[0x12];
     layout L;
@@ -1370,6 +1502,9 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
     g_prims++;
     if (g_null_backend()) return;
     setup_draw();
+    if (g_hw && !g_ref && g_hw->draw_tl && g_gpu_tl && !g_through && !g_clear && type >= 3 && type <= 5 &&
+        VT_MORPH(vt) == 1 && (R[0x50] & 1) && !g_dump_req && tl_draw(type, count, vaddr, iaddr, vt, &L))
+        return;
 
     pvtx *buf = g_vbuf;
     const int morph_stride = L.stride * (int)VT_MORPH(vt);
@@ -1869,8 +2004,10 @@ void psp_gpu_dump_stats(FILE *out) {
             (unsigned long long)c_tested, (unsigned long long)c_tri_px, (unsigned long long)c_sprite_px,
             (unsigned long long)c_shaded, (unsigned long long)c_textured, (unsigned long long)c_linear,
             (unsigned long long)c_blend, (unsigned long long)c_clear);
-    if (g_hw) fprintf(out, "    hardware backend %s: %llu draws, %llu fell back to software\n", g_hw->name,
-            (unsigned long long)g_hw_draws, (unsigned long long)g_hw_fallback);
+    if (g_hw) fprintf(out, "    hardware backend %s: %llu draws, %llu fell back to software; vertex work on the GPU %llu "
+                           "(%s), refused %llu\n", g_hw->name,
+            (unsigned long long)g_hw_draws, (unsigned long long)g_hw_fallback, (unsigned long long)g_tl_draws,
+            !g_hw->draw_tl ? "not supported" : g_gpu_tl ? "on" : "off", (unsigned long long)g_tl_refused);
     fprintf(out, "    render threads %d; draws split across them %llu, drawn on one %llu\n",
             g_nworkers, (unsigned long long)g_parallel_draws, (unsigned long long)g_serial_draws);
     fprintf(out, "    draws %llu (%llu textured), %llu triangles culled, %llu clipped\n",

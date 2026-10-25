@@ -27,6 +27,9 @@ typedef struct {
     int nentries, centries;
     const uint32_t *hooks; /* functions with a run-time hook (emit_opts) */
     int nhooks;
+    const uint32_t *sw_addr, *sw_word;   /* instructions with a run-time alternative (emit_opts) */
+    const uint8_t *sw_id;
+    int nsw;
     int *scc;              /* per function index: tail-call cycle id, 0 = none (see compute_tail_cycles) */
     int has_entry_switch;  /* the current body re-enters its entry switch on a computed jump */
 } ectx;
@@ -636,7 +639,31 @@ static void emit_vfpu_mem(FILE *f, const char *ind, const a_insn *in, const char
     fprintf(f, " }\n");
 }
 
+/* The switch entry for an instruction address, or -1. */
+static int switch_at(const ectx *c, uint32_t addr) {
+    for (int i = 0; i < c->nsw; i++) if (c->sw_addr[i] == addr) return i;
+    return -1;
+}
+
+static void emit_simple_one(ectx *c, const a_insn *in, const char *ind);
+
+/* An instruction, or -- with a switch (--switches) -- the original and its
+ * alternative, chosen at run time by psp_switch[id]. */
 static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+    const int s = switch_at(c, in->addr);
+    if (s < 0) { emit_simple_one(c, in, ind); return; }
+    a_insn alt;
+    a_decode(c->sw_word[s], in->addr, &alt);
+    char ind2[64];
+    snprintf(ind2, sizeof ind2, "%s    ", ind);
+    fprintf(c->out, "%sif (psp_switch[%u]) {   /* switched: %08X */\n", ind, c->sw_id[s], c->sw_word[s]);
+    emit_simple_one(c, &alt, ind2);
+    fprintf(c->out, "%s} else {\n", ind);
+    emit_simple_one(c, in, ind2);
+    fprintf(c->out, "%s}\n", ind);
+}
+
+static void emit_simple_one(ectx *c, const a_insn *in, const char *ind) {
     FILE *f = c->out;
     const char *rd = RN[in->rd], *rs = RN[in->rs], *rt = RN[in->rt];
 
@@ -1349,8 +1376,16 @@ static void emit_function(ectx *c, const a_func *fn) {
         }
 
         if (in.is_branch) {
-            char cond[128];
+            char cond[160];
             branch_cond(cond, sizeof cond, &in);
+            /* A switched branch (--switches, alternative nop): never taken
+             * while the switch is on. */
+            const int bsw = switch_at(c, a);
+            if (bsw >= 0) {
+                char tmp[160];
+                snprintf(tmp, sizeof tmp, "(%s) && !psp_switch[%u]", cond, c->sw_id[bsw]);
+                snprintf(cond, sizeof cond, "%s", tmp);
+            }
 
             if (in.is_likely) {
                 /* A "likely" branch nullifies its delay slot when NOT taken,
@@ -1374,6 +1409,12 @@ static void emit_function(ectx *c, const a_func *fn) {
                     fprintf(f, "        psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n        return;\n", in.target);
                 else
                     { emit_static_call(c, in.target); fprintf(f, "        return;\n"); }
+                if (bsw >= 0 && have_slot) {
+                    /* the nop alternative runs the slot as an ordinary instruction */
+                    fprintf(f, "    } else if (psp_switch[%u]) {\n", c->sw_id[bsw]);
+                    comment(c, &slot);
+                    emit_simple(c, &slot, "        ");
+                }
                 fprintf(f, "    }\n");
             } else {
                 /* An ordinary branch always executes its delay slot, and reads
@@ -1760,6 +1801,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     }
 
     c.hooks = o->hooks; c.nhooks = o->nhooks;
+    c.sw_addr = o->sw_addr; c.sw_word = o->sw_word; c.sw_id = o->sw_id; c.nsw = o->nsw;
     c.scc = NULL;
     compute_tail_cycles(&c);
     /* Tail transfers inside a cycle: see compute_tail_cycles. */

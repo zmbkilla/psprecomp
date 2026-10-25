@@ -114,6 +114,8 @@ static void (*g_watch_fn)(uint32_t);
 static struct { uint32_t addr; psp_hook_fn fn; } g_hooks[MAX_HOOKS];
 static int g_nhooks;
 
+uint8_t psp_switch[32];
+
 void psp_hook_set(uint32_t addr, psp_hook_fn fn) {
     for (int i = 0; i < g_nhooks; i++)
         if (g_hooks[i].addr == addr) { g_hooks[i].fn = fn; return; }

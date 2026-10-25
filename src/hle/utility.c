@@ -66,6 +66,7 @@ static uint32_t g_param;
 static int      g_polls;
 
 void psp_utility_reset(void) { g_status = ST_NONE; g_param = 0; g_polls = 0; }
+int psp_utility_savedata_busy(void) { return g_status != ST_NONE; }
 void psp_utility_init(void)  { psp_utility_reset(); }
 
 #define SD_NAMELIST  0x60      /* char (*)[20], for the list modes */
@@ -564,6 +565,7 @@ static uint32_t do_sizes(uint32_t p) {
 }
 
 static void hle_SavedataInitStart(void) {
+    const uint64_t t0 = psp_sched_now_us();
     uint32_t p = psp_arg(0);
     if (g_status != ST_NONE) { psp_ret(0x80110002u); return; }   /* busy */
     g_param = p;
@@ -583,7 +585,8 @@ static void hle_SavedataInitStart(void) {
         fprintf(stderr, "psprecomp: sceUtilitySavedata mode %u not implemented (%s/%s)\n", mode, dir, file);
         break;
     }
-    fprintf(stderr, "psprecomp: sceUtilitySavedata mode %u %s/%s -> 0x%08X\n", mode, dir, file, result);
+    fprintf(stderr, "psprecomp: sceUtilitySavedata mode %u %s/%s -> 0x%08X (%.1f ms)\n", mode, dir, file, result,
+            (psp_sched_now_us() - t0) / 1000.0);
     psp_write32(p + SD_RESULT, result);
     g_status = ST_INIT;
     g_polls = 0;

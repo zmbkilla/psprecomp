@@ -37,6 +37,15 @@ typedef struct {
      * callback and may wrap or replace it. Sorted or not; small. */
     const uint32_t *hooks;
     int             nhooks;
+
+    /* Instructions with a run-time alternative (allegrexrecomp emit
+     * --switches): switch[i] selects between the original word at addr[i]
+     * and word[i] through psp_switch[id[i]] (dispatch.h). The alternative of
+     * a branch may only be 0 (nop: the branch is never taken while the switch
+     * is on); other alternatives must not transfer control. */
+    const uint32_t *sw_addr, *sw_word;
+    const uint8_t  *sw_id;
+    int             nsw;
 } emit_opts;
 
 /* Emit <outdir>/<prefix>_funcs.c, <prefix>_funcs.h and <prefix>_imports.c.

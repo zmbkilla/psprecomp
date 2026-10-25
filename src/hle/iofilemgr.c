@@ -72,6 +72,12 @@ typedef struct {
      * is the position within it (the image's FILE is shared). */
     int     iso;
     int64_t pos;
+    /* Memory-stick files (saves, DLC): what was done with them, logged at
+     * close through psp_io_set_ms_log -- where save and DLC load time goes. */
+    int      ms;
+    char     name[96];
+    uint32_t reads, seeks;
+    uint64_t bytes, read_us, open_at;
 } io_file;
 
 /* The UMD's sector map: where each file starts on the disc. The host serves
@@ -99,6 +105,7 @@ typedef struct {
 #endif
     int iso;             /* listing the disc image: */
     int cursor;          /* 0 ".", 1 "..", then g_umd[cursor - 2] onward */
+    int ms;              /* a memory-stick directory: its entries are logged (psp_io_set_ms_log) */
 } io_dir;
 
 static io_file g_file[MAX_FILES];
@@ -311,6 +318,15 @@ uint64_t psp_io_bytes_read(void) { return g_bytes_read; }
 
 /* Host callback for memory-stick opens (ms0:), e.g. a game's download data. */
 static void (*g_ms_log)(const char *line);
+static const char *g_ms_open_name;   /* the memory-stick open being made (its stats start) */
+/* PSP2I_FILE_LOG=1: also each memory-stick folder entry listed and each file's
+ * statistics at close (every line is written and flushed twice: costly while
+ * DLC loads -- hundreds of files). */
+static int file_log(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PSP2I_FILE_LOG"); on = e && *e == '1'; }
+    return on;
+}
 void psp_io_set_ms_log(void (*fn)(const char *line)) { g_ms_log = fn; }
 
 static int tracing(void) {
@@ -459,10 +475,12 @@ static uint32_t do_open(const char *guest, uint32_t flags, int keep_on_error, in
     if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     *err = 0;
     if (tracing()) fprintf(stderr, "sceIoOpen(%s, 0x%X)%s\n", guest, flags, f ? "" : " -> not found");
+    g_ms_open_name = NULL;                  /* this open's alone (a failed one returns early) */
     if (g_ms_log && (!strncmp(guest, "ms0:", 4) || !strncmp(guest, "fatms0:", 7))) {
         char line[600];
         snprintf(line, sizeof line, "sceIoOpen(%s, 0x%X)%s", guest, flags, f ? "" : " -> not found");
         g_ms_log(line);
+        g_ms_open_name = guest;
     }
     if (!f) {
         /* A failed open is normal (a game probing for a save file) and is not
@@ -472,7 +490,17 @@ static uint32_t do_open(const char *guest, uint32_t flags, int keep_on_error, in
         if (!keep_on_error) return ERR_ENOENT;
     }
 
-    return new_fd(f, base, limit, 0);
+    const uint32_t fd = new_fd(f, base, limit, 0);
+    if (g_ms_open_name && (int32_t)fd >= 3 && fd - 3 < MAX_FILES) {
+        io_file *h = &g_file[fd - 3];
+        h->ms = 1;
+        snprintf(h->name, sizeof h->name, "%s", g_ms_open_name);
+        h->reads = h->seeks = 0;
+        h->bytes = h->read_us = 0;
+        h->open_at = psp_sched_now_us();
+    }
+    g_ms_open_name = NULL;
+    return fd;
 }
 
 static void hle_Open(void) {
@@ -506,6 +534,14 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(ERR_BADF); return; }
+    if (h->ms && g_ms_log && file_log()) {
+        char line[300];
+        snprintf(line, sizeof line, "close %s: %u reads, %llu bytes, %u seeks; reading %.1f ms, open %.1f ms",
+                 h->name, h->reads, (unsigned long long)h->bytes, h->seeks, h->read_us / 1000.0,
+                 (psp_sched_now_us() - h->open_at) / 1000.0);
+        g_ms_log(line);
+    }
+    h->ms = 0;
     if (h->f) fclose(h->f);                 /* never the shared disc image (f is NULL for it) */
     h->f = NULL;
     h->used = 0;
@@ -530,7 +566,9 @@ static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
     uint8_t *tmp = (uint8_t *)malloc(size);
     if (!tmp) return (int64_t)(int32_t)SCE_KERNEL_ERROR_NO_MEMORY;
 
+    const uint64_t t0 = h->ms ? psp_sched_now_us() : 0;
     size_t got = fread(tmp, 1, size, h->iso ? g_iso : h->f);
+    if (h->ms) { h->reads++; h->bytes += got; h->read_us += psp_sched_now_us() - t0; }
     if (h->iso) h->pos += (int64_t)got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
@@ -603,6 +641,7 @@ static void hle_Write(void) {
  * land somewhere plausible but wrong. */
 static void hle_Lseek(void) {
     io_file *h = fd_arg();
+    if (h && h->ms) h->seeks++;
     uint64_t off = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
     uint32_t whence = psp_arg(4);
     if (h && h->iso) {                      /* positions within the image window */
@@ -819,6 +858,13 @@ static void hle_Ioctl(void) {
 
 /* ---- directories --------------------------------------------------------- */
 
+static void ms_dir_log(const char *guest, const char *what) {
+    if (!g_ms_log || (strncmp(guest, "ms0:", 4) && strncmp(guest, "fatms0:", 7))) return;
+    char line[700];
+    snprintf(line, sizeof line, "sceIoDopen(%s)%s", guest, what);
+    g_ms_log(line);
+}
+
 static void hle_Dopen(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
@@ -845,16 +891,21 @@ static void hle_Dopen(void) {
             psp_ret((uint32_t)(i + 1));
             return;
         }
+        /* A slot that last listed the disc image still has `iso` set (Dclose
+         * only frees it): reads would list the image instead, end at once,
+         * and a memory-stick folder (PSP2i's DLC items, ms0:/PSP/GAME/<id>)
+         * looked empty whenever the game ran from an ISO. */
+        memset(&g_dir[i], 0, sizeof g_dir[i]);
 #ifdef _WIN32
         char pattern[1088];
         snprintf(pattern, sizeof pattern, "%s/*", host);
         g_dir[i].handle = _findfirst(pattern, &g_dir[i].data);
-        if (g_dir[i].handle == -1) { psp_ret(ERR_ENOENT); return; }
+        if (g_dir[i].handle == -1) { ms_dir_log(guest, " -> not found"); psp_ret(ERR_ENOENT); return; }
         g_dir[i].first = 1;
         g_dir[i].done = 0;
 #else
         g_dir[i].dir = opendir(host);
-        if (!g_dir[i].dir) { psp_ret(ERR_ENOENT); return; }
+        if (!g_dir[i].dir) { ms_dir_log(guest, " -> not found"); psp_ret(ERR_ENOENT); return; }
 #endif
         snprintf(g_dir[i].path, sizeof g_dir[i].path, "%s", host);
         const char *rel = disc_rel(guest);
@@ -864,6 +915,8 @@ static void hle_Dopen(void) {
         size_t dl = strlen(g_dir[i].disc);
         while (dl && (g_dir[i].disc[dl - 1] == '/' || g_dir[i].disc[dl - 1] == '\\')) g_dir[i].disc[--dl] = '\0';
         g_dir[i].used = 1;
+        g_dir[i].ms = !strncmp(guest, "ms0:", 4) || !strncmp(guest, "fatms0:", 7);
+        ms_dir_log(guest, "");
         psp_ret((uint32_t)(i + 1));
         return;
     }
@@ -936,6 +989,12 @@ static void hle_Dread(void) {
     if (n > 255) n = 255;
     for (uint32_t i = 0; i < (uint32_t)n; i++) psp_write8(at + i, (uint8_t)name[i]);
     psp_write8(at + (uint32_t)n, 0);
+    if (g_dir[id].ms && g_ms_log && file_log() && strcmp(name, ".") && strcmp(name, "..")) {
+        char line[1500];
+        snprintf(line, sizeof line, "  entry %s (mode 0x%X, %u bytes)", host, psp_read32(dirent),
+                 psp_read32(dirent + 8));
+        g_ms_log(line);
+    }
 
     psp_ret(1);                       /* more entries may follow */
 }

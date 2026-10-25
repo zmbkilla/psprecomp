@@ -67,10 +67,12 @@ void     psp_render_reset_pixels(void);
 
 /* ---- hardware rasterizer backend ---------------------------------------------
  *
- * The GE pipeline in src/hle/gpu.c always does vertex work on the CPU
- * (decoding, transforms, near-plane clipping, culling). With a hardware backend
+ * The GE pipeline in src/hle/gpu.c does vertex work on the CPU (decoding,
+ * transforms, near-plane clipping, culling). With a hardware backend
  * installed, it hands each draw over as a triangle list in screen space plus
- * the decoded draw state, instead of rasterizing in software. The backend owns
+ * the decoded draw state, instead of rasterizing in software -- or, for
+ * transformed triangles and a backend with draw_tl, hands over the game's
+ * vertex bytes and leaves the vertex work to the GPU (psp_gpu_tl). The backend owns
  * any copy of VRAM it keeps on the GPU and must keep emulated VRAM coherent
  * through sync_vram / vram_written. */
 
@@ -102,6 +104,60 @@ typedef struct {
     uint32_t mask_rgb, mask_a;        /* write masks: set bits are preserved */
 } psp_gpu_state;
 
+/* A transformed triangle draw with the vertex work left to the GPU (draw_tl):
+ * the game's own vertex bytes, a triangle list of indices into them, and the
+ * GE state the vertex stage needs. The backend's vertex shader decodes each
+ * vertex (the format is the GE's vertex type, below), skins, transforms,
+ * lights and maps its texture coordinates exactly as gpu.c's psp_gpu_prim
+ * does on the CPU, and projects it through the viewport onto the target. It
+ * clips (no near / far depth clipping: depth clamped, as the GE's 0..65535)
+ * and culls itself.
+ *
+ * The vertex bytes: vertex i starts at byte `misalign + i * stride` of
+ * `vdata` (`vdata` is word aligned and `vbytes` a multiple of 4, so a shader
+ * reads 32-bit words). The uniforms are PSP_TL_NU vec4s and PSP_TL_NI ivec4s,
+ * laid out as the PSP_TL_U_* / PSP_TL_I_* indices say. */
+enum {
+    PSP_TL_U_WORLD = 0,      /* 3 rows of the 4x3 world matrix: out.k = dot(row k, (p, 1)) */
+    PSP_TL_U_VIEW = 3,       /* 3 rows */
+    PSP_TL_U_PROJ = 6,       /* 4 rows of the 4x4 projection */
+    PSP_TL_U_TGEN = 10,      /* 3 rows of the texture-generation matrix */
+    PSP_TL_U_BONES = 13,     /* 8 bones x 3 rows */
+    PSP_TL_U_VSCALE = 37,    /* viewport scale x, y, z */
+    PSP_TL_U_VCENTRE = 38,   /* viewport centre minus the screen offset: x, y; centre z */
+    PSP_TL_U_UV = 39,        /* UV scale u, v, offset u, v (scale 1, 1 when both are 0) */
+    PSP_TL_U_TEXSIZE = 40,   /* level 0 width, height */
+    PSP_TL_U_EMISSIVE = 41,  /* material colours, 0..1: emissive rgb */
+    PSP_TL_U_AMBIENT = 42,   /* ambient rgba (also the colour of vertices without one) */
+    PSP_TL_U_DIFFUSE = 43,
+    PSP_TL_U_SPECULAR = 44,
+    PSP_TL_U_GLOBAL = 45,    /* global ambient rgba */
+    PSP_TL_U_SHINE = 46,     /* x: shininess */
+    PSP_TL_U_LIGHTS = 47,    /* 4 lights x 8: pos, dir, att, ambient, diffuse, specular, (spot exp, spot cutoff) */
+    PSP_TL_U_SHADE = 79,     /* the shade-map lights' unit directions, u then v (2 rows) */
+    PSP_TL_NU = 81
+};
+enum {
+    PSP_TL_I_LAYOUT0 = 0,    /* stride, misalign, vertex type, weight count */
+    PSP_TL_I_LAYOUT1 = 1,    /* byte offsets in the vertex (-1 = none): weights, texture, colour, normal */
+    PSP_TL_I_LAYOUT2 = 2,    /* position offset, flags (PSP_TL_F_*), texture map mode, projection source */
+    PSP_TL_I_LIGHT = 3,      /* x: per light (byte l) enabled | type << 1 | components << 3; y: material update bits */
+    PSP_TL_NI = 4
+};
+enum { PSP_TL_F_LIT = 1, PSP_TL_F_SKIN = 2, PSP_TL_F_REVERSE_NORMALS = 4 };
+
+typedef struct {
+    const uint8_t  *vdata;
+    uint32_t        vbytes;
+    const uint32_t *idx;            /* triangle list: vertex numbers, 3 per triangle */
+    int             nidx;
+    uint32_t        nverts;         /* vertices in vdata (every index is below this) */
+    const float    *u;              /* PSP_TL_NU x 4 */
+    const int32_t  *i;              /* PSP_TL_NI x 4 */
+    int             cull;           /* 0 none; drop triangles whose screen-space signed area,
+                                     * (b-a) x (c-a) with y down, is 1: > 0, 2: < 0 */
+} psp_gpu_tl;
+
 typedef struct {
     const char *name;
     /* Draw a triangle list. Returns 0 on success; nonzero makes the caller
@@ -115,9 +171,18 @@ typedef struct {
     /* Nonzero: the backend keeps VRAM coherent on every CPU access itself
      * (psp_mem_set_vram_hook), so a GE sync needs no flush. */
     int  coherent_on_access;
+    /* A transformed triangle draw with the vertex work on the GPU (psp_gpu_tl
+     * above); NULL when the backend has none. Returns 0 on success; nonzero
+     * makes the caller do the vertex work on the CPU and call draw(). */
+    int  (*draw_tl)(const psp_gpu_state *st, const psp_gpu_tl *tl);
 } psp_gpu_backend;
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
+
+/* Vertex work for transformed triangles on the GPU when the backend can
+ * (draw_tl): on by default; 0 keeps it all on the CPU (A/B testing). */
+void psp_gpu_set_gpu_transform(int on);
+int  psp_gpu_gpu_transform(void);
 const psp_gpu_backend *psp_gpu_get_backend(void);
 
 /* GE sync point (sceGeDrawSync/ListSync): bring emulated VRAM up to date with

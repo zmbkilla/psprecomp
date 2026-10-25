@@ -170,9 +170,14 @@ static void hle_SetFrameBuf(void) {
 static void (*g_vblank_use)(int kind, uint32_t ra);
 void psp_display_set_vblank_use_hook(void (*fn)(int kind, uint32_t ra)) { g_vblank_use = fn; }
 
+static int g_skip_wait;
+void psp_display_skip_next_wait(int on) { g_skip_wait = on; }
+
 static void wait_vblank(int cb) {
     if (g_vblank_use) g_vblank_use(0, psp_cpu.r[31]);
-    psp_sched_wait_vblank(cb);
+    if (g_skip_wait)                        /* psp_display_skip_next_wait: a 1 ms nap instead, which */
+        psp_sched_sleep_until(psp_sched_now_us() + 1000);   /* lets lower-priority threads (a file thread) run */
+    else psp_sched_wait_vblank(cb);
     g_vblank_count = psp_sched_active() ? psp_sched_vblank_count() : g_vblank_count + 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
