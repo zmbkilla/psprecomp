@@ -147,6 +147,19 @@ void psp_ge_dump_stats(FILE *out);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
+/* The GE thread (ge.c): display lists run on a host thread of their own, as
+ * on the hardware, beside the game. init runs first on that thread. */
+int  psp_ge_thread_start(void (*init)(void));
+int  psp_ge_threaded(void);
+int  psp_ge_on_thread(void);          /* the caller is the GE thread */
+void psp_ge_wait_idle(void);          /* until it has done everything handed to it */
+/* fn(arg) on the GE thread after what is queued (wait: until it ran); here
+ * and now without the thread. */
+void psp_ge_call(void (*fn)(void *), void *arg, int wait);
+void psp_ge_poll(void);               /* the finish / signal callbacks it reached, run here */
+void psp_ge_thread_report(FILE *out);
+/* Totals: the game's waits for the GE thread (count, us); its host work (us). */
+void psp_ge_thread_stats(uint64_t *waits, uint64_t *wait_us, uint64_t *job_us);
 
 void psp_sas_init(void);
 void psp_sas_register(void);
@@ -313,6 +326,9 @@ uint64_t psp_sched_vblank_count(void);
  * that, so a game that paces its frames by vblanks can run at 120 fps. Every
  * vblank wait, the vblank interrupt and the vcount follow it. */
 void psp_sched_set_vblank_rate(int mult);
+/* Variable refresh: hold (1) the vblanks while a frame runs; release (0) --
+ * an overdue one then comes gap_us later. See threadman.c. */
+void psp_sched_hold_vblank(int hold, uint32_t gap_us);
 int  psp_sched_vblank_rate(void);
 /* Called once per vblank on the scheduler's clock: present, pump input. */
 void     psp_sched_set_vblank_hook(void (*fn)(void));

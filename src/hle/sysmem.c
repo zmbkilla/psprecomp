@@ -44,7 +44,7 @@ static uint32_t  g_heap_lo, g_heap_hi;
  * starting above them keeps the allocator from handing out memory the module
  * itself occupies. A host that knows its real layout should narrow this. */
 #define DEFAULT_HEAP_LO 0x08C00000u
-#define DEFAULT_HEAP_HI (PSP_RAM_BASE + PSP_RAM_SIZE)
+#define DEFAULT_HEAP_HI PSP_HOST_RAM_BASE      /* the console's RAM: the host keeps the rest */
 
 void psp_sysmem_reset(void) {
     memset(g_block, 0, sizeof g_block);

@@ -15,6 +15,13 @@
  * stall address. Every way a game can observe progress -- ListSync, DrawSync,
  * the finish and signal callbacks -- then sees a completed list, which is
  * indistinguishable from a GE that happens to be fast.
+ *
+ * Or, once the host starts the GE thread (psp_ge_thread_start), lists run
+ * there, alongside the game, as on the hardware: enqueueing or moving a
+ * stall address only hands the work over, a sync waits until the GE thread
+ * is idle, and the finish / signal callbacks are run on the game thread at
+ * its next firmware call (psp_ge_poll). The host's renderer then lives on
+ * that thread too (psp_ge_call runs host work there, in order with the lists).
  */
 
 #include "psprecomp/hle.h"
@@ -23,6 +30,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#else
+#    include <pthread.h>
+#endif
 
 #define GE_NOP          0x00
 #define GE_VADDR        0x01
@@ -79,7 +92,7 @@ typedef struct {
     uint32_t id;
     uint32_t start;     /* where the list began */
     uint32_t list;      /* current read pointer */
-    uint32_t stall;     /* stop before this address; 0 means "no stall" */
+    volatile uint32_t stall;   /* stop before this address; 0 means "no stall" (moved by the game) */
     int      cbid;      /* callback set for FINISH / SIGNAL, or -1 */
     uint32_t stack[GE_STACK];
     int      sp;
@@ -142,11 +155,129 @@ static uint32_t rel(uint32_t arg) {
     return (((psp_gpu_reg(GE_BASE) & 0x0F0000u) << 8) | (arg & 0xFFFFFFu)) + g_offset;
 }
 
+/* ---- the GE thread (psp_ge_thread_start) ----------------------------------- */
+
+#ifdef _WIN32
+typedef SRWLOCK            ge_lock;
+typedef CONDITION_VARIABLE ge_cond;
+#    define LOCK()        AcquireSRWLockExclusive(&g_lk)
+#    define UNLOCK()      ReleaseSRWLockExclusive(&g_lk)
+#    define WAIT(c)       SleepConditionVariableSRW(&(c), &g_lk, INFINITE, 0)
+#    define WAKE(c)       WakeAllConditionVariable(&(c))
+static ge_lock g_lk = SRWLOCK_INIT;
+static ge_cond g_work_cv = CONDITION_VARIABLE_INIT, g_idle_cv = CONDITION_VARIABLE_INIT;
+static DWORD   g_worker_id;
+static int on_worker(void) { return GetCurrentThreadId() == g_worker_id; }
+#else
+#    define LOCK()        pthread_mutex_lock(&g_lk)
+#    define UNLOCK()      pthread_mutex_unlock(&g_lk)
+#    define WAIT(c)       pthread_cond_wait(&(c), &g_lk)
+#    define WAKE(c)       pthread_cond_broadcast(&(c))
+static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_work_cv = PTHREAD_COND_INITIALIZER, g_idle_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_worker;
+static int on_worker(void) { return pthread_equal(pthread_self(), g_worker); }
+#endif
+
+/* Jobs, in order: run the lists (RUN), or host work (psp_ge_call). */
+#define JOBS 64
+typedef struct { void (*fn)(void *); void *arg; } ge_job;   /* fn NULL: RUN */
+static ge_job   g_job[JOBS];
+static unsigned g_job_head, g_job_tail;    /* taken / added (counters) */
+static int      g_threaded, g_worker_busy;
+static void   (*g_worker_init)(void);
+static uint64_t g_waits, g_wait_us, g_job_us;
+
+/* Callbacks the GE thread reached, for the game thread (psp_ge_poll). */
+#define PEND 64
+typedef struct { uint32_t func, value, arg; } ge_pend;
+static ge_pend  g_pend[PEND];
+static unsigned g_pend_head, g_pend_tail;
+static volatile int g_pend_any;
+
+int psp_ge_threaded(void) { return g_threaded; }
+int psp_ge_on_thread(void) { return g_threaded && on_worker(); }
+
 static void callback(const ge_queue *q, int finish, uint32_t value) {
     if (q->cbid < 0 || q->cbid >= MAX_CB || !g_cb[q->cbid].used) return;
     const ge_cb *c = &g_cb[q->cbid];
-    if (finish) psp_sched_call_interrupt(c->finish_func, value, c->finish_arg);
-    else        psp_sched_call_interrupt(c->signal_func, value, c->signal_arg);
+    const uint32_t func = finish ? c->finish_func : c->signal_func, arg = finish ? c->finish_arg : c->signal_arg;
+    if (g_threaded && on_worker()) {
+        LOCK();
+        if (g_pend_tail - g_pend_head < PEND) {
+            g_pend[g_pend_tail++ % PEND] = (ge_pend){ func, value, arg };
+            g_pend_any = 1;
+        }
+        UNLOCK();
+        return;
+    }
+    psp_sched_call_interrupt(func, value, arg);
+}
+
+/* The callbacks the GE thread reached, run on the game thread. */
+void psp_ge_poll(void) {
+    if (!g_pend_any) return;
+    for (;;) {
+        LOCK();
+        const int have = g_pend_head != g_pend_tail;
+        ge_pend p = { 0, 0, 0 };
+        if (have) p = g_pend[g_pend_head++ % PEND];
+        if (g_pend_head == g_pend_tail) g_pend_any = 0;
+        UNLOCK();
+        if (!have) break;
+        psp_sched_call_interrupt(p.func, p.value, p.arg);
+    }
+}
+
+static void push_job(void (*fn)(void *), void *arg) {   /* under the lock */
+    while (g_job_tail - g_job_head >= JOBS) WAIT(g_idle_cv);
+    if (!fn && g_job_tail != g_job_head && !g_job[(g_job_tail - 1) % JOBS].fn) return;   /* a RUN is already queued */
+    g_job[g_job_tail++ % JOBS] = (ge_job){ fn, arg };
+    WAKE(g_work_cv);
+}
+
+/* Until the GE thread has done everything handed to it. */
+void psp_ge_wait_idle(void) {
+    if (!g_threaded || on_worker()) return;
+    LOCK();
+    if (g_job_head != g_job_tail || g_worker_busy) {
+        const uint64_t t0 = psp_sched_now_us();
+        while (g_job_head != g_job_tail || g_worker_busy) WAIT(g_idle_cv);
+        g_waits++;
+        g_wait_us += psp_sched_now_us() - t0;
+    }
+    UNLOCK();
+}
+
+/* Host work on the GE thread, after what is queued: wait = 1 returns once it
+ * ran. Without the thread (or on it) it runs here and now. */
+typedef struct { void (*fn)(void *); void *arg; volatile int done; } ge_sync;
+static void run_sync(void *p) {
+    ge_sync *s = (ge_sync *)p;
+    s->fn(s->arg);
+    LOCK();
+    s->done = 1;
+    WAKE(g_idle_cv);
+    UNLOCK();
+}
+void psp_ge_call(void (*fn)(void *), void *arg, int wait) {
+    if (!g_threaded || on_worker()) { fn(arg); return; }
+    LOCK();
+    if (!wait) { push_job(fn, arg); UNLOCK(); return; }
+    ge_sync s = { fn, arg, 0 };
+    push_job(run_sync, &s);
+    while (!s.done) WAIT(g_idle_cv);
+    UNLOCK();
+}
+
+void psp_ge_thread_stats(uint64_t *waits, uint64_t *wait_us, uint64_t *job_us) {
+    *waits = g_waits; *wait_us = g_wait_us; *job_us = g_job_us;
+}
+
+void psp_ge_thread_report(FILE *out) {
+    if (!g_threaded) return;
+    fprintf(out, "  GE thread           the game waited for it %llu times, %.1f ms in all\n",
+            (unsigned long long)g_waits, (double)g_wait_us / 1000.0);
 }
 
 /* Walk a list until it ends, reaches its stall address, or exhausts a step
@@ -294,6 +425,69 @@ static ge_queue *find_queue(uint32_t id) {
     return NULL;
 }
 
+/* The GE thread: every list that can go on, in the order they were queued,
+ * until each has ended or caught up with its stall address. */
+static void run_queues(void) {
+    for (;;) {
+        LOCK();
+        ge_queue *q = NULL;
+        for (int i = 0; i < MAX_QUEUES; i++) {
+            ge_queue *c = &g_queue[i];
+            if (!c->used || c->done || (c->stall && c->list == c->stall)) continue;
+            if (!q || c->id < q->id) q = c;
+        }
+        UNLOCK();
+        if (!q) return;
+        run_list(q);
+    }
+}
+
+static volatile int g_worker_ready;
+static void worker_loop(void) {
+    if (g_worker_init) g_worker_init();
+    LOCK();
+    g_worker_ready = 1;
+    WAKE(g_idle_cv);
+    for (;;) {
+        while (g_job_head == g_job_tail) { g_worker_busy = 0; WAKE(g_idle_cv); WAIT(g_work_cv); }
+        const ge_job j = g_job[g_job_head++ % JOBS];
+        g_worker_busy = 1;
+        WAKE(g_idle_cv);                           /* a slot is free */
+        UNLOCK();
+        const uint64_t t0 = psp_sched_now_us();
+        if (j.fn) j.fn(j.arg); else run_queues();
+        if (j.fn) g_job_us += psp_sched_now_us() - t0;
+        LOCK();
+    }
+}
+#ifdef _WIN32
+static DWORD WINAPI worker_main(LPVOID p) { (void)p; worker_loop(); return 0; }
+#else
+static void *worker_main(void *p) { (void)p; worker_loop(); return NULL; }
+#endif
+
+/* Lists run on a host thread of their own from now on; `init` runs first on
+ * it (the host's renderer makes its context current there). Returns 0 once
+ * the thread has started. */
+int psp_ge_thread_start(void (*init)(void)) {
+    if (g_threaded) return 0;
+    g_worker_init = init;
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, worker_main, NULL, 0, &g_worker_id);
+    if (!h) return -1;
+    SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+    CloseHandle(h);
+#else
+    if (pthread_create(&g_worker, NULL, worker_main, NULL) != 0) return -1;
+#endif
+    g_threaded = 1;
+    LOCK();
+    while (!g_worker_ready) WAIT(g_idle_cv);
+    UNLOCK();
+    fprintf(stderr, "psprecomp: display lists run on the GE thread\n");
+    return 0;
+}
+
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
     /* A completed list has left the hardware queue, so its slot is free. Not
@@ -301,10 +495,11 @@ static void enqueue(int head) {
      * every list after that was refused -- the game kept rendering into lists
      * that never ran. (A completed list's id stays findable until its slot is
      * reused, so a late ListSync on it still reports completion.) */
+    if (g_threaded) LOCK();
     ge_queue *q = NULL;
     for (int i = 0; i < MAX_QUEUES && !q; i++) if (!g_queue[i].used) q = &g_queue[i];
     for (int i = 0; i < MAX_QUEUES && !q; i++) if (g_queue[i].done) q = &g_queue[i];
-    if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (!q) { if (g_threaded) UNLOCK(); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(q, 0, sizeof *q);
     q->id    = g_next_id++;
@@ -313,8 +508,11 @@ static void enqueue(int head) {
     q->cbid  = (int32_t)psp_arg(2);
     q->used  = 1;
     (void)head;
-    run_list(q);
-    psp_ret(q->id);
+    const uint32_t id = q->id;
+    if (g_threaded) { push_job(NULL, NULL); UNLOCK(); }
+    else run_list(q);
+    psp_ge_poll();
+    psp_ret(id);
 }
 
 static void hle_ListEnQueue(void)     { enqueue(0); }
@@ -331,27 +529,45 @@ static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(0x80000100); return; }
     q->stall = psp_arg(1) & 0x0FFFFFFCu;
-    if (!q->done) run_list(q);          /* the new stall released more commands */
+    if (g_threaded) { LOCK(); push_job(NULL, NULL); UNLOCK(); }
+    else if (!q->done) run_list(q);     /* the new stall released more commands */
+    psp_ge_poll();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Lists complete synchronously, so a sync never waits. In query mode (1) the
- * answer is "completed" (0) for a finished list and "drawing" (2) for one
- * still parked at its stall address. */
+/* The CPU may now touch what the GE drew: everything handed over is done,
+ * its callbacks have run, and VRAM is current (on the renderer's thread). */
+static void cpu_sync_job(void *p) { (void)p; psp_gpu_cpu_sync(); }
+static void sync_all(void) {
+    psp_ge_wait_idle();
+    psp_ge_poll();
+    psp_ge_call(cpu_sync_job, NULL, 1);
+}
+
+/* Without the GE thread lists complete synchronously, so a sync never waits.
+ * In query mode (1) the answer is "completed" (0) for a finished list and
+ * "drawing" (2) for one still parked at its stall address. */
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
-    if (psp_arg(1) == 1) { psp_ret(q && !q->done ? 3 : 0); return; }   /* 3: stall reached */
-    psp_gpu_cpu_sync();                  /* the CPU may now touch what the GE drew */
+    if (psp_arg(1) == 1) { psp_ge_poll(); psp_ret(q && !q->done ? 3 : 0); return; }   /* 3: stall reached */
+    sync_all();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 static void hle_DrawSync(void) {
     if (psp_arg(0) == 1) {
+        psp_ge_poll();
+        if (g_threaded) {
+            LOCK();
+            const int busy = g_job_head != g_job_tail || g_worker_busy;
+            UNLOCK();
+            if (busy) { psp_ret(2); return; }
+        }
         for (int i = 0; i < MAX_QUEUES; i++)
             if (g_queue[i].used && !g_queue[i].done) { psp_ret(2); return; }
         psp_ret(0);
         return;
     }
-    psp_gpu_cpu_sync();
+    sync_all();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

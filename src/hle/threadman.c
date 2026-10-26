@@ -401,6 +401,27 @@ void psp_sched_set_vblank_rate(int mult) {
 }
 int psp_sched_vblank_rate(void) { return (int)(VBLANK_US / g_vblank_us); }
 
+/* Variable refresh (psp_sched_hold_vblank): while held, a due vblank waits --
+ * the host's frame-rate code holds it while the game's frame runs, so a late
+ * frame gets its vblank when it is done (after a short gap for the other
+ * threads), not at the next fixed tick a whole period on. Any thread starting
+ * a vblank wait releases it (a loading loop's own waits), and a vblank held
+ * more than three periods past due fires anyway. */
+static int      g_vblank_hold;
+static uint64_t g_vblank_gap;
+void psp_sched_hold_vblank(int hold, uint32_t gap_us) {
+    if (hold) { g_vblank_hold = 1; g_vblank_gap = gap_us; return; }
+    if (!g_vblank_hold) return;
+    g_vblank_hold = 0;
+    const uint64_t now = psp_sched_now_us();
+    if (g_next_vblank <= now) g_next_vblank = now + gap_us;      /* overdue: shortly */
+}
+static int vblank_held(uint64_t now) {
+    if (!g_vblank_hold) return 0;
+    if (now > g_next_vblank + 3 * (uint64_t)g_vblank_us) { g_vblank_hold = 0; return 0; }
+    return 1;
+}
+
 /* Sub-interrupt handlers (sceKernelRegisterSubIntrHandler). Only what the
  * scheduler can actually raise is delivered: the vblank, interrupt 30. */
 #define PSP_VBLANK_INT 30
@@ -663,6 +684,7 @@ void psp_park_thread(void) {
 
 uint32_t psp_sched_wait_vblank(int cb) {
     if (!g_sched_on || !g_current) { g_vblank_count++; return 0; }
+    psp_sched_hold_vblank(0, (uint32_t)g_vblank_gap);
     return wait_current(W_VBLANK, 0, 0, cb, 0, 0, 0);
 }
 
@@ -799,7 +821,7 @@ static void run_posted(void) {
 static void process_events(uint64_t now) {
     if (g_in_interrupt) return;
 
-    while (now >= g_next_vblank) {
+    while (now >= g_next_vblank && !vblank_held(now)) {
         g_vblank_count++;
         g_next_vblank += g_vblank_us;
         for (int i = 0; i < g_thread_hi; i++) {
@@ -823,7 +845,7 @@ static void process_events(uint64_t now) {
 }
 
 static uint64_t next_event(void) {
-    uint64_t e = g_next_vblank;
+    uint64_t e = g_vblank_hold ? g_next_vblank + 3 * (uint64_t)g_vblank_us + 1 : g_next_vblank;
     for (int i = 0; i < g_thread_hi; i++) {
         psp_thread *t = &g_thread[i];
         if (t->used && t->state == TH_WAITING && t->wait_until && t->wait_until < e)
@@ -848,6 +870,7 @@ static psp_thread *pick_ready(void) {
 void psp_sched_after_hle(void) {
     if (!g_sched_on || !g_current || g_in_interrupt) return;
     if (!interrupts_enabled()) return;
+    psp_ge_poll();                       /* callbacks the GE thread reached */
     uint64_t now = psp_sched_now_us();
     if (now >= g_next_vblank) process_events(now);
     else {

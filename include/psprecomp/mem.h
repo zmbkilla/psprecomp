@@ -9,6 +9,11 @@
  *   0x08000000-0x09FFFFFF   main RAM    (32 MB on PSP-2000+, 24 MB usable
  *                                        on PSP-1000 where it ends at 0x09FFFFFF
  *                                        but only 0x087FFFFF is user memory)
+ *   0x0A000000-0x0BFFFFFF   host RAM    (32 MB more, not the console's: the
+ *                                        game's heap still ends at 0x0A000000;
+ *                                        the host keeps data of its own here --
+ *                                        replacement models -- that the game
+ *                                        and the GE reach like any RAM)
  *
  * Each region is mirrored at three segment bases, which differ only in cache
  * behaviour — irrelevant to us, so we fold them together:
@@ -34,7 +39,8 @@ extern "C" {
 #define PSP_VRAM_BASE       0x04000000u
 #define PSP_VRAM_SIZE       0x00200000u  /* 2 MB */
 #define PSP_RAM_BASE        0x08000000u
-#define PSP_RAM_SIZE        0x02000000u  /* 32 MB */
+#define PSP_RAM_SIZE        0x04000000u  /* 64 MB: the console's 32, then the host's (above) */
+#define PSP_HOST_RAM_BASE   0x0A000000u  /* the host's part: up to PSP_RAM_BASE + PSP_RAM_SIZE */
 
 typedef struct {
     uint8_t *ram;        /* PSP_RAM_SIZE bytes */
