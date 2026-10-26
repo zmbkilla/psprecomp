@@ -108,11 +108,11 @@ static int clamp16(int v) {
 /* Decode the 16-byte ADPCM block at the voice's current position into its
  * 28-sample buffer. Returns 0 when the voice has run off the end.
  *
- * Looping is driven by the block flags in the data, as on the hardware
- * (and PPSSPP's VagDecoder): flag 6 marks the loop-start block, flag 3 ends
- * the loop -- the next block is the loop start again, but only if the voice
- * was set up with looping -- and flag 7 ends the sample whatever the loop
- * mode. Running past the size also ends it. An earlier version ignored 6
+ * Looping is driven by the block flags in the data: flag 6 marks the
+ * loop-start block, flag 3 ends the loop -- the next block is the loop start
+ * again, but only if the voice was set up with looping -- and flag 7 ends
+ * the sample whatever the loop mode (PSP VAG data ends with such a block;
+ * PSP2i's one-shot sounds repeat otherwise, below). Running past the size also ends it. An earlier version ignored 6
  * and 3 and restarted from block 0 at flag 7 when looping was on, so a
  * one-shot sound on a voice set up as looping (PSP2i's menu "select" ping)
  * repeated forever. */
@@ -309,12 +309,17 @@ static void hle_SetADSR(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* The packed envelope of __sceSasSetSimpleADSR(core, voice, env1, env2),
- * field layout as in PPSSPP's sceSas (ADSREnvelope::SetSimpleEnvelope):
- *   env1: bit 15 attack curve (linear / bent), bits 8-14 attack rate,
- *         bits 4-7 decay rate (exponential), bits 0-3 sustain level;
- *   env2: bits 13-15 sustain curve, bits 6-12 sustain rate,
- *         bit 5 release curve (linear / exponential), bits 0-4 release rate.
+/* The packed envelope of __sceSasSetSimpleADSR(core, voice, env1, env2):
+ *   env1: bit 15 attack mode (linear / bent), bits 8-14 attack rate (a
+ *         shift in 10-14, a step in 8-9), bits 4-7 decay rate
+ *         (exponential), bits 0-3 sustain level ((n + 1) / 16 of full);
+ *   env2: bits 13-15 sustain mode (bit 15 curved, bit 14 decreasing), bits
+ *         6-12 sustain rate, bit 5 release mode (linear / exponential),
+ *         bits 0-4 release rate. A rate of all ones means no change.
+ * PSP2i's own call (08DE02B8) passes env1 0x000F, env2 0x5FC0: immediate
+ * attack to full level, sustain rate 0x7F (held), immediate release -- a
+ * plain on/off gate, which only this layout gives. The special release
+ * rates 29 and 30 still need a source (docs/PPSSPP_CLEANUP.md).
  * An earlier version ignored both words and used one fixed envelope for
  * every sound, so short percussive sounds (footsteps) came out wrong. */
 static int32_t simple_rate(uint32_t n) {

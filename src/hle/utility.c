@@ -10,7 +10,7 @@
  * On hardware the data file is encrypted with a per-game key and PARAM.SFO
  * carries its hashes (SAVEDATA_FILE_LIST, SAVEDATA_PARAMS). With a host
  * crypto provider (psp_savedata_set_crypto) saves are read and written that
- * way, interchangeable with a PSP or PPSSPP; encrypted saves are recognised
+ * way, interchangeable with a PSP's; encrypted saves are recognised
  * by SAVEDATA_PARAMS, so plain saves written earlier still load. Without a
  * provider the data file is stored as given.
  *
@@ -153,9 +153,11 @@ static int has_key(uint32_t p) {
     return 0;
 }
 
-/* The crypt mode the firmware uses for this request (PPSSPP's
- * DetermineCryptMode; games built with SDK 4+ -- PSP2i is 6.03 -- get the
- * new hash): 1 without the full-size request, else by secureVersion. */
+/* The crypt mode for a new save: 1 when the request is shorter than
+ * pspsdk's full SceUtilitySavedataParam (0x600 bytes: no key or
+ * secureVersion fields), else by secureVersion. The secureVersion table
+ * still needs an independent source (docs/PPSSPP_CLEANUP.md); loading does
+ * not depend on it, as a save's own mode (SAVEDATA_PARAMS) is tried first. */
 static int crypt_mode_for(uint32_t p) {
     if (psp_read32(p) < 1536) return 1;
     switch (psp_read32(p + SD_SECUREVER)) {
@@ -214,7 +216,7 @@ static uint32_t do_load(uint32_t p) {
             if (rc && have_hash) {
                 used = file_mode;
                 rc = g_crypto->decrypt(file_mode, fdata, flen, keyed ? key : NULL, NULL, &plain, &plen);
-                if (!rc) fprintf(stderr, "psprecomp: savedata %s: hash mismatch (loaded anyway, as PPSSPP does)\n", guest);
+                if (!rc) fprintf(stderr, "psprecomp: savedata %s: hash mismatch (loaded anyway)\n", guest);
             }
         }
         if (!rc) {
@@ -470,7 +472,9 @@ static uint32_t do_getsize(uint32_t p) {
 /* SIZES (8): free space on the stick, the space an existing save takes, and
  * the space a new one would take -- PSP2i asks this before its download
  * feature ("open website") writes NPJH50332DL/DOWNLOAD.FLD. Pointers in the
- * parameter block (PPSSPP SavedataParam::GetSizes):
+ * parameter block (pspsdk psputility_savedata.h: SceUtilitySavedataParam's
+ * msFree / msData / utilityData, SceUtilitySavedataMsFreeInfo, MsDataInfo,
+ * UsedDataInfo):
  *   +0x5D0 msFree:      s32 clusterSize, freeClusters, freeSpaceKB; char freeSpaceStr[8]
  *   +0x5D4 msData:      char gameName[13] + pad[3], saveName[20] (inputs), then
  *   +0x5D8 utilityData: the used-data info below (msData's at +0x24)

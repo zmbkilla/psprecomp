@@ -14,12 +14,11 @@
  *     order), u32 addr (network order), u16 vport, zero[6]}; fd_set is 256
  *     bits (8 u32); timeval {u32 sec, u32 usec}.
  *   - Options: SOL_SOCKET is 0xFFFF and the BSD option numbers match the
- *     host's; SO_NBIO (0x1009) / SO_BIO (0x100A) switch the guest's blocking
- *     mode, SO_RCVTIMEO / SO_SNDTIMEO (0x1006 / 0x1005) are kept here and
- *     applied to the emulated blocking. PSP2i's socket crypto options
- *     (0x1000 / 0x2000, and the MSG_CRYPT send flags) are accepted; the
- *     traffic stays plain (both ends are emulators), but a socket with them is
- *     a player-to-player socket.
+ *     host's; SO_NBIO (0x1009) switches the guest's blocking mode,
+ *     SO_RCVTIMEO / SO_SNDTIMEO (0x1006 / 0x1005) are kept here and applied
+ *     to the emulated blocking. PSP2i's socket crypto options (0x1000 /
+ *     0x2000) are accepted; the traffic stays plain (both ends are
+ *     emulators), but a socket with them is a player-to-player socket.
  *   - connect() to 0.0.0.0 goes to this host's own address, as on the PSP's BSD
  *     stack (Windows refuses it): a room owner connecting to its own room.
  *
@@ -44,7 +43,13 @@
  * source port, u16 source vport, u8 socket type, u32 sequence (big-endian),
  * payload. Ports and vports are carried as the game wrote them (network order).
  *
- * Constants follow PPSSPP's NetInetConstants.h (Komak57/ppsspp master). */
+ * Where the constants come from: errno values are newlib's (sys/errno.h);
+ * SOL_SOCKET, the SO_* numbers up to SO_TYPE and the MSG_* flags are 4.4BSD's
+ * (sys/socket.h). The PSP's own values are the ones PSP2i passes: socket
+ * types 1, 2, 6 and 10 (sceNetInetSocket at 08CB6A90, 08D9A848, 08D9A88C,
+ * ...), options 0x1000 / 0x2000 / 0x1001 / 0x1002 / 0x1009 / 0x80 on level
+ * 0xFFFF (sceNetInetSetsockopt at 08CB6AD4, 08D9BA90 ... 08D9BB94). Values
+ * the game never uses are not handled. */
 
 #include "psprecomp/hle.h"
 #include "psprecomp/net.h"
@@ -88,11 +93,9 @@ enum { P_EINTR = 4, P_EBADF = 9, P_EAGAIN = 11, P_EFAULT = 14, P_EINVAL = 22, P_
        P_ENOTCONN = 128 };
 
 enum { SOL_SOCKET_P = 0xFFFF, SO_SNDTIMEO_P = 0x1005, SO_RCVTIMEO_P = 0x1006, SO_ERROR_P = 0x1007,
-       SO_TYPE_P = 0x1008, SO_NBIO_P = 0x1009, SO_BIO_P = 0x100A, SO_USECRYPTO_RX_P = 0x1000,
-       SO_USECRYPTO_TX_P = 0x2000 };
+       SO_TYPE_P = 0x1008, SO_NBIO_P = 0x1009, SO_USECRYPTO_RX_P = 0x1000, SO_USECRYPTO_TX_P = 0x2000 };
 enum { MSG_OOB_P = 0x1, MSG_PEEK_P = 0x2, MSG_DONTROUTE_P = 0x4, MSG_WAITALL_P = 0x40, MSG_DONTWAIT_P = 0x80 };
-enum { SOCK_STREAM_P = 1, SOCK_DGRAM_P = 2, SOCK_CONN_DGRAM_P = 6, SOCK_DCCP_P = 7, SOCK_PACKET_P = 10,
-       SOCK_NONBLOCK_P = 0x20000000 };
+enum { SOCK_STREAM_P = 1, SOCK_DGRAM_P = 2, SOCK_CONN_DGRAM_P = 6, SOCK_PACKET_P = 10 };
 
 /* ---- player-to-player (virtual) socket state ----------------------------------------------- */
 
@@ -119,6 +122,7 @@ typedef struct vsock {
     uint16_t port_n, vport_n;
     uint32_t peer_ip_n;                  /* the other end */
     uint16_t peer_port_n, peer_vport_n;
+    uint16_t phys_port_n;                /* the other end's real UDP port (0: its vport) */
     uint32_t rx_seq, tx_seq;
     vpkt *rx;                            /* streams: by sequence; datagrams: arrival order */
     vpkt *tx;                            /* sent, not yet acknowledged */
@@ -332,8 +336,13 @@ static int wire_send(uint32_t ip_n, uint16_t phys_port_n, uint16_t dst_port_n, u
 
 static uint64_t ms_now(void) { return psp_sched_now_us() / 1000u; }
 
+/* Where a connection's packets go: the peer's real UDP port as last seen --
+ * behind a router that changes ports (3658 out as 1630) that is not its vport
+ * (3658), and an answer sent there is dropped -- else its vport. */
+#define PHYS(v) ((v)->phys_port_n ? (v)->phys_port_n : (v)->peer_vport_n)
+
 /* A reliable packet: numbered, kept until acknowledged, sent to the peer's
- * address : its vport (its shared P2P port). */
+ * address : its real port (PHYS). */
 static int vs_send(vsock *v, int type, uint8_t flags, const uint8_t *data, uint32_t len) {
     vpkt *p = pkt_new(data, len);
     if (!p) return -1;
@@ -344,7 +353,7 @@ static int vs_send(vsock *v, int type, uint8_t flags, const uint8_t *data, uint3
     while (*t) t = &(*t)->next;
     *t = p;
     v->tx_seq++;
-    return wire_send(v->peer_ip_n, v->peer_vport_n, v->peer_port_n, v->peer_vport_n, flags, v->port_n, v->vport_n,
+    return wire_send(v->peer_ip_n, PHYS(v), v->peer_port_n, v->peer_vport_n, flags, v->port_n, v->vport_n,
                      (uint8_t)type, p->seq, data, len);
 }
 
@@ -369,7 +378,12 @@ static int vs_has_accept(const vsock *v) {
 
 /* A stream packet for socket v (type `type`): as the reference's Process_Reliable. */
 static int vs_input_stream(uint32_t fd, vsock *v, int type, const p2p_packet *pk) {
-    if (v->port_n != pk->dst_port_n || v->vport_n != pk->dst_vport_n) return 0;
+    if (v->port_n != pk->dst_port_n) return 0;
+    /* The connector names our vport as signaling gave it: our real UDP port
+     * as the internet sees it, which a router may have changed (3658 seen as
+     * 1630). A listener takes the request whatever that number; the
+     * connection then uses the connector's number at both ends. */
+    if (v->vport_n != pk->dst_vport_n && v->state != VS_LISTEN) return 0;
     if (v->ip_n && v->ip_n != p2p_local_ip()) return 0;
     if (pk->sock_type != type) return 0;
     char t[32];
@@ -378,6 +392,7 @@ static int vs_input_stream(uint32_t fd, vsock *v, int type, const p2p_packet *pk
     } else {
         if (v->peer_ip_n && v->peer_ip_n != pk->src_ip_n) return 0;
         if (v->peer_port_n != pk->src_port_n || v->peer_vport_n != pk->src_vport_n) return 0;
+        v->phys_port_n = pk->src_udp_port_n;          /* where the peer really is now */
     }
     switch (pk->flags) {
     case F_PSH | F_ACK | F_TCP:
@@ -400,7 +415,7 @@ static int vs_input_stream(uint32_t fd, vsock *v, int type, const p2p_packet *pk
             }
         }
         /* acknowledge with the received number (also for a resend) */
-        wire_send(v->peer_ip_n, v->peer_vport_n, v->peer_port_n, v->peer_vport_n, F_PSH | F_ACK | F_TCP,
+        wire_send(v->peer_ip_n, PHYS(v), v->peer_port_n, v->peer_vport_n, F_PSH | F_ACK | F_TCP,
                   v->port_n, v->vport_n, (uint8_t)type, pk->seq, NULL, 0);
         break;
     case F_SYN | F_TCP: {
@@ -419,8 +434,9 @@ static int vs_input_stream(uint32_t fd, vsock *v, int type, const p2p_packet *pk
         }
         vsock *c = (vsock *)calloc(1, sizeof *c);
         if (!c) break;
-        c->ip_n = v->ip_n; c->port_n = v->port_n; c->vport_n = v->vport_n;
+        c->ip_n = v->ip_n; c->port_n = v->port_n; c->vport_n = pk->dst_vport_n;
         c->peer_ip_n = pk->src_ip_n; c->peer_port_n = pk->src_port_n; c->peer_vport_n = pk->src_vport_n;
+        c->phys_port_n = pk->src_udp_port_n;
         c->state = VS_SYN_RCVD;
         c->rx_seq = 1;
         c->next = v->pending;
@@ -520,7 +536,7 @@ static int vs_retransmit(vsock *v, int type, uint64_t now) {
             free(p);
             continue;
         }
-        wire_send(v->peer_ip_n, v->peer_vport_n, v->peer_port_n, v->peer_vport_n, p->flags, v->port_n, v->vport_n,
+        wire_send(v->peer_ip_n, PHYS(v), v->peer_port_n, v->peer_vport_n, p->flags, v->port_n, v->vport_n,
                   (uint8_t)type, p->seq, p->data, p->len);
         p->sent_ms = now;
         p->sent_count++;
@@ -563,11 +579,11 @@ static void hle_Socket(void) {
     const uint32_t domain = psp_arg(0), type = psp_arg(1), proto = psp_arg(2);
     wsa_up();
     if (domain != 2) { psp_net_log_line("socket(domain %u, type 0x%X, protocol %u): unsupported domain", domain, type, proto); psp_ret(fail(P_EAFNOSUPPORT)); return; }
-    const uint32_t t = type & 0xF;
+    const uint32_t t = type;
     int htype;
     switch (t) {
     case SOCK_STREAM_P: case SOCK_PACKET_P: htype = SOCK_STREAM; break;
-    case SOCK_DGRAM_P: case SOCK_CONN_DGRAM_P: case SOCK_DCCP_P: htype = SOCK_DGRAM; break;
+    case SOCK_DGRAM_P: case SOCK_CONN_DGRAM_P: htype = SOCK_DGRAM; break;
     default:
         psp_net_log_line("socket(domain %u, type 0x%X, protocol %u): unsupported type", domain, type, proto);
         psp_ret(fail(P_EOPNOTSUPP));
@@ -588,8 +604,7 @@ static void hle_Socket(void) {
     g_fd[fd].used = 1;
     g_fd[fd].s = s;
     g_fd[fd].type = (int)t;
-    g_fd[fd].nonblock = (type & SOCK_NONBLOCK_P) != 0;
-    static const char *const TN[] = { "?", "TCP", "UDP", "?", "?", "?", "P2P datagram (UDP)", "P2P master (UDP)", "?", "?", "P2P stream (TCP)" };
+    static const char *const TN[] = { "?", "TCP", "UDP", "?", "?", "?", "P2P datagram (UDP)", "?", "?", "?", "P2P stream (TCP)" };
     psp_net_log_line("socket %u: %s%s", fd, TN[t <= 10 ? t : 0], g_fd[fd].nonblock ? " (non-blocking)" : "");
     psp_ret(ok(fd));
 }
@@ -726,6 +741,7 @@ static uint32_t connect_virtual(uint32_t fd, const struct sockaddr_in *sa, uint1
     v->peer_ip_n = sa->sin_addr.s_addr;
     v->peer_port_n = sa->sin_port;
     v->peer_vport_n = vport_n;
+    v->phys_port_n = vport_n;                        /* signaling's address: the peer's real port */
     v->ip_n = 0;
     v->port_n = htons(next_port);
     next_port = next_port >= 65000 ? 49152 : next_port + 1;
@@ -1050,7 +1066,6 @@ static void hle_Setsockopt(void) {
     if (level == SOL_SOCKET_P) {
         switch (name) {
         case SO_NBIO_P: g_fd[fd].nonblock = iv != 0; psp_ret(ok(0)); return;
-        case SO_BIO_P:  g_fd[fd].nonblock = 0; psp_ret(ok(0)); return;
         case SO_RCVTIMEO_P: g_fd[fd].rcvtimeo_us = timeo_from_guest(val, len); psp_ret(ok(0)); return;
         case SO_SNDTIMEO_P: g_fd[fd].sndtimeo_us = timeo_from_guest(val, len); psp_ret(ok(0)); return;
         case SO_USECRYPTO_RX_P: case SO_USECRYPTO_TX_P:

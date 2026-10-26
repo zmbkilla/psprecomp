@@ -801,8 +801,8 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 /* Transform a vector by a matrix. The hardware multiplies by the TRANSPOSE of
  * the matrix register as addressed: vd[i] = sum over k of S[col i][row k] *
- * vt[k] (PPSSPP Int_Vtfm: d[i] += s[i*4+k] * t[k] over its column-major
- * ReadMatrix). Code that wants M * v therefore names the transposed view --
+ * vt[k] -- the convention vmmul has on hardware (below), which a transform
+ * must share. Code that wants M * v therefore names the transposed view --
  * PSP2i loads a column-major matrix into M100 with lv.q and transforms with
  * E100 (36 of its 37 vhtfm sites). An earlier version computed S * v, which
  * gave M^T * v for exactly that code.
@@ -837,10 +837,13 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size)  { transform(vd, 
 void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) { transform(vd, vs, vt, size, 1); }
 
 /* Matrix product with the same convention as the transform above: the result
- * is S^T * T, where S and T are the matrices as addressed (PPSSPP Int_Vmmul:
- * d[a*4+b] = sum s[b*4+c] * t[a*4+c]). Each column of the result is a column
- * of T transformed by S, exactly as psp_vtfm would. That is why assemblers
- * flip vs's transpose bit for `vmmul.q M000, M100, M200` (= M100 * M200).
+ * is S^T * T, where S and T are the matrices as encoded. Each column of the
+ * result is a column of T transformed by S, exactly as psp_vtfm would. That
+ * is why assemblers flip vs's transpose bit for `vmmul.q M000, M100, M200`
+ * (= M100 * M200). The hardware record: pspautotests tests/cpu/vfpu/matrix
+ * runs vmmul.q M200, M000, M100 -- encoded 0xF004A088, vs E000 -- on two
+ * matrices loaded by rows and gets their product (matrix.expected);
+ * tests/test_vfpu.c repeats it.
  *
  * The earlier S * T was unverified and wrong: PSP2i's multiply 0x08D7AED4
  * (vmmul E000, M200, E100 on out = a * b) produced a * b^T, so every

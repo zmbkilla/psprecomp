@@ -10,11 +10,8 @@
  * asks of the response (status code, length, how much it reads) -- can be
  * seen in full.
  *
- * sceHttpSendRequest blocks only the calling PSP thread, as zmbkilla's fix in
- * Komak57/ppsspp (sceHttp.cpp, commits f82c85a / 0be42cd: the send runs on a
- * host thread and __KernelWaitCurThread(WAITTYPE_ASYNCIO, ...) parks the
- * caller): the transport runs on a host worker thread while the caller waits
- * in short scheduler sleeps, so every other PSP thread keeps running instead
+ * sceHttpSendRequest blocks only the calling PSP thread: the transport runs
+ * on a host worker thread while the caller waits in short scheduler sleeps, so every other PSP thread keeps running instead
  * of the whole game stalling for the network round trip (TLS handshake
  * included). The scheduler is single-threaded and cooperative, so the worker
  * never touches it: it only sets a flag the waiting thread polls. Deleting

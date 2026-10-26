@@ -195,7 +195,9 @@ static void test_unaligned(void) {
 }
 
 static void test_float_to_word(void) {
-    /* cvt/trunc/round/ceil/floor.w.s: hardware saturation, not a C cast. */
+    /* cvt/trunc/round/ceil/floor.w.s: hardware saturation, not a C cast. The
+     * special values and the rounding cases match pspautotests' hardware
+     * record (tests/cpu/fpu/fpu.expected). */
     const float nan = psp_bits_to_f32(0x7FC00000u), inf = psp_bits_to_f32(0x7F800000u);
     CHECK_EQ(psp_f2w(nan, 1), 0x7FFFFFFFu, "NaN -> 0x7FFFFFFF");
     CHECK_EQ(psp_f2w(-nan, 0), 0x7FFFFFFFu, "-NaN -> 0x7FFFFFFF");

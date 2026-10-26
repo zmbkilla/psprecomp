@@ -219,7 +219,9 @@ static inline uint32_t psp_f32_to_bits(float v) {
 
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
 
-/* Float -> word, as the Allegrex FPU (and PPSSPP) does it: NaN and anything
+/* Float -> word, as the Allegrex FPU does it (pspautotests
+ * tests/cpu/fpu/fpu.expected, recorded on hardware: inf and +-NaN give
+ * 2147483647, -inf -2147483648, for every mode): NaN and anything
  * at or above 2^31 give 0x7FFFFFFF, anything below -2^31 gives 0x80000000,
  * the rest is rounded by `mode` -- FCR31's RM field: 0 nearest (ties to
  * even), 1 toward zero, 2 up, 3 down. cvt.w.s uses the current mode,

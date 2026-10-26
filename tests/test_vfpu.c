@@ -293,12 +293,50 @@ static void test_matrix_ops(void) {
         for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r] * 2.5f, "vmscl element");
 }
 
+/* vmmul as the hardware does it: two matrices loaded by rows (lv.q
+ * R000..R003, R100..R103), `vmmul.q M200, M000, M100`, the rows of R200..R203
+ * stored -- they hold the ordinary product A x B. The assembler encodes that
+ * instruction as 0xF004A088 (vd 0x08, vs 0x20 = E000, vt 0x04): vs's
+ * transpose bit is flipped, and psp_vmmul takes the encoded operand. (The
+ * behaviour was checked against a recording made on a PSP; the data here is
+ * our own.) */
+static void test_matrix_hardware(void) {
+    float a[4][4], b[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int i = 0; i < 4; i++) {
+            a[r][i] = (float)(r * 7 + i * 3 + 1);
+            b[r][i] = (float)((r + 2) * (i + 5) - 9);
+        }
+    const uint32_t AT = 0x08860000u;
+    psp_vfpu_reset();
+    for (int r = 0; r < 4; r++)
+        for (int i = 0; i < 4; i++) {
+            psp_write_f32(AT + 0x00 + (uint32_t)(r * 16 + i * 4), a[r][i]);
+            psp_write_f32(AT + 0x40 + (uint32_t)(r * 16 + i * 4), b[r][i]);
+        }
+    for (int r = 0; r < 4; r++) {
+        psp_lv_q(0x20 | (uint32_t)r, AT + 0x00 + (uint32_t)r * 16);     /* R000 + r */
+        psp_lv_q(0x24 | (uint32_t)r, AT + 0x40 + (uint32_t)r * 16);     /* R100 + r */
+    }
+    psp_vmmul(0x08, 0x20, 0x04, 4);         /* vmmul.q M200, M000, M100, as encoded: vs E000 */
+    for (int r = 0; r < 4; r++) {
+        psp_sv_q(0x28 | (uint32_t)r, AT + 0x80 + (uint32_t)r * 16);     /* R200 + r */
+        for (int i = 0; i < 4; i++) {
+            float want = 0.0f;
+            for (int k = 0; k < 4; k++) want += a[r][k] * b[k][i];
+            const float got = psp_read_f32(AT + 0x80 + (uint32_t)(r * 16 + i * 4));   /* whole numbers: exact */
+            CHECK(got == want, "vmmul.q gives A x B [%d][%d]: got %f, want %f", r, i, (double)got, (double)want);
+        }
+    }
+}
+
 static void test_matrix_transform(void) {
     psp_vfpu_reset();
     float m[4][4], v[4];
 
     /* The hardware transforms by the TRANSPOSE of the matrix as addressed
-     * (PPSSPP Int_Vtfm), so code that wants M * v names the transposed view:
+     * (the vmmul convention, test_matrix_hardware), so code that wants M * v
+     * names the transposed view:
      * transforming a basis vector through E200 yields M200's column, and
      * through M200 itself yields its row. An identity test passes either
      * way; these do not. */
@@ -321,7 +359,7 @@ static void test_matrix_transform(void) {
             CHECK_F(psp_cpu.v[d[r]], m[r][basis], "vtfm through the matrix as addressed: the row");
     }
 
-    /* vmmul is S^T * T (PPSSPP Int_Vmmul). With the identity as S the
+    /* vmmul is S^T * T (test_matrix_hardware). With the identity as S the
      * result is T; with the identity as T it is S transposed. */
     psp_vmidt(0x00, 4);
     psp_vmmul(0x0C, 0x08, 0x00, 4);
@@ -579,6 +617,7 @@ int main(void) {
     test_prefixes();
     test_compare();
     test_matrix_ops();
+    test_matrix_hardware();
     test_matrix_transform();
     test_vidt();
     test_fast_paths();

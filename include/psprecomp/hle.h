@@ -263,8 +263,8 @@ void psp_io_set_ms_root(const char *dir);
 
 /* PSP savedata encryption, supplied by the host (the toolkit carries none).
  * With it, saves are read and written as on hardware -- encrypted with the
- * game's key, hashes in PARAM.SFO -- so they are interchangeable with a PSP
- * or PPSSPP; without it, data files are stored as given. Modes: 1 (no key),
+ * game's key, hashes in PARAM.SFO -- so they are interchangeable with a
+ * PSP's; without it, data files are stored as given. Modes: 1 (no key),
  * 3, 5 (with the game's 16-byte key). All return 0 on success; *out is
  * malloc'd. */
 typedef struct {

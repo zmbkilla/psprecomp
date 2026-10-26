@@ -535,8 +535,8 @@ static void test_savedata_roundtrip(void) {
 }
 
 /* sceHttpSendRequest runs the transport on a host worker thread and parks
- * only the calling PSP thread (zmbkilla's fix in Komak57/ppsspp sceHttp.cpp):
- * the response still arrives intact, from a thread other than the caller's. */
+ * only the calling PSP thread: the response still arrives intact, from a
+ * thread other than the caller's. */
 static unsigned long g_http_main_thread, g_http_send_thread;
 static char g_http_seen[256];
 static int fake_send(const psp_http_request *q, psp_http_response *r) {
@@ -695,6 +695,8 @@ static void test_mpeg_movie(void) {
     call(psp_nid("sceMpegAvcDecodeYCbCr"), MPEGP, AU, BUFP, INITP);
     CHECK(call(psp_nid("sceMpegAvcDecodeDetail"), MPEGP, DETAIL, 0, 0) == 0 && psp_read32(DETAIL + 32) == 0, "no picture");
     CHECK(call(psp_nid("sceMpegGetAvcAu"), MPEGP, vs, AU, ATTR) == 0x80618001u && psp_read32(AU + 12) == 0xFFFFFFFFu, "video end, dts -1");
+    CHECK(call(psp_nid("sceMpegRingbufferAvailableSize"), RING, 0, 0, 0) == 16, "the ring is empty at the end");
+    CHECK(call(psp_nid("sceMpegGetAvcAu"), MPEGP, vs, AU, ATTR) == 0x80618001u && psp_read32(AU + 12) == 0xFFFFFFFFu, "still the end, dts -1");
     CHECK(call(psp_nid("sceMpegDelete"), MPEGP, 0, 0, 0) == 0, "delete");
     CHECK(call(psp_nid("sceMpegFinish"), 0, 0, 0, 0) == 0, "finish");
     psp_mpeg_set_video_codec(NULL);

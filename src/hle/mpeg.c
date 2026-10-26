@@ -307,9 +307,11 @@ static void demux(mpeg_ctx *c) {
 }
 
 /* Packets the ring reports as filled: what is buffered and not yet decoded,
- * plus one, as the firmware never reports an empty ring once data flows. */
+ * plus one, as the firmware never reports an empty ring while data flows.
+ * Once the last picture is out the ring is empty, as the firmware has it at
+ * the video's end: a game that waits for the ring to drain sees the movie end. */
 static uint32_t ring_filled(mpeg_ctx *c, uint32_t packets) {
-    if (!c->put_bytes) return 0;
+    if (!c->put_bytes || c->video_end) return 0;
     uint64_t pending = (uint64_t)c->raw.len + c->ves.len + c->aes.len;
     uint64_t f = 1 + (pending + PACKET - 1) / PACKET;
     return f > packets ? packets : (uint32_t)f;
@@ -739,6 +741,12 @@ static void hle_GetAvcAu(void) {
     const uint32_t sid = psp_arg(1), au = psp_arg(2), attr = psp_arg(3);
     if (!c) { psp_ret(0xFFFFFFFFu); return; }
     if (!ring_ok(c->ring)) { psp_ret(0xFFFFFFFFu); return; }
+    if (c->video_end) {                       /* the end, on every call after it (the ring is empty now) */
+        au_write(au, c->vpts + c->first_ts, -1);
+        psp_ret(ERR_NO_DATA);
+        delay(100);
+        return;
+    }
     if (!psp_read32(c->ring + RB_READ) || !psp_read32(c->ring + RB_AVAIL)) {
         au_write(au, 0, 0);
         psp_ret(ERR_NO_DATA);
@@ -750,12 +758,6 @@ static void hle_GetAvcAu(void) {
     c->st[i].needs_reset = 0;
     psp_write32(au + 16, (uint32_t)c->st[i].num);
     const int64_t pts = c->vpts + c->first_ts;
-    if (c->video_end) {
-        au_write(au, pts, -1);
-        psp_ret(ERR_NO_DATA);
-        delay(100);
-        return;
-    }
     au_write(au, pts, pts - VIDEO_PTS_STEP);
     if (attr && psp_mem_ptr(attr, 4)) psp_write32(attr, 1);
     psp_ret(0);
