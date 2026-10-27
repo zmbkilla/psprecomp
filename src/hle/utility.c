@@ -201,6 +201,7 @@ static uint32_t do_load(uint32_t p) {
             }
         }
         for (uint32_t i = 0; i < 16; i++) key[i] = psp_read8(p + SD_KEY + i);
+        dump_key(p);
         const int keyed = has_key(p), want = crypt_mode_for(p);
         uint8_t *plain = NULL;
         uint32_t plen = 0;
@@ -296,6 +297,64 @@ static int write_host(const char *host, const uint8_t *b, size_t n) {
     return fclose(f) == 0 && ok ? 0 : -1;
 }
 
+/* host_src -> host_dst, whole file. 0 on success. */
+static int copy_file(const char *src, const char *dst) {
+    uint32_t n = 0;
+    uint8_t *d = read_file(src, &n);
+    if (!d) return -1;
+    FILE *f = fopen(dst, "wb");
+    const int ok = f && fwrite(d, 1, n, f) == n;
+    if (f) fclose(f);
+    free(d);
+    return ok ? 0 : -1;
+}
+
+/* Saving over an encrypted save this runtime cannot read (no crypto
+ * provider): the old data file and PARAM.SFO are copied first to
+ * <dir>.encrypted-backup/ (once; an existing backup is never replaced), so
+ * the game writing a new save never costs the old one -- a converter can
+ * still decrypt it. */
+static void backup_encrypted(const char *dir, const char *file) {
+    if (g_crypto) return;
+    char guest[160], host[1024], bdir[1024], src[1024], dst[1100];
+    snprintf(guest, sizeof guest, "%s/PARAM.SFO", dir);
+    psp_io_host_path(guest, host, sizeof host);
+    uint32_t slen = 0, vl = 0;
+    uint8_t *sfo = read_file(host, &slen);
+    const uint8_t *v = sfo ? sfo_value(sfo, slen, "SAVEDATA_PARAMS", &vl) : NULL;
+    const int encrypted = v && vl && v[0] != 0;
+    free(sfo);
+    if (!encrypted) return;
+    psp_io_host_path(dir, bdir, sizeof bdir);
+    snprintf(bdir + strlen(bdir), sizeof bdir - strlen(bdir), ".encrypted-backup");
+    struct stat st;
+    if (stat(bdir, &st) == 0) return;                       /* kept from the first time */
+    host_mkdir(bdir);
+    const char *names[2] = { file, "PARAM.SFO" };
+    for (int i = 0; i < 2; i++) {
+        snprintf(guest, sizeof guest, "%s/%s", dir, names[i]);
+        psp_io_host_path(guest, src, sizeof src);
+        snprintf(dst, sizeof dst, "%s/%s", bdir, names[i]);
+        if (copy_file(src, dst) != 0) fprintf(stderr, "psprecomp: savedata %s: could not back up %s\n", dir, names[i]);
+    }
+    fprintf(stderr, "psprecomp: savedata %s is encrypted and cannot be read here: kept a copy in %s\n", dir, bdir);
+}
+
+/* PSPRECOMP_SAVE_KEY_FILE=path: the game's 16-byte save key, as hex, written
+ * to that file the first time the game saves or loads with one -- for a
+ * separate tool that converts encrypted saves. Off unless set. */
+static void dump_key(uint32_t p) {
+    static int done;
+    const char *path = getenv("PSPRECOMP_SAVE_KEY_FILE");
+    if (done || !path || !path[0] || !has_key(p)) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < 16; i++) fprintf(f, "%02X", psp_read8(p + SD_KEY + i));
+    fprintf(f, "\n");
+    fclose(f);
+    done = 1;
+}
+
 /* AUTOSAVE / SAVE: create the directory, then write the data file, the
  * icon/picture/sound files the game provides, and PARAM.SFO. The data file
  * is stored unencrypted (see the note at the top of this file). */
@@ -315,6 +374,8 @@ static uint32_t do_save(uint32_t p) {
         *c = keep;
     }
     host_mkdir(host);
+    dump_key(p);
+    backup_encrypted(dir, file);
 
     snprintf(guest, sizeof guest, "%s/%s", dir, file);
     psp_io_host_path(guest, host, sizeof host);
