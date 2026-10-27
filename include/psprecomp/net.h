@@ -1,12 +1,10 @@
-/* psprecomp — networking and PSN HLE: the PSP's WLAN, network, HTTP and NP
- * libraries answered from the host (src/hle/net.c, http.c, np.c).
+/* psprecomp — networking HLE: the PSP's WLAN, network and HTTP libraries
+ * answered from the host (src/hle/net.c, net_sock.c, http.c). PSN and ad hoc
+ * are not provided (src/hle/offline.c).
  *
- * The HLE side is platform neutral. What needs a policy or a user interface
- * is supplied by the host program:
- *   - an HTTP transport (psp_http_set_transport): how a game's HTTP requests
- *     are answered and where they are logged;
- *   - an NP backend (psp_np_set_backend): PSN sign-in and auth tickets.
- * Without them, requests and sign-in fail with the firmware's error codes. */
+ * The HLE side is platform neutral. An HTTP transport (psp_http_set_transport),
+ * supplied by the host program, says how a game's HTTP requests are answered;
+ * without one they fail with the firmware's error code. */
 #ifndef PSPRECOMP_NET_H
 #define PSPRECOMP_NET_H
 
@@ -27,6 +25,9 @@ typedef struct {
 
 /* Fills *out (may be NULL); returns connected. PSPRECOMP_NET=off forces 0. */
 int  psp_net_host_info(psp_net_host *out);
+/* Nonzero: the host looks disconnected (the WLAN switch reads off), as with
+ * PSPRECOMP_NET=off. */
+void psp_net_set_forced_off(int off);
 void psp_net_ether_addr(uint8_t mac[6]);
 /* Every network event line (resolver lookups, the network dialog), for a log file. */
 void psp_net_set_log(void (*fn)(const char *line));
@@ -59,135 +60,11 @@ typedef struct {
 
 void psp_http_set_transport(const psp_http_transport *t);
 
-/* ---- NP (PSN) -------------------------------------------------------------------- */
-
-enum { PSP_NP_SIGNIN_NONE = 0, PSP_NP_SIGNIN_BUSY, PSP_NP_SIGNIN_OK, PSP_NP_SIGNIN_FAILED, PSP_NP_SIGNIN_CANCELLED };
-
-typedef struct {
-    void        (*signin_begin)(void);        /* show the login screen / start signing in */
-    int         (*signin_state)(void);        /* PSP_NP_SIGNIN_* */
-    void        (*signin_cancel)(void);
-    const char *(*online_id)(void);           /* while signed in */
-    /* Auth tickets, for request slot `slot`. ticket_state: 0 pending, 1 ready
-     * (*data/*len valid until the slot is cancelled), -1 failed (*err = an
-     * SCE_NP_AUTH_ERROR_* code, or 0 for unknown). */
-    void        (*ticket_begin)(int slot, const char *service_id, const uint8_t *cookie, uint32_t cookie_len);
-    int         (*ticket_state)(int slot, const uint8_t **data, uint32_t *len, uint32_t *err);
-    void        (*ticket_cancel)(int slot);
-    /* NP matching 2 (sceNpMatching2), on the signed-in session. Blocking;
-     * com_id is "NPWRnnnnn_nn". Return the number of IDs written to `ids`
-     * (at most `max`), or -1 with *err = an SCE_NP_MATCHING2_* error code.
-     * May be NULL: matching then reports the server unavailable. */
-    int         (*m2_server_list)(const char *com_id, uint16_t *ids, int max, uint32_t *err);
-    int         (*m2_world_list)(const char *com_id, uint16_t server_id, uint32_t *ids, int max, uint32_t *err);
-    /* Room requests (kind = PSP_M2_*): read the game's request at guest
-     * address `param` now (game thread), send it, and complete it later with
-     * psp_np2_request_done(req_id, ...). 0 = sent, else an SCE error to
-     * report. May be NULL (rooms then report the service unavailable). */
-    int         (*m2_room_request)(int kind, const char *com_id, uint32_t req_id, uint32_t param);
-    /* Once per vblank on the game thread: deliver replies and notifications
-     * (psp_np2_request_done / psp_np2_room_event / psp_np2_room_message). */
-    void        (*m2_poll)(void);
-    /* Where NP log lines go besides stderr (may be NULL). */
-    void        (*log)(const char *line);
-} psp_np_backend;
-
-void psp_np_set_backend(const psp_np_backend *be);
-
-/* The firmware's PS Store, drawn over the running game (PSP2i: the PSN
- * utility in mode 1, after sceNpCommerce2Init). A host with a store page sets
- * these: open(title_id) shows it without blocking and returns 0 (nonzero:
- * no store -- the dialog then just finishes), showing() is 1 while it is up.
- * The dialog reports "processing" meanwhile and finishes when it closes. */
-void psp_np_set_store(int (*open)(const char *title_id), int (*showing)(void));
-
-enum {
-    PSP_M2_SEARCH_ROOM = 1, PSP_M2_CREATE_JOIN_ROOM, PSP_M2_JOIN_ROOM, PSP_M2_LEAVE_ROOM,
-    PSP_M2_GET_ROOM_DATA_EXTERNAL_LIST, PSP_M2_SET_ROOM_DATA_EXTERNAL, PSP_M2_SET_ROOM_DATA_INTERNAL,
-    PSP_M2_SEND_ROOM_MESSAGE,
-};
-/* For the matching backend (game thread only). */
-void     psp_np2_request_done(uint32_t req_id, uint32_t error, uint32_t data);   /* the request's callback */
-void     psp_np2_room_event(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data);
-void     psp_np2_room_message(uint64_t room_id, uint16_t member_id, uint16_t event, uint32_t data);
-uint32_t psp_np2_alloc(uint32_t size);   /* zeroed guest memory for event data (a ring: valid for a while) */
-/* Deliver backend results (ticket callbacks) to the game: call once per vblank. */
-void psp_np_poll(void);
-
-/* ---- player-to-player (src/hle/p2p.c) ----------------------------------------------
- * Other players are reached through UDP port 3658 after NP signaling, as on a
- * PSP; the matching backend supplies what the matching server says (game
- * thread only; IPv4 addresses in host byte order, ports host order). */
-/* After sign-in: the matching server's UDP address check (RPCN: its address,
- * port 3657), the account's user ID and online ID. Opens UDP port 3658. */
-void psp_p2p_start(uint32_t server_ipv4, uint16_t server_udp_port, int64_t user_id, const char *npid);
-void psp_p2p_stop(void);
-/* A room member's online ID (from room data and join notifications). */
-void psp_p2p_room_member(uint64_t room, uint16_t member, const char *npid);
-/* Connect to a member at the address the matching server gave (JoinRoom's
- * signaling data, a member-joined notification). */
-void psp_p2p_connect(uint64_t room, uint16_t member, uint32_t ipv4, uint16_t port);
-/* The server asks us to open the path to a user (RPCN SignalingHelper). */
-void psp_p2p_info(const char *npid, uint32_t ipv4, uint16_t port);
-void psp_p2p_member_left(uint64_t room, uint16_t member);
-/* We left the room, or it was destroyed: end its connections. */
-void psp_p2p_room_closed(uint64_t room);
-
 void psp_net_register(void);
 void psp_http_register(void);
-void psp_np_register(void);
-void psp_np2_register(void);
-
-/* ---- ad hoc (src/hle/adhoc.c, adhoc_mesh.c, adhoc_matching.c) ----------------------------
- * Ad hoc play over the internet through an ad hoc server (PPSSPP's protocol,
- * which also finds the players of a group). Three connection options:
- *   PSP_ADHOC_MODE_PPSSPP_DIRECT  PPSSPP style, direct: game data goes straight
- *                                 between players, every port shifted by
- *                                 port_offset; players' ports must be reachable;
- *   PSP_ADHOC_MODE_PPSSPP_RELAY   PPSSPP style, relayed: game data goes through
- *                                 the server ("aemu postoffice", relay_port) --
- *                                 works behind any NAT; plays with PPSSPP users
- *                                 on the relay too;
- *   PSP_ADHOC_MODE_MODERN         direct hosting through NAT traversal (recomp
- *                                 players only): one UDP socket (mesh_port) per
- *                                 player; addresses learned locally (IPv4 and
- *                                 IPv6), from a STUN server and from the server
- *                                 are swapped through the relay, then both sides
- *                                 punch through their NATs (CGNAT included,
- *                                 unless it is symmetric). PTP gets a reliable
- *                                 stream over that UDP path. A pair that cannot
- *                                 punch through stays reachable: its packets are
- *                                 tunnelled through the relay. Modern uses its
- *                                 own server only (modern_server; never a PPSSPP
- *                                 one): "host" runs the built-in server
- *                                 (adhoc_server.c) in this program and uses it;
- *                                 otherwise the address of a player hosting, or
- *                                 of a machine running it alone (IPv4, IPv6 or a
- *                                 name; [v6]:port or v4:port for another port). */
-enum { PSP_ADHOC_MODE_PPSSPP_DIRECT = 0, PSP_ADHOC_MODE_PPSSPP_RELAY = 1, PSP_ADHOC_MODE_MODERN = 2 };
-typedef struct {
-    const char *server;          /* host name or address */
-    uint16_t    server_port;     /* 0 = 27312 */
-    uint16_t    relay_port;      /* 0 = 27313 */
-    int         mode;            /* PSP_ADHOC_MODE_* */
-    int         port_offset;     /* PPSSPP-style: added to every game port (PPSSPP default 10000) */
-    const char *nickname;        /* shown to other players */
-    const char *stun_server;     /* modern: host[:port]; NULL = stun.l.google.com:19302, "" = none */
-    uint16_t    mesh_port;       /* modern: the UDP port; 0 = 27320 */
-    const char *modern_server;   /* modern: "host" (NULL/"") or an address[:port] (see above) */
-    uint16_t    modern_port;     /* modern: the server's TCP port; 0 = 27330 (its relay: the next one) */
-} psp_adhoc_config;
-void psp_adhoc_configure(const psp_adhoc_config *c);
-
-/* The modern connection's server (src/hle/adhoc_server.c), on a host thread:
- * lobby on TCP `port`, relay on `relay_port`, IPv6 and IPv4. 0 if it runs
- * (or already did); log may be NULL (stderr). */
-int  psp_adhoc_server_start(uint16_t port, uint16_t relay_port, void (*log)(const char *line));
-int  psp_adhoc_server_running(void);
-int  psp_adhoc_server_players(void);       /* logged-in players */
-/* What others type to join this machine: its IPv4 on its network and its
- * global IPv6 address ("" if none), for the host program to show. */
-void psp_adhoc_host_addresses(char *v4, size_t v4cap, char *v6, size_t v6cap);
+/* PSN, NP matching and ad hoc are not provided: offline.c answers their
+ * imports as unavailable. */
+void psp_offline_register(void);
 
 #ifdef __cplusplus
 }

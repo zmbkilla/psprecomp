@@ -220,6 +220,5 @@ void psp_hle_init(void) {
     psp_modules_register();
     psp_net_register();
     psp_http_register();
-    psp_np_register();
-    psp_np2_register();
+    psp_offline_register();
 }

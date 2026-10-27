@@ -22,17 +22,18 @@ facts are taken (numbers, layouts, protocol formats) -- never code or text:
 - psx-spx: no license and, by its maintainers' account, derived from Sony's
   confidential documents: not used.
 
-Ad hoc and RPCN (infrastructure) play are on hold (the network rows below),
-so the aemu ad hoc server source is not used either.
+Ad hoc and RPCN (infrastructure) play were removed (2026-10-27): the
+network rows below are gone from the code, and from git history where they
+were based on Komak57/ppsspp. The aemu ad hoc server source is not used.
 
 Using PPSSPP as an external oracle (docs/ORACLE.md: run as a separate process
 and compared against) is not reliance and stays.
 
 | Where | Was based on | Re-derived from | Status |
 |---|---|---|---|
-| src/hle/net_sock.c constants | Komak57/ppsspp NetInetConstants.h | newlib errno, 4.4BSD socket.h, PSP2i's socket/setsockopt calls | done |
-| src/hle/np2.c events, layouts, errors | Komak57/ppsspp sceNp2 | PSP2i's matching2 handlers; RPCS3 sceNp2.h / sceNp.h (GPL-2.0, numbers only) | done |
-| src/hle/np.c NP / auth error codes | (no source given) | PSP2i's checks, RPCS3 sceNp.h | on hold (RPCN dropped for now) |
+| src/hle/net_sock.c constants | Komak57/ppsspp NetInetConstants.h | newlib errno, 4.4BSD socket.h, PSP2i's socket/setsockopt calls | done; its player-to-player streams removed |
+| src/hle/np2.c events, layouts, errors | Komak57/ppsspp sceNp2 | PSP2i's matching2 handlers; RPCS3 sceNp2.h / sceNp.h (GPL-2.0, numbers only) | removed (ad hoc and online dropped; offline.c answers the imports) |
+| src/hle/np.c NP / auth error codes | (no source given) | PSP2i's checks, RPCS3 sceNp.h | removed (ad hoc and online dropped; offline.c answers the imports) |
 | src/hle/http.c (comment) | credits a fix in Komak57/ppsspp | describe the technique only | done |
 | include/psprecomp/recomp_rt.h float -> word | "as PPSSPP does" | pspautotests tests/cpu/fpu/fpu.expected (test_runtime matches it) | done |
 | src/vfpu.c vtfm / vmmul order | PPSSPP Int_Vtfm / Int_Vmmul | behaviour recorded on hardware (pspautotests vfpu/matrix, cited, no data copied) and the instruction's encoding; test_vfpu checks it with its own data; PSP2i's vhtfm sites | done |
@@ -43,8 +44,8 @@ and compared against) is not reliance and stays.
 | include/psprecomp/ge_vertex.h lighting reference | PPSSPP software transform | GE docs, pspautotests gpu | to do |
 | src/hle/atrac.c context model | PPSSPP sceAtrac | pspautotests atrac, PSP2i's use | to do |
 | src/hle/mpeg.c layouts, errors, timing | PPSSPP sceMpeg | pspautotests mpeg, PSP2i's use | to do |
-| src/hle/p2p.c, net_sock.c P2P streams | Komak57/ppsspp RPCNSigAgent, SocketManager | packet captures of PPSSPP players | on hold (online dropped for now) |
-| src/hle/adhoc.c, adhoc_matching.c | Komak57/ppsspp sceNetAdhoc | captures (aemu not used) | on hold (ad hoc dropped for now) |
+| src/hle/p2p.c, net_sock.c P2P streams | Komak57/ppsspp RPCNSigAgent, SocketManager | packet captures of PPSSPP players | removed (ad hoc and online dropped; offline.c answers the imports) |
+| src/hle/adhoc.c, adhoc_matching.c | Komak57/ppsspp sceNetAdhoc | captures (aemu not used) | removed (ad hoc and online dropped; offline.c answers the imports) |
 | tests/test_hle.c (comment) | credits the Komak fix | reword | done |
-| tests/test_p2p.c, test_adhoc.c (comments) | as the code above | follow the code | on hold |
-| include/psprecomp/net.h mode names (PPSSPP_DIRECT / _RELAY) | naming only | rename once adhoc is redone | on hold |
+| tests/test_p2p.c, test_adhoc.c (comments) | as the code above | follow the code | removed (ad hoc and online dropped; offline.c answers the imports) |
+| include/psprecomp/net.h mode names (PPSSPP_DIRECT / _RELAY) | naming only | rename once adhoc is redone | removed (ad hoc and online dropped; offline.c answers the imports) |
